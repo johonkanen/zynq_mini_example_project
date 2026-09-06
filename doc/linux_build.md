@@ -163,6 +163,10 @@ BR2_TARGET_UBOOT_FORMAT_ELF=y      # -> output/images/u-boot  (ELF)
 BR2_TARGET_ROOTFS_CPIO=y           # keep EXT2 on too -> sdcard.img still built
 BR2_TARGET_ROOTFS_CPIO_GZIP=y
 BR2_TARGET_ROOTFS_CPIO_UIMAGE=y    # -> output/images/rootfs.cpio.uboot
+
+# --- auto-load the PL bitstream at boot (step 10) ----------------------
+BR2_ROOTFS_OVERLAY="<abs>/board/zynqmini/overlay/rootfs"
+BR2_ROOTFS_POST_BUILD_SCRIPT="board/zynq/post-build.sh <abs>/board/zynqmini/overlay/copy-bitstream.sh"
 ```
 
 - `BR2_LINUX_KERNEL_CUSTOM_DTS_PATH` copies `zynq-zynqmini.dts` into the kernel
@@ -313,27 +317,76 @@ load `0x8000`, so `bootm` relocates the kernel down itself.)
 
 ---
 
-## 10. Loading the bitstream / using `axi_regs` from Linux
+## 10. Loading the bitstream at boot / using `axi_regs` from Linux
 
-The PL is not needed to boot. To use `axi_regs` (at `0x4000_0000`, signature
-`0x5A5A_1234`) you must configure the PL first:
+The PL is not needed to boot, but `axi_regs` (`0x4000_0000`, `SIGNATURE`
+`0x5A5A_1234`) is dark until the PL is configured. The kernel has
+`FPGA_MGR_ZYNQ_FPGA` + `FPGA_MGR_ZYNQ_AFI_FPGA` built in (the AFI part also
+brings the PS↔PL AXI ports up), and `fpgautil` is in the rootfs
+(`BR2_PACKAGE_XILINX_FPGAUTIL`, inherited from `zynq_zed_defconfig`).
+
+### Auto-load at boot (both SD and JTAG)
+
+A rootfs overlay stages the bitstream and a BusyBox init script loads it:
+
+```
+board/zynqmini/overlay/
+├─ rootfs/etc/init.d/S95fpga        # fpgautil -b /lib/firmware/arm_fpga_zynq_mini.bit
+└─ copy-bitstream.sh                # POST_BUILD hook: output/*.bit -> target /lib/firmware
+```
+
+`S95fpga`:
+```sh
+#!/bin/sh
+BIT=/lib/firmware/arm_fpga_zynq_mini.bit
+[ "$1" = start ] || exit 0
+[ -f "$BIT" ] || exit 0
+printf 'PL: loading %s ... ' "$(basename "$BIT")"
+fpgautil -b "$BIT" >/dev/null 2>&1 && echo ok || echo FAILED
+```
+
+`copy-bitstream.sh` (Buildroot passes `$1` = `TARGET_DIR`):
+```sh
+#!/bin/sh
+install -D -m0644 /path/to/output/arm_fpga_zynq_mini.bit "$1/lib/firmware/arm_fpga_zynq_mini.bit"
+```
+
+defconfig:
+```make
+BR2_ROOTFS_OVERLAY="<abs>/board/zynqmini/overlay/rootfs"
+BR2_ROOTFS_POST_BUILD_SCRIPT="board/zynq/post-build.sh <abs>/board/zynqmini/overlay/copy-bitstream.sh"
+```
+
+`fpgautil -b` takes the **raw Vivado `.bit`** on Zynq-7000 — the `zynq-fpga`
+driver skips the header and byte-swaps as needed. (Prefer a headerless `.bin`?
+Add `set_property STEPS.WRITE_BITSTREAM.ARGS.BIN_FILE true [get_runs impl_1]` to
+`scripts/build.tcl` and point the script at the `.bin`.)
+
+The bitstream lands in **both** `rootfs.ext4` (SD) and `rootfs.cpio.uboot`
+(JTAG), so the PL comes up ~2 s into userspace either way. Boot log:
+`PL: loading arm_fpga_zynq_mini.bit ... ok`.
+
+### Load it earlier, from U-Boot (optional)
+
+U-Boot here has `CMD_FPGA` + `FPGA_ZYNQPL`; `fpga loadb` also eats the raw
+`.bit`. The extlinux parser has no `fpga` directive, so this needs a `boot.scr`
+(and dropping `extlinux.conf`) or a custom `CONFIG_BOOTCOMMAND`:
+```
+fatload mmc 0:1 0x02000000 arm_fpga_zynq_mini.bit && fpga loadb 0 0x02000000 ${filesize}
+```
+
+### Poke it
 
 ```bash
-# convert once, on the build host:
-#   bootgen -image fpga.bif -arch zynq -process_bitstream bin   (fpga.bif lists the .bit)
-# then on the target:
-mkdir -p /lib/firmware
-cp arm_fpga_zynq_mini.bit.bin /lib/firmware/
-fpgautil -b /lib/firmware/arm_fpga_zynq_mini.bit.bin        # or echo to /sys/class/fpga_manager
-
-devmem2 0x4000001C          # -> 0x5A5A1234
+devmem2 0x4000001C          # -> 0x5A5A1234   (SIGNATURE)
 devmem2 0x40000000 w 0x12340000
 devmem2 0x40000004 w 0x0000ABCD
-devmem2 0x40000014         # SUM -> 0x1234ABCD
+devmem2 0x40000014         # -> 0x1234ABCD   (SUM, computed in the PL)
+devmem2 0x40000010         # HEARTBEAT, changes every read
 ```
 
 See [`notes.md`](notes.md) → Habr [1052912](https://habr.com/ru/articles/1052912/)
-for the FPGA-manager route, and the `axi_regs` section there for the UIO node.
+for the FPGA-manager / `fpga-region` route and the `axi_regs` UIO node.
 
 ---
 
