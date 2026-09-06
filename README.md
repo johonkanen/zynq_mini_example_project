@@ -77,9 +77,11 @@ and its QMTech sibling, **including building Linux** — see [`doc/notes.md`](do
 | `sim/tb_axi_regs.vhd`         | VUnit testbench: AXI3 master BFM driving `axi_regs` |
 | `sim/run.py`                  | VUnit run script (NVC backend) |
 | `sw/`                         | **bare-metal bring-up test** — PS UART1 + PS↔PL AXI, JTAG only (`sw/README.md`) |
+| `linux/zynq-zynqmini.dts`     | kernel device tree for the board (used by `doc/linux_build.md`) |
 | `doc/mio_map.md`              | full PS MIO map of the board |
 | `doc/board_pinout.md`        | PL pin map (LEDs, OLED, HDMI, 2nd Ethernet, cameras) from the vendor XDCs |
 | `doc/notes.md`                | board details, Linux-boot resources (Habr series), `axi_regs` from Linux |
+| `doc/linux_build.md`          | step-by-step: build a bootable SD-card Linux image with Buildroot |
 
 `build/` and `output/` are generated and git-ignored. Everything is VHDL-2008.
 

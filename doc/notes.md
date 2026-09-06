@@ -60,6 +60,8 @@ Repo of lesson materials for this board:
 
 ### Recommended path
 
+**Worked step-by-step (Buildroot): [`linux_build.md`](linux_build.md).**
+
 1. Start from the **stock SD image** or Zaostrovnykh's Buildroot config
    ([567408](https://habr.com/ru/articles/567408/)) and re-point the FSBL +
    device tree at `output/arm_fpga_zynq_mini.xsa`.

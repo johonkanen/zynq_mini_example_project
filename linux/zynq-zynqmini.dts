@@ -1,0 +1,155 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Device tree for the AliExpress "Zynq Mini" XC7Z020-CLG400 board.
+ *
+ * Hand-adapted from arch/arm/boot/dts/xilinx/zynq-zed.dts (Avnet ZedBoard):
+ * same SoC, same 512 MB DDR3, same GEM0-RGMII / UART1-console layout. Deltas
+ * for this board:
+ *   - on-board eMMC on SD1 (sdhci1), 4-bit, non-removable
+ *   - Ethernet PHY is an RTL8211E (addr 0) instead of the ZedBoard's 88E1518
+ *   - PS LED on MIO9, PS button on MIO0
+ *   - axi_regs (this project's VHDL AXI slave) exported as a UIO node
+ *
+ * MIO map: doc/mio_map.md.  PS7 config: scripts/ps7_base_config.tcl.
+ * Build/boot instructions: doc/linux_build.md.
+ */
+/dts-v1/;
+/*
+ * Buildroot's BR2_LINUX_KERNEL_CUSTOM_DTS_PATH copies this file to
+ * arch/arm/boot/dts/ (flat), so include the base dtsi via its vendor subdir.
+ */
+#include "xilinx/zynq-7000.dtsi"
+
+/ {
+	model = "Zynq Mini XC7Z020 (AliExpress)";
+	compatible = "aliexpress,zynq-mini", "xlnx,zynq-7000";
+
+	aliases {
+		ethernet0 = &gem0;
+		serial0 = &uart1;
+		spi0 = &qspi;
+		mmc0 = &sdhci0;		/* microSD  */
+		mmc1 = &sdhci1;		/* eMMC     */
+	};
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0x0 0x20000000>;		/* 512 MB, MT41J256M16 */
+	};
+
+	chosen {
+		/* bootargs come from extlinux.conf; keep only the console hint */
+		stdout-path = "serial0:115200n8";
+	};
+
+	usb_phy0: phy0 {
+		compatible = "usb-nop-xceiv";
+		#phy-cells = <0>;
+	};
+
+	leds {
+		compatible = "gpio-leds";
+		ps-led1 {
+			label = "zynqmini:ps:led1";
+			gpios = <&gpio0 9 0>;		/* MIO9, active high */
+			default-state = "off";
+		};
+	};
+
+	gpio-keys {
+		compatible = "gpio-keys";
+		autorepeat;
+		ps-key {
+			label = "ps-key";
+			gpios = <&gpio0 0 1>;		/* MIO0, active low */
+			linux,code = <0x66>;		/* KEY_HOME */
+			wakeup-source;
+		};
+	};
+
+	/*
+	 * axi_regs — the VHDL AXI slave at the base of M_AXI_GP0 (src/hdl/axi_regs.vhd).
+	 * Not a block-design IP, so no generated node; reach it via UIO once the PL
+	 * is configured.  SIGNATURE at 0x4000001C reads 0x5A5A1234.  See doc/notes.md.
+	 */
+	axi_regs@40000000 {
+		compatible = "generic-uio";
+		reg = <0x40000000 0x1000>;
+	};
+};
+
+&clkc {
+	ps-clk-frequency = <33333333>;
+};
+
+&gem0 {
+	status = "okay";
+	phy-mode = "rgmii-id";			/* RTL8211E supplies the RGMII delays */
+	phy-handle = <&ethernet_phy>;
+
+	ethernet_phy: ethernet-phy@0 {
+		reg = <0>;			/* MDIO addr 0, MDC/MDIO on MIO 52/53 */
+		/*
+		 * No PHY reset is routed from the PS on this board (board POR only).
+		 * If you wire one to an EMIO GPIO, add: reset-gpios = <&gpio0 N 1>;
+		 */
+	};
+};
+
+&qspi {
+	bootph-all;
+	status = "okay";
+	num-cs = <1>;
+	flash@0 {
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+		spi-tx-bus-width = <1>;
+		spi-rx-bus-width = <4>;
+		spi-max-frequency = <50000000>;
+		m25p,fast-read;
+		/* 16 MB, socketed SOIC-8 */
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+			partition@0 {
+				label = "boot";		/* boot.bin (SPL + U-Boot) */
+				reg = <0x0 0x500000>;
+			};
+			partition@500000 {
+				label = "bitstream";
+				reg = <0x500000 0x400000>;
+			};
+			partition@900000 {
+				label = "spare";
+				reg = <0x900000 0x700000>;
+			};
+		};
+	};
+};
+
+&sdhci0 {					/* microSD socket, MIO 40-45 */
+	bootph-all;
+	status = "okay";
+	disable-wp;
+};
+
+&sdhci1 {					/* on-board eMMC, MIO 10-15 */
+	status = "okay";
+	non-removable;
+	disable-wp;
+	bus-width = <4>;
+	no-sd;
+	no-sdio;
+};
+
+&uart1 {					/* console, MIO 48/49 */
+	bootph-all;
+	status = "okay";
+};
+
+&usb0 {						/* USB-C host, ULPI PHY (USB3320-class) */
+	status = "okay";
+	dr_mode = "host";
+	usb-phy = <&usb_phy0>;
+};
