@@ -31,6 +31,36 @@ AXI slave written in VHDL.
    +-- placeholder PL user logic  (counter on FCLK_CLK0 + the register bus)
 ```
 
+## The board
+
+The cheap AliExpress **"Zynq Mini" XC7Z020-CLG400** board, reviewed on Habr:
+[habr.com/ru/articles/721146](https://habr.com/ru/articles/721146/) (English-friendly
+mirror: [pvsm.ru/fpga/383315](https://www.pvsm.ru/fpga/383315)).
+
+| | |
+|---|---|
+| SoC | XC7Z020-CLG400, speed grade -2 |
+| DDR3 | 512 MB, MT41J256M16 (16-bit, 533 MHz) |
+| QSPI flash | 16 MB, socketed SOIC-8 |
+| Ethernet | gigabit **RTL8211E-class, RGMII**, on **PS GEM0 / MIO 16–27**, MDIO on MIO 52–53, PHY address 0 |
+| USB | host on USB-C, ULPI PHY |
+| storage | microSD (SDIO0) + on-board eMMC (SDIO1) |
+| video / display | HDMI direct from PL GPIO (no companion chip); 128×64 OLED bit-banged from PL |
+| clocks | PS 33.333 MHz + external 50 MHz oscillator to PL |
+| misc | I²C EEPROM, 5 LEDs, 3 buttons, 34 PL GPIO, on-board JTAG programmer, 3-way boot switch (JTAG / QSPI / SD) |
+
+Andrey Zaostrovnykh (@andreyzaostrovnykh) has a Habr series covering this board
+and its QMTech sibling, **including building Linux** — see [`doc/notes.md`](doc/notes.md):
+
+| Article | Topic |
+|---|---|
+| [721146](https://habr.com/ru/articles/721146/) | Zynq Mini board review (this board) |
+| [559946](https://habr.com/ru/articles/559946/) | getting started with Zynq-7000 (QMTech "Bajie") |
+| [565368](https://habr.com/ru/articles/565368/) | build Linux from scratch (U-Boot + DTG + `linux-xlnx` + rootfs + `BOOT.BIN`) — its Ethernet setup is identical to this project's PS7 config |
+| [567408](https://habr.com/ru/articles/567408/) | kernel + rootfs via Buildroot |
+| [835912](https://habr.com/ru/companies/timeweb/articles/835912/) | boot Linux over JTAG with XSCT (`zynqmini.dtb`), no SD flashing |
+| [849032](https://habr.com/ru/companies/timeweb/articles/849032/) | HDMI from bare-metal (repo: [github.com/megalloid/zynq_mini_lessons](https://github.com/megalloid/zynq_mini_lessons)) |
+
 ## Layout
 
 | Path | Purpose |
@@ -47,7 +77,7 @@ AXI slave written in VHDL.
 | `sim/tb_axi_regs.vhd`         | VUnit testbench: AXI3 master BFM driving `axi_regs` |
 | `sim/run.py`                  | VUnit run script (NVC backend) |
 | `doc/mio_map.md`              | full PS MIO map of the board |
-| `doc/notes.md`                | Linux-boot resources + the Ethernet PHY caveat |
+| `doc/notes.md`                | board details, Linux-boot resources (Habr series), `axi_regs` from Linux |
 
 `build/` and `output/` are generated and git-ignored. Everything is VHDL-2008.
 
