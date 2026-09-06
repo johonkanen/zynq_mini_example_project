@@ -71,6 +71,24 @@ ls xsa/ps7_init_gpl.*            # ps7_init_gpl.c  ps7_init_gpl.h
 mux (GEM0 16–27, MDIO 52–53, QSPI 1–6, SD0 40–45, SD1/eMMC 10–15, UART1 48–49).
 U-Boot's SPL compiles these in, so **no FSBL and no Vitis are required**.
 
+**Patch the K&R prototypes.** Vivado 2024.2 emits `int ps7_init();` (empty
+parens); modern U-Boot's SPL build has `-Werror=strict-prototypes` and rejects
+it. Add `void` to the declarations *and* definitions — but not the internal
+calls:
+
+```bash
+cd ~/dev/zynqmini-linux/xsa
+sed -i -E \
+  -e 's/^int (ps7_init|ps7_post_config|ps7_debug)\(\);/int \1(void);/' \
+  -e 's/^void perf_reset_and_start_timer\(\); ?/void perf_reset_and_start_timer(void);/' \
+  ps7_init_gpl.h
+sed -i -E \
+  -e 's/^ps7GetSiliconVersion \(\) \{/ps7GetSiliconVersion (void) {/' \
+  -e 's/^(ps7_post_config|ps7_debug|ps7_init)\(\) ?$/\1(void)/' \
+  -e 's/^void perf_reset_and_start_timer\(\) ?$/void perf_reset_and_start_timer(void)/' \
+  ps7_init_gpl.c
+```
+
 ---
 
 ## 3. The device tree
@@ -175,19 +193,32 @@ cd ~/dev/zynqmini-linux/buildroot
 make -j"$(nproc)"
 ```
 
-First build ~30–90 min (it builds a toolchain, U-Boot, the kernel and a rootfs).
-Results land in `output/images/`:
+> **WSL:** Buildroot aborts with *"Your PATH contains spaces, TABs, and/or
+> newline characters"* because WSL injects the Windows `PATH`. Run the build
+> with a clean environment:
+> ```bash
+> env -i HOME="$HOME" PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+>     TERM=xterm bash -c 'cd ~/dev/zynqmini-linux/buildroot && make -j$(nproc)'
+> ```
+
+First build ~30–90 min (it builds a toolchain, U-Boot, the kernel and a rootfs;
+downloads from `ftpmirror.gnu.org` may 502 and retry — harmless). Results land in
+`output/images/`:
 
 ```
 output/images/
  ├─ boot.bin              (U-Boot SPL — runs your ps7_init, then loads u-boot.img)
  ├─ u-boot.img
- ├─ uImage                (Linux, load 0x8000)
+ ├─ uImage                (Linux 6.18-xilinx, load 0x8000)
  ├─ zynq-zynqmini.dtb
  ├─ system.dtb            -> zynq-zynqmini.dtb (symlink, what extlinux loads)
- ├─ rootfs.ext4
- └─ sdcard.img            (assembled by genimage — flash this)
+ ├─ rootfs.ext4           (-> rootfs.ext2)
+ └─ sdcard.img            (32M FAT32 boot + 60M ext4 rootfs — flash this)
 ```
+
+Verified with Buildroot **2026.08**: `boot.bin` is a valid Zynq image
+(`0xaa995566` / `XNLX`), `uImage` is Linux 6.18.10-xilinx at load `0x8000`, and
+`zynq-zynqmini.dtb` carries the `axi_regs@40000000` UIO node.
 
 ---
 
