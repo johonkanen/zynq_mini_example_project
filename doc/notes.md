@@ -71,6 +71,52 @@ Repo of lesson materials for this board:
 SD card layout: p1 FAT32 (`BOOT.BIN`, `uImage`/`Image`, `*.dtb`, `boot.scr` or
 `uramdisk.image.gz`), p2 ext4 (rootfs). Boot switch → SD.
 
+### Build environment (Windows + WSL2)
+
+The FPGA flow is Windows (Vivado/Vitis). The Linux flow splits:
+
+| Step | Where |
+|---|---|
+| `.xsa` (done), FSBL `.elf`, device tree via XSCT + `device-tree-xlnx`, `dtc`, `bootgen` → `BOOT.BIN`, **XSCT JTAG boot** | Windows (Vivado/Vitis) — native |
+| U-Boot, Linux kernel, Buildroot rootfs, **PetaLinux** | Linux — WSL2 or a VM |
+
+Genuinely Windows-only option: take prebuilt `u-boot.elf` / `uImage` /
+`zynqmini.dtb` / rootfs (stock SD image or Zaostrovnykh's materials), rebuild
+only FSBL + DTB in Vitis to match this `.xsa`, then `bootgen` or XSCT-boot.
+
+**WSL2 setup** (Ubuntu 22.04 — required version for PetaLinux 2024.2):
+
+```bash
+# in PowerShell (admin), once:
+wsl --install -d Ubuntu-22.04
+
+# in the Ubuntu shell:
+sudo apt update && sudo apt install -y build-essential bc bison flex \
+    libssl-dev git cpio rsync u-boot-tools device-tree-compiler \
+    gcc-arm-linux-gnueabihf                       # cross toolchain
+
+git clone https://github.com/buildroot/buildroot -b 2024.02.x
+# or PetaLinux 2024.2 installer (Ubuntu 22.04 only; run as non-root)
+```
+
+- Build in the **native Linux fs** (`~/…`), **not** `/mnt/d/…` — PetaLinux
+  refuses `/mnt/*` (case-insensitivity, symlink perms, path length). Copy the
+  `.xsa` in: `cp /mnt/d/dev/zynq_mini/arm_fpga_zynq_mini/output/*.xsa ~/lin/`.
+- `git` and the GitHub remote work the same from WSL.
+
+**Claude Code in WSL2** (for the kernel/rootfs side):
+
+```bash
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+exec $SHELL && nvm install 22
+npm install -g @anthropic-ai/claude-code
+cd ~/lin && claude            # /login: paste the URL into a Windows browser
+```
+
+Keep this Windows session for Vivado/Vitis/bootgen/XSCT; run a second `claude`
+in WSL2 for U-Boot / kernel / Buildroot. Same repo, same remote. Optional:
+VS Code + the **WSL** extension, `code .` from the WSL shell.
+
 ### Using `axi_regs` from Linux
 
 `axi_regs` sits at `0x4000_0000` (the whole M_AXI_GP0 window). It is not a BD IP,
