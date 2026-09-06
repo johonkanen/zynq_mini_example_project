@@ -27,8 +27,9 @@ vu.add_vhdl_builtins()
 vu.add_verification_components()
 
 lib = vu.add_library("lib")
-# Only the synthesizable AXI slave + the testbench. zynq_mini_top.vhd needs the
-# generated block design and is not part of the unit sim.
+# The AXI package + slave + testbench. zynq_mini_top.vhd needs the generated
+# block design and is not part of the unit sim.
+lib.add_source_files(ROOT / "src" / "hdl" / "axi_pkg.vhd")
 lib.add_source_files(ROOT / "src" / "hdl" / "axi_regs.vhd")
 lib.add_source_files(ROOT / "sim" / "tb_axi_regs.vhd")
 

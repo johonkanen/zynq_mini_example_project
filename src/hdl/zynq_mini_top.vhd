@@ -3,25 +3,24 @@
 --
 -- Hand-written top level. It instantiates the "zynq_mini" block design (just the
 -- PS7 - DDR3 / Ethernet / QSPI / eMMC / microSD / UART1, with M_AXI_GP0 and the
--- PL clock/reset routed straight to the boundary) and connects the raw AXI3
--- master to axi_regs, a VHDL AXI slave. No AXI interconnect IP anywhere.
+-- PL clock/reset routed straight to the boundary), packs the flat M_AXI_GP0
+-- signals into the axi_pkg direction records and hands them to axi_regs, an
+-- AXI slave written in VHDL. No AXI interconnect IP anywhere.
 --
 --   zynq_mini_top
---     |
 --     +-- u_bd : zynq_mini    (PS7; M_AXI_GP0_* + FCLK_CLK0/FCLK_RESET0_N)
---     |
---     +-- u_axi_regs : axi_regs   <- AXI slave, written in VHDL
---     |
+--     +-- u_axi_regs : axi_regs   <- AXI slave, records from axi_pkg
 --     +-- placeholder PL user logic
 --
 -- Entity ports = the physical device pins only (DDR_* + FIXED_IO_*), which the
--- PS7 IP constrains automatically. Add a port here + a line in
--- src/constrs/zynq_mini.xdc for any real PL I/O.
+-- PS7 IP constrains automatically.
 -------------------------------------------------------------------------------
 
 library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
+
+use work.axi_pkg.all;
 
 entity zynq_mini_top is
     port (
@@ -117,55 +116,18 @@ architecture rtl of zynq_mini_top is
         );
     end component zynq_mini;
 
-    -- PS <-> PL
-    signal clk     : std_logic;
-    signal resetn  : std_logic;
+    signal clk    : std_logic;
+    signal resetn : std_logic;
 
-    -- M_AXI_GP0 (AXI3) - PS master side
-    signal m_awid    : std_logic_vector(11 downto 0);
-    signal m_awaddr  : std_logic_vector(31 downto 0);
-    signal m_awlen   : std_logic_vector(3 downto 0);
-    signal m_awsize  : std_logic_vector(2 downto 0);
-    signal m_awburst : std_logic_vector(1 downto 0);
-    signal m_awlock  : std_logic_vector(1 downto 0);
-    signal m_awcache : std_logic_vector(3 downto 0);
-    signal m_awprot  : std_logic_vector(2 downto 0);
-    signal m_awqos   : std_logic_vector(3 downto 0);
-    signal m_awvalid : std_logic;
-    signal m_awready : std_logic;
-    signal m_wid     : std_logic_vector(11 downto 0);
-    signal m_wdata   : std_logic_vector(31 downto 0);
-    signal m_wstrb   : std_logic_vector(3 downto 0);
-    signal m_wlast   : std_logic;
-    signal m_wvalid  : std_logic;
-    signal m_wready  : std_logic;
-    signal m_bid     : std_logic_vector(11 downto 0);
-    signal m_bresp   : std_logic_vector(1 downto 0);
-    signal m_bvalid  : std_logic;
-    signal m_bready  : std_logic;
-    signal m_arid    : std_logic_vector(11 downto 0);
-    signal m_araddr  : std_logic_vector(31 downto 0);
-    signal m_arlen   : std_logic_vector(3 downto 0);
-    signal m_arsize  : std_logic_vector(2 downto 0);
-    signal m_arburst : std_logic_vector(1 downto 0);
-    signal m_arlock  : std_logic_vector(1 downto 0);
-    signal m_arcache : std_logic_vector(3 downto 0);
-    signal m_arprot  : std_logic_vector(2 downto 0);
-    signal m_arqos   : std_logic_vector(3 downto 0);
-    signal m_arvalid : std_logic;
-    signal m_arready : std_logic;
-    signal m_rid     : std_logic_vector(11 downto 0);
-    signal m_rdata   : std_logic_vector(31 downto 0);
-    signal m_rresp   : std_logic_vector(1 downto 0);
-    signal m_rlast   : std_logic;
-    signal m_rvalid  : std_logic;
-    signal m_rready  : std_logic;
+    -- M_AXI_GP0 as direction records (axi_pkg)
+    signal ps_i : axi_mosi_t;   -- PS master -> slave
+    signal ps_o : axi_miso_t;   -- slave -> PS master
 
     -- register view from the AXI slave
     signal reg_ps2pl : std_logic_vector(127 downto 0);
     signal pl_active : std_logic;
 
-    -- ===== placeholder PL user logic =====================================
+    -- ===== placeholder PL user logic ====================================
     signal heartbeat  : unsigned(27 downto 0) := (others => '0');
     signal user_probe : std_logic_vector(31 downto 0);
     attribute keep : string;
@@ -174,7 +136,8 @@ architecture rtl of zynq_mini_top is
 begin
 
     ---------------------------------------------------------------------------
-    -- Block design (PS7)
+    -- Block design (PS7). The flat M_AXI_GP0 pins map straight onto the record
+    -- fields - master outputs into ps_i, slave outputs (from us) into ps_o.
     ---------------------------------------------------------------------------
     u_bd : component zynq_mini
         port map (
@@ -201,102 +164,61 @@ begin
             FIXED_IO_ps_clk   => FIXED_IO_ps_clk,
             FIXED_IO_ps_porb  => FIXED_IO_ps_porb,
             FIXED_IO_ps_srstb => FIXED_IO_ps_srstb,
-            M_AXI_GP0_araddr  => m_araddr,
-            M_AXI_GP0_arburst => m_arburst,
-            M_AXI_GP0_arcache => m_arcache,
-            M_AXI_GP0_arid    => m_arid,
-            M_AXI_GP0_arlen   => m_arlen,
-            M_AXI_GP0_arlock  => m_arlock,
-            M_AXI_GP0_arprot  => m_arprot,
-            M_AXI_GP0_arqos   => m_arqos,
-            M_AXI_GP0_arready => m_arready,
-            M_AXI_GP0_arsize  => m_arsize,
-            M_AXI_GP0_arvalid => m_arvalid,
-            M_AXI_GP0_awaddr  => m_awaddr,
-            M_AXI_GP0_awburst => m_awburst,
-            M_AXI_GP0_awcache => m_awcache,
-            M_AXI_GP0_awid    => m_awid,
-            M_AXI_GP0_awlen   => m_awlen,
-            M_AXI_GP0_awlock  => m_awlock,
-            M_AXI_GP0_awprot  => m_awprot,
-            M_AXI_GP0_awqos   => m_awqos,
-            M_AXI_GP0_awready => m_awready,
-            M_AXI_GP0_awsize  => m_awsize,
-            M_AXI_GP0_awvalid => m_awvalid,
-            M_AXI_GP0_bid     => m_bid,
-            M_AXI_GP0_bready  => m_bready,
-            M_AXI_GP0_bresp   => m_bresp,
-            M_AXI_GP0_bvalid  => m_bvalid,
-            M_AXI_GP0_rdata   => m_rdata,
-            M_AXI_GP0_rid     => m_rid,
-            M_AXI_GP0_rlast   => m_rlast,
-            M_AXI_GP0_rready  => m_rready,
-            M_AXI_GP0_rresp   => m_rresp,
-            M_AXI_GP0_rvalid  => m_rvalid,
-            M_AXI_GP0_wdata   => m_wdata,
-            M_AXI_GP0_wid     => m_wid,
-            M_AXI_GP0_wlast   => m_wlast,
-            M_AXI_GP0_wready  => m_wready,
-            M_AXI_GP0_wstrb   => m_wstrb,
-            M_AXI_GP0_wvalid  => m_wvalid
+            M_AXI_GP0_araddr  => ps_i.ar.addr,
+            M_AXI_GP0_arburst => ps_i.ar.burst,
+            M_AXI_GP0_arcache => ps_i.ar.cache,
+            M_AXI_GP0_arid    => ps_i.ar.id,
+            M_AXI_GP0_arlen   => ps_i.ar.len,
+            M_AXI_GP0_arlock  => ps_i.ar.lock,
+            M_AXI_GP0_arprot  => ps_i.ar.prot,
+            M_AXI_GP0_arqos   => ps_i.ar.qos,
+            M_AXI_GP0_arready => ps_o.arready,
+            M_AXI_GP0_arsize  => ps_i.ar.size,
+            M_AXI_GP0_arvalid => ps_i.ar.valid,
+            M_AXI_GP0_awaddr  => ps_i.aw.addr,
+            M_AXI_GP0_awburst => ps_i.aw.burst,
+            M_AXI_GP0_awcache => ps_i.aw.cache,
+            M_AXI_GP0_awid    => ps_i.aw.id,
+            M_AXI_GP0_awlen   => ps_i.aw.len,
+            M_AXI_GP0_awlock  => ps_i.aw.lock,
+            M_AXI_GP0_awprot  => ps_i.aw.prot,
+            M_AXI_GP0_awqos   => ps_i.aw.qos,
+            M_AXI_GP0_awready => ps_o.awready,
+            M_AXI_GP0_awsize  => ps_i.aw.size,
+            M_AXI_GP0_awvalid => ps_i.aw.valid,
+            M_AXI_GP0_bid     => ps_o.b.id,
+            M_AXI_GP0_bready  => ps_i.bready,
+            M_AXI_GP0_bresp   => ps_o.b.resp,
+            M_AXI_GP0_bvalid  => ps_o.b.valid,
+            M_AXI_GP0_rdata   => ps_o.r.data,
+            M_AXI_GP0_rid     => ps_o.r.id,
+            M_AXI_GP0_rlast   => ps_o.r.last,
+            M_AXI_GP0_rready  => ps_i.rready,
+            M_AXI_GP0_rresp   => ps_o.r.resp,
+            M_AXI_GP0_rvalid  => ps_o.r.valid,
+            M_AXI_GP0_wdata   => ps_i.w.data,
+            M_AXI_GP0_wid     => ps_i.w.id,
+            M_AXI_GP0_wlast   => ps_i.w.last,
+            M_AXI_GP0_wready  => ps_o.wready,
+            M_AXI_GP0_wstrb   => ps_i.w.strb,
+            M_AXI_GP0_wvalid  => ps_i.w.valid
         );
 
     ---------------------------------------------------------------------------
-    -- VHDL AXI slave, wired straight to the PS master
+    -- VHDL AXI slave, wired straight to the PS master (records)
     ---------------------------------------------------------------------------
     u_axi_regs : entity work.axi_regs
-        generic map (
-            C_DATA_WIDTH => 32,
-            C_ADDR_WIDTH => 32,
-            C_ID_WIDTH   => 12
-        )
         port map (
             reg_ps2pl_o   => reg_ps2pl,
             pl_active_o   => pl_active,
             s_axi_aclk    => clk,
             s_axi_aresetn => resetn,
-            s_axi_awid    => m_awid,
-            s_axi_awaddr  => m_awaddr,
-            s_axi_awlen   => m_awlen,
-            s_axi_awsize  => m_awsize,
-            s_axi_awburst => m_awburst,
-            s_axi_awlock  => m_awlock,
-            s_axi_awcache => m_awcache,
-            s_axi_awprot  => m_awprot,
-            s_axi_awqos   => m_awqos,
-            s_axi_awvalid => m_awvalid,
-            s_axi_awready => m_awready,
-            s_axi_wid     => m_wid,
-            s_axi_wdata   => m_wdata,
-            s_axi_wstrb   => m_wstrb,
-            s_axi_wlast   => m_wlast,
-            s_axi_wvalid  => m_wvalid,
-            s_axi_wready  => m_wready,
-            s_axi_bid     => m_bid,
-            s_axi_bresp   => m_bresp,
-            s_axi_bvalid  => m_bvalid,
-            s_axi_bready  => m_bready,
-            s_axi_arid    => m_arid,
-            s_axi_araddr  => m_araddr,
-            s_axi_arlen   => m_arlen,
-            s_axi_arsize  => m_arsize,
-            s_axi_arburst => m_arburst,
-            s_axi_arlock  => m_arlock,
-            s_axi_arcache => m_arcache,
-            s_axi_arprot  => m_arprot,
-            s_axi_arqos   => m_arqos,
-            s_axi_arvalid => m_arvalid,
-            s_axi_arready => m_arready,
-            s_axi_rid     => m_rid,
-            s_axi_rdata   => m_rdata,
-            s_axi_rresp   => m_rresp,
-            s_axi_rlast   => m_rlast,
-            s_axi_rvalid  => m_rvalid,
-            s_axi_rready  => m_rready
+            s_axi_i       => ps_i,
+            s_axi_o       => ps_o
         );
 
     ---------------------------------------------------------------------------
-    -- placeholder PL user logic (see axi_ps2pl earlier notes) - replace it
+    -- placeholder PL user logic - replace it
     ---------------------------------------------------------------------------
     heartbeat_proc : process (clk)
     begin

@@ -40,8 +40,9 @@ AXI slave written in VHDL.
 | `scripts/ps7_base_config.tcl` | full PS7 preset (DDR3 + GEM0 + UART1 + clocks), captured from the board |
 | `scripts/create_bd.tcl`       | builds the PS7-only `zynq_mini` block design, routes M_AXI_GP0 to the boundary, generates it as a plain entity (no wrapper) |
 | `scripts/build.tcl`           | top build flow: project → BD → add VHDL → synth → impl → bitstream → XSA |
-| `src/hdl/axi_regs.vhd`        | **VHDL AXI slave** for the raw M_AXI_GP0 (AXI3) — register file |
-| `src/hdl/zynq_mini_top.vhd`   | **hand-written VHDL top**, instantiates the BD + `axi_regs` |
+| `src/hdl/axi_pkg.vhd`         | AXI bus **direction records** — `axi_mosi_t` (master→slave), `axi_miso_t` (slave→master), nested per channel |
+| `src/hdl/axi_regs.vhd`        | **VHDL AXI slave** for the raw M_AXI_GP0 (AXI3); port is `s_axi_i : axi_mosi_t` / `s_axi_o : axi_miso_t` |
+| `src/hdl/zynq_mini_top.vhd`   | **hand-written VHDL top**; maps the flat `M_AXI_GP0_*` pins onto the records, instantiates the BD + `axi_regs` |
 | `src/constrs/zynq_mini.xdc`   | (empty — no external PL I/O in this design) |
 | `sim/tb_axi_regs.vhd`         | VUnit testbench: AXI3 master BFM driving `axi_regs` |
 | `sim/run.py`                  | VUnit run script (NVC backend) |
@@ -128,14 +129,32 @@ xil_printf("SUM  = %08x\n", Xil_In32(BASE + 0x14));  // 1234abcd
 xil_printf("BEAT = %08x\n", Xil_In32(BASE + 0x10));  // changes every read
 ```
 
+## AXI records (`axi_pkg.vhd`)
+
+The bus is carried on two direction records instead of ~60 loose signals:
+
+```
+axi_mosi_t  (master out / slave in)      axi_miso_t  (slave out / master in)
+  aw : axi_ax_t   -- id addr len size ...   awready
+  w  : axi_w_t    -- id data strb last ...  wready
+  bready                                    b  : axi_b_t   -- id resp valid
+  ar : axi_ax_t                             arready
+  rready                                    r  : axi_r_t   -- id data resp last valid
+```
+
+Widths (`AXI_ADDR_WIDTH`=32, `AXI_DATA_WIDTH`=32, `AXI_ID_WIDTH`=12,
+`AXI_LEN_WIDTH`=4) and the `AXI_BURST_*` / `AXI_RESP_*` / `*_IDLE` constants are
+in the package. `zynq_mini_top` maps the block design's flat `M_AXI_GP0_*` pins
+directly onto the record fields; `axi_regs` and the testbench use the records
+end to end.
+
 ## The VHDL AXI slave (`axi_regs.vhd`)
 
 Speaks the raw **AXI3 GP** protocol: 32-bit data/address, 12-bit IDs, 4-bit
 `AWLEN`/`ARLEN`, single- and multi-beat INCR/FIXED bursts (WRAP handled as
 INCR — fine for a register file). `BID`/`RID` reflect the request IDs so the PS
-never stalls. The `AxLOCK`/`AxCACHE`/`AxPROT`/`AxQOS` sidebands are accepted and
-ignored (this produces harmless "unconnected port" synthesis warnings, exactly
-like any minimal AXI slave).
+never stalls. `AxLOCK`/`AxCACHE`/`AxPROT`/`AxQOS` are carried in the record but
+ignored by the slave.
 
 ## Extending it
 
@@ -143,6 +162,8 @@ like any minimal AXI slave).
   `TOP_SOURCES`), clocked by `clk` / reset `resetn`. Read PS values from
   `reg_ps2pl`. To return values to the PS, add a read register in
   `axi_regs.vhd` (extend the read mux + the write decode).
+- **Reuse the AXI records**: `axi_pkg` gives you `axi_mosi_t` / `axi_miso_t` for
+  any other AXI slave (or a PL AXI master) you add.
 - **Add real PL I/O**: add a port to the `zynq_mini_top` entity **and** a
   `PACKAGE_PIN` / `IOSTANDARD` line in `src/constrs/zynq_mini.xdc` (pin numbers:
   `doc/mio_map.md`). Unconstrained top-level ports fail bitstream DRC.

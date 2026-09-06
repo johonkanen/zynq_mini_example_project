@@ -2,9 +2,9 @@
 -- tb_axi_regs.vhd  (VHDL-2008, VUnit)
 --
 -- Simulation model of the PS <-> PL AXI communication: a small AXI3 master
--- bus-functional model drives axi_regs exactly the way the Zynq M_AXI_GP0
--- port would, and the tests check the register behaviour, ID reflection and
--- burst handling.
+-- bus-functional model drives axi_regs through the axi_pkg direction records
+-- exactly the way the Zynq M_AXI_GP0 port would, and the tests check the
+-- register behaviour, ID reflection and burst handling.
 --
 --   Run:  python sim/run.py            (NVC backend, see sim/run.py)
 -------------------------------------------------------------------------------
@@ -16,58 +16,22 @@ use ieee.numeric_std.all;
 library vunit_lib;
 context vunit_lib.vunit_context;
 
+use work.axi_pkg.all;
+
 entity tb_axi_regs is
     generic (runner_cfg : string);
 end entity;
 
 architecture sim of tb_axi_regs is
 
-    constant ID_W : integer := 12;
     constant TCLK : time := 10 ns;      -- 100 MHz, same as FCLK_CLK0
 
     signal aclk    : std_logic := '0';
     signal aresetn : std_logic := '0';
     signal running : boolean := true;
 
-    -- AXI3 wires (master drives the *_m signals; slave drives *_ready / read data)
-    signal awid    : std_logic_vector(ID_W-1 downto 0) := (others => '0');
-    signal awaddr  : std_logic_vector(31 downto 0) := (others => '0');
-    signal awlen   : std_logic_vector(3 downto 0) := (others => '0');
-    signal awsize  : std_logic_vector(2 downto 0) := "010";      -- 4 bytes
-    signal awburst : std_logic_vector(1 downto 0) := "01";       -- INCR
-    signal awlock  : std_logic_vector(1 downto 0) := "00";
-    signal awcache : std_logic_vector(3 downto 0) := "0000";
-    signal awprot  : std_logic_vector(2 downto 0) := "000";
-    signal awqos   : std_logic_vector(3 downto 0) := "0000";
-    signal awvalid : std_logic := '0';
-    signal awready : std_logic;
-    signal wid     : std_logic_vector(ID_W-1 downto 0) := (others => '0');
-    signal wdata   : std_logic_vector(31 downto 0) := (others => '0');
-    signal wstrb   : std_logic_vector(3 downto 0) := "1111";
-    signal wlast   : std_logic := '0';
-    signal wvalid  : std_logic := '0';
-    signal wready  : std_logic;
-    signal bid     : std_logic_vector(ID_W-1 downto 0);
-    signal bresp   : std_logic_vector(1 downto 0);
-    signal bvalid  : std_logic;
-    signal bready  : std_logic := '0';
-    signal arid    : std_logic_vector(ID_W-1 downto 0) := (others => '0');
-    signal araddr  : std_logic_vector(31 downto 0) := (others => '0');
-    signal arlen   : std_logic_vector(3 downto 0) := (others => '0');
-    signal arsize  : std_logic_vector(2 downto 0) := "010";
-    signal arburst : std_logic_vector(1 downto 0) := "01";
-    signal arlock  : std_logic_vector(1 downto 0) := "00";
-    signal arcache : std_logic_vector(3 downto 0) := "0000";
-    signal arprot  : std_logic_vector(2 downto 0) := "000";
-    signal arqos   : std_logic_vector(3 downto 0) := "0000";
-    signal arvalid : std_logic := '0';
-    signal arready : std_logic;
-    signal rid     : std_logic_vector(ID_W-1 downto 0);
-    signal rdata   : std_logic_vector(31 downto 0);
-    signal rresp   : std_logic_vector(1 downto 0);
-    signal rlast   : std_logic;
-    signal rvalid  : std_logic;
-    signal rready  : std_logic := '0';
+    signal m2s : axi_mosi_t := AXI_MOSI_IDLE;   -- master -> slave (driven here)
+    signal s2m : axi_miso_t;                    -- slave  -> master
 
     signal reg_ps2pl : std_logic_vector(127 downto 0);
     signal pl_active : std_logic;
@@ -86,23 +50,10 @@ begin
     end process;
 
     dut : entity work.axi_regs
-        generic map (C_DATA_WIDTH => 32, C_ADDR_WIDTH => 32, C_ID_WIDTH => ID_W)
         port map (
             reg_ps2pl_o => reg_ps2pl, pl_active_o => pl_active,
             s_axi_aclk => aclk, s_axi_aresetn => aresetn,
-            s_axi_awid => awid, s_axi_awaddr => awaddr, s_axi_awlen => awlen,
-            s_axi_awsize => awsize, s_axi_awburst => awburst, s_axi_awlock => awlock,
-            s_axi_awcache => awcache, s_axi_awprot => awprot, s_axi_awqos => awqos,
-            s_axi_awvalid => awvalid, s_axi_awready => awready,
-            s_axi_wid => wid, s_axi_wdata => wdata, s_axi_wstrb => wstrb,
-            s_axi_wlast => wlast, s_axi_wvalid => wvalid, s_axi_wready => wready,
-            s_axi_bid => bid, s_axi_bresp => bresp, s_axi_bvalid => bvalid, s_axi_bready => bready,
-            s_axi_arid => arid, s_axi_araddr => araddr, s_axi_arlen => arlen,
-            s_axi_arsize => arsize, s_axi_arburst => arburst, s_axi_arlock => arlock,
-            s_axi_arcache => arcache, s_axi_arprot => arprot, s_axi_arqos => arqos,
-            s_axi_arvalid => arvalid, s_axi_arready => arready,
-            s_axi_rid => rid, s_axi_rdata => rdata, s_axi_rresp => rresp,
-            s_axi_rlast => rlast, s_axi_rvalid => rvalid, s_axi_rready => rready);
+            s_axi_i => m2s, s_axi_o => s2m);
 
     main : process
 
@@ -115,33 +66,34 @@ begin
         procedure axi_write_burst(constant addr  : natural;
                                   constant data  : slv32_array;
                                   constant id    : natural := 0;
-                                  constant burst : std_logic_vector(1 downto 0) := "01") is
+                                  constant burst : std_logic_vector(1 downto 0) := AXI_BURST_INCR) is
         begin
             -- address phase
-            awid    <= std_logic_vector(to_unsigned(id, ID_W));
-            awaddr  <= std_logic_vector(to_unsigned(addr, 32));
-            awlen   <= std_logic_vector(to_unsigned(data'length - 1, 4));
-            awburst <= burst;
-            awvalid <= '1';
-            loop wait until rising_edge(aclk); exit when awready = '1'; end loop;
-            awvalid <= '0';
+            m2s.aw.id    <= std_logic_vector(to_unsigned(id, AXI_ID_WIDTH));
+            m2s.aw.addr  <= std_logic_vector(to_unsigned(addr, AXI_ADDR_WIDTH));
+            m2s.aw.len   <= std_logic_vector(to_unsigned(data'length - 1, AXI_LEN_WIDTH));
+            m2s.aw.size  <= "010";                       -- 4 bytes
+            m2s.aw.burst <= burst;
+            m2s.aw.valid <= '1';
+            loop wait until rising_edge(aclk); exit when s2m.awready = '1'; end loop;
+            m2s.aw.valid <= '0';
             -- data phase
-            wid <= std_logic_vector(to_unsigned(id, ID_W));
+            m2s.w.id <= std_logic_vector(to_unsigned(id, AXI_ID_WIDTH));
             for i in data'range loop
-                wdata  <= data(i);
-                wstrb  <= "1111";
-                wlast  <= '1' when i = data'high else '0';
-                wvalid <= '1';
-                loop wait until rising_edge(aclk); exit when wready = '1'; end loop;
+                m2s.w.data  <= data(i);
+                m2s.w.strb  <= (others => '1');
+                m2s.w.last  <= '1' when i = data'high else '0';
+                m2s.w.valid <= '1';
+                loop wait until rising_edge(aclk); exit when s2m.wready = '1'; end loop;
             end loop;
-            wvalid <= '0';
-            wlast  <= '0';
+            m2s.w.valid <= '0';
+            m2s.w.last  <= '0';
             -- write response
-            bready <= '1';
-            loop wait until rising_edge(aclk); exit when bvalid = '1'; end loop;
-            check_equal(bresp, std_logic_vector'("00"), "BRESP OKAY");
-            check_equal(bid, std_logic_vector(to_unsigned(id, ID_W)), "BID reflects AWID");
-            bready <= '0';
+            m2s.bready <= '1';
+            loop wait until rising_edge(aclk); exit when s2m.b.valid = '1'; end loop;
+            check_equal(s2m.b.resp, AXI_RESP_OKAY, "BRESP OKAY");
+            check_equal(s2m.b.id, std_logic_vector(to_unsigned(id, AXI_ID_WIDTH)), "BID reflects AWID");
+            m2s.bready <= '0';
         end procedure;
 
         procedure axi_write(constant addr : natural; constant d : std_logic_vector(31 downto 0);
@@ -156,28 +108,29 @@ begin
                                  constant len   : positive;
                                  variable data  : out slv32_array;
                                  constant id    : natural := 0;
-                                 constant burst : std_logic_vector(1 downto 0) := "01") is
+                                 constant burst : std_logic_vector(1 downto 0) := AXI_BURST_INCR) is
         begin
-            arid    <= std_logic_vector(to_unsigned(id, ID_W));
-            araddr  <= std_logic_vector(to_unsigned(addr, 32));
-            arlen   <= std_logic_vector(to_unsigned(len - 1, 4));
-            arburst <= burst;
-            arvalid <= '1';
-            loop wait until rising_edge(aclk); exit when arready = '1'; end loop;
-            arvalid <= '0';
-            rready <= '1';
+            m2s.ar.id    <= std_logic_vector(to_unsigned(id, AXI_ID_WIDTH));
+            m2s.ar.addr  <= std_logic_vector(to_unsigned(addr, AXI_ADDR_WIDTH));
+            m2s.ar.len   <= std_logic_vector(to_unsigned(len - 1, AXI_LEN_WIDTH));
+            m2s.ar.size  <= "010";
+            m2s.ar.burst <= burst;
+            m2s.ar.valid <= '1';
+            loop wait until rising_edge(aclk); exit when s2m.arready = '1'; end loop;
+            m2s.ar.valid <= '0';
+            m2s.rready <= '1';
             for i in 0 to len - 1 loop
-                loop wait until rising_edge(aclk); exit when rvalid = '1'; end loop;
-                data(i) := rdata;
-                check_equal(rresp, std_logic_vector'("00"), "RRESP OKAY");
-                check_equal(rid, std_logic_vector(to_unsigned(id, ID_W)), "RID reflects ARID");
+                loop wait until rising_edge(aclk); exit when s2m.r.valid = '1'; end loop;
+                data(i) := s2m.r.data;
+                check_equal(s2m.r.resp, AXI_RESP_OKAY, "RRESP OKAY");
+                check_equal(s2m.r.id, std_logic_vector(to_unsigned(id, AXI_ID_WIDTH)), "RID reflects ARID");
                 if i = len - 1 then
-                    check_equal(rlast, '1', "RLAST on last beat");
+                    check_equal(s2m.r.last, '1', "RLAST on last beat");
                 else
-                    check_equal(rlast, '0', "RLAST low mid-burst");
+                    check_equal(s2m.r.last, '0', "RLAST low mid-burst");
                 end if;
             end loop;
-            rready <= '0';
+            m2s.rready <= '0';
         end procedure;
 
         procedure axi_read(constant addr : natural; variable d : out std_logic_vector(31 downto 0);
@@ -191,7 +144,7 @@ begin
         procedure do_reset is
         begin
             aresetn <= '0';
-            awvalid <= '0'; wvalid <= '0'; bready <= '0'; arvalid <= '0'; rready <= '0';
+            m2s <= AXI_MOSI_IDLE;
             tick(5);
             aresetn <= '1';
             tick(2);
@@ -234,7 +187,7 @@ begin
             elsif run("fixed_burst_write") then
                 -- FIXED burst: 3 beats all to SCRATCH0, last one wins
                 axi_write_burst(16#00#, (x"AAAAAAAA", x"BBBBBBBB", x"12345678"),
-                                id => 0, burst => "00");
+                                id => 0, burst => AXI_BURST_FIXED);
                 axi_read(16#00#, r);
                 check_equal(r, std_logic_vector'(x"12345678"), "FIXED burst last beat wins");
 
