@@ -12,18 +12,17 @@ AXI slave written in VHDL.
 ```
    zynq_mini_top.vhd  (VHDL-2008, synthesis top)
    |  entity ports = DDR_* + FIXED_IO_* only (auto-constrained by PS7)
+   |  internal PS<->PL bus = two record signals
    |
-   +-- u_bd : zynq_mini            <- generated block-design entity (PS7 only)
+   +-- u_ps : zynq_ps_wrapper
+   |     |   +-- zynq_mini  <- generated block-design entity (PS7 only)
+   |     |         DDR3 (MT41J256M16, 512 MB)
+   |     |         Ethernet GEM0 (RGMII + MDIO) / QSPI x4 / SD1 eMMC /
+   |     |         SD0 microSD / UART1 console
    |     |
-   |     |   DDR3 (MT41J256M16, 512 MB)
-   |     +---processing_system7----- Ethernet GEM0 (RGMII + MDIO) -> PHY
-   |     |        (PS7)              QSPI (single SS, x4)          -> boot flash
-   |     |                           SD1                          -> eMMC
-   |     |                           SD0                          -> microSD
-   |     |                           UART1                        -> USB console
-   |     |
-   |     +-- M_AXI_GP0 (AXI3, raw)  +  FCLK_CLK0 (100 MHz) / FCLK_RESET0_N
-   |            |                       exposed on the BD boundary
+   |     +-- clk / resetn          (FCLK_CLK0 100 MHz / FCLK_RESET0_N)
+   |     +-- m_axi_o : axi_mosi_t  \  raw M_AXI_GP0 (AXI3) packed into
+   |     +-- m_axi_i : axi_miso_t  /  the axi_pkg direction records
    |            v
    +-- u_axi_regs : axi_regs   <- AXI slave, 100% VHDL (src/hdl/axi_regs.vhd)
    |            |
@@ -42,7 +41,8 @@ AXI slave written in VHDL.
 | `scripts/build.tcl`           | top build flow: project → BD → add VHDL → synth → impl → bitstream → XSA |
 | `src/hdl/axi_pkg.vhd`         | AXI bus **direction records** — `axi_mosi_t` (master→slave), `axi_miso_t` (slave→master), nested per channel |
 | `src/hdl/axi_regs.vhd`        | **VHDL AXI slave** for the raw M_AXI_GP0 (AXI3); port is `s_axi_i : axi_mosi_t` / `s_axi_o : axi_miso_t` |
-| `src/hdl/zynq_mini_top.vhd`   | **hand-written VHDL top**; maps the flat `M_AXI_GP0_*` pins onto the records, instantiates the BD + `axi_regs` |
+| `src/hdl/zynq_ps_wrapper.vhd` | wraps the block design; packs the flat `M_AXI_GP0_*` pins into `m_axi_o`/`m_axi_i` records |
+| `src/hdl/zynq_mini_top.vhd`   | **synthesis top** — just `u_ps` + `u_axi_regs` + user logic, PS↔PL bus is 2 record signals |
 | `src/constrs/zynq_mini.xdc`   | (empty — no external PL I/O in this design) |
 | `sim/tb_axi_regs.vhd`         | VUnit testbench: AXI3 master BFM driving `axi_regs` |
 | `sim/run.py`                  | VUnit run script (NVC backend) |
@@ -144,9 +144,9 @@ axi_mosi_t  (master out / slave in)      axi_miso_t  (slave out / master in)
 
 Widths (`AXI_ADDR_WIDTH`=32, `AXI_DATA_WIDTH`=32, `AXI_ID_WIDTH`=12,
 `AXI_LEN_WIDTH`=4) and the `AXI_BURST_*` / `AXI_RESP_*` / `*_IDLE` constants are
-in the package. `zynq_mini_top` maps the block design's flat `M_AXI_GP0_*` pins
-directly onto the record fields; `axi_regs` and the testbench use the records
-end to end.
+in the package. `zynq_ps_wrapper` is the only place the flat `M_AXI_GP0_*` pins
+appear — it packs them into `m_axi_o` / `m_axi_i`, so `zynq_mini_top`, `axi_regs`
+and the testbench see nothing but the two records.
 
 ## The VHDL AXI slave (`axi_regs.vhd`)
 
