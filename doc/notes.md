@@ -1,54 +1,75 @@
 # Notes
 
-## Booting Linux on this board
+## The board
 
-This project only produces a bitstream + `.xsa`. Linux is a separate build on top
-of the `.xsa` (FSBL → U-Boot → kernel + device tree → rootfs, packed into
-`BOOT.BIN` + an SD card). Nothing in the FPGA design needs to change to support
-it — DDR3 (512 MB), UART1 console, QSPI, SD0 (microSD), SD1 (eMMC) and GEM0 are
-all already configured.
+**"Zynq Mini" XC7Z020-CLG400** — a cheap AliExpress Zynq-7020 board, reviewed on
+Habr: [habr.com/ru/articles/721146](https://habr.com/ru/articles/721146/)
+(English-friendly mirror: [pvsm.ru/fpga/383315](https://www.pvsm.ru/fpga/383315)).
+The Habr author, **Andrey Zaostrovnykh (@andreyzaostrovnykh)**, has a whole
+Zynq-7000 series covering this exact board and its close QMTech sibling.
 
-### The board
-
-Appears to be a **MicroPhase Z7-Lite 7020** (or a close clone). Matches the
-reference manual: `XC7Z020-1CLG400C` speed grade -2, one 512 MB DDR3
-(MT41J/MT41K 256M16), `W25Q128` 128 MB QSPI, `USB3320` ULPI PHY, JTAG/QSPI/SD
-boot jumper (J1). The vendor example set (OLED, dual OV5640, HDMI, lwIP) is
-MicroPhase's line-up. MicroPhase sells it "running Ubuntu/Debian", so a working
-Linux stack for this exact board exists — ask them for the PetaLinux BSP / SD
-image.
-
-### Board-specific resources
-
-| Resource | What it is |
+| | |
 |---|---|
-| <https://github.com/smirnovich/microphase-z7> | `linux/` folder with **Buildroot** instructions for the Z7-Lite (Vivado 2023.1). Incomplete in places but board-specific. |
-| <https://github.com/vanbwodonk/zynq_z7lite_training> | FPGA-only tutorials, **but ships `Schematic/Z7-LITE_Rev1_1.pdf`** — use it to confirm the Ethernet PHY wiring (see caveat below). |
-| <https://github.com/MicroPhase/fpga-docs> · <https://fpga-docs.microphase.cn> | Vendor docs. Z7-Lite manual points to Baidu courseware for the OS side. |
-| <https://github.com/hw/Microphase-Z7-Lite> | Z7-Lite **7010** notes; links to `github.com/vanbwodonk/zynq_z7lite_training`. |
+| SoC | XC7Z020-CLG400, speed grade -2 |
+| DDR3 | 512 MB, MT41J256M16 |
+| QSPI flash | **16 MB**, SOIC-8 (socketed / upgradeable) |
+| Ethernet | Gigabit **RTL8211E-class, RGMII**, on **PS GEM0 / MIO 16–27**, MDIO on MIO 52–53, **PHY address 0** |
+| USB | Host on USB-C, ULPI PHY (USB3320-class) |
+| HDMI | direct from PL GPIO, no companion/ESD chip (bit-banged TMDS: H16 H17 D19 D20 C20 B20 B19 A20 H18) |
+| OLED | 128×64 SSD1306, bit-banged 4-wire from PL (this repo's sibling example uses AXI-GPIO → E19 E18 F16 F17) |
+| clock | external 50 MHz oscillator to PL |
+| storage | microSD (SDIO0) + on-board eMMC (SDIO1) |
+| misc | I²C EEPROM 2 Kbit (PL), 5 LEDs (4 PL / 1 PS), 3 buttons (2 PL / 1 PS), 34 PL GPIO |
+| boot | 3-position switch: JTAG / QSPI / SD; on-board JTAG programmer |
 
-### From-scratch walkthroughs for XC7Z020
+The board ships with a **microSD that already has Linux on it** — you don't
+have to build anything to see it boot; the material below is for building your
+own image.
+
+## Booting Linux
+
+This project only produces a bitstream + `.xsa`. Nothing in the FPGA design
+needs to change to support Linux — DDR3, UART1 console, QSPI, microSD, eMMC and
+GEM0 are all configured. The `.xsa` feeds the FSBL and the base device tree.
+
+### Zaostrovnykh's Habr series — this board / its QMTech twin
+
+| Article | What it covers |
+|---|---|
+| [721146](https://habr.com/ru/articles/721146/) | Zynq Mini board review (this board) |
+| [559946](https://habr.com/ru/articles/559946/) | Getting started with Zynq-7000 (QMTech "Bajie", beginner) |
+| [565368](https://habr.com/ru/articles/565368/) | **Build Linux from scratch**: `u-boot-xlnx` (`xilinx_zynq_virt_defconfig`) → DTG (`device-tree-xlnx`) → `linux-xlnx` (`xilinx_zynq_defconfig`, `uImage` @ `0x8000`) → prebuilt rootfs → `uramdisk` → `BOOT.BIN` → SD. Its Ethernet section is **identical to this project's config** (RGMII, bank1 1.8 V, MIO 16:27, MDIO 52:53, RTL8211E, "Link is Up - 1Gbps"). |
+| [567408](https://habr.com/ru/articles/567408/) | Same, but rootfs + kernel via **Buildroot** (2021.05.x): ARM Cortex-A9 hardfp / glibc, kernel from `linux-xlnx` `xilinx_zynq_defconfig` `uImage`, SD FAT = `uImage` + `uramdisk.image.gz` + `devicetree.dtb`. |
+| [835912](https://habr.com/ru/companies/timeweb/articles/835912/) | **Boot Linux over JTAG with XSCT** on the Zynq Mini (uses a `zynqmini.dtb`). No SD flashing: `connect` → `fpga *.bit` → `dow fsbl.elf` → `source ps7_init.tcl; ps7_init; ps7_post_config` → `dow -data zynqmini.dtb 0x10000` → `dow u-boot.elf` → `dow -data uImage 0x3000000` → `dow -data rootfs.cpio.uboot 0x2000000` → `bootm 0x3000000 0x2000000 0x1f00000`. Confirms `phyaddr 0, interface rgmii-id`. Great for bring-up. |
+| [849032](https://habr.com/ru/companies/timeweb/articles/849032/) | HDMI from bare-metal on the Zynq Mini (companion, not Linux). Repo below. |
+
+Repo of lesson materials for this board:
+**<https://github.com/megalloid/zynq_mini_lessons>** (`first_lesson`, `hdmi_vdma`).
+
+### Other useful references
 
 | Resource | Notes |
 |---|---|
-| <https://github.com/Risto97/zturn_linux> | MYIR Z-Turn 7020, a near-identical XC7Z020 core board. **Full step-by-step README**: hardware export → FSBL in SDK → device tree via DTG → `make_uboot.sh` / `make_kernel.sh` → `BOOT.BIN` via a `.bif`. Most directly transferable recipe. |
-| <https://xilinx.github.io/Embedded-Design-Tutorials/docs/2023.1/build/html/docs/Introduction/Zynq7000-EDT/7-linux-booting-debug.html> | AMD/Xilinx *Zynq7000 Embedded Design Tutorials*, Ch. 7 "Linux Boot Image Configuration" — the canonical FSBL → U-Boot → kernel → rootfs → `BOOT.BIN` guide. |
-| <https://xilinx-wiki.atlassian.net/wiki/spaces/A/pages/18842369/Build+Linux+for+Zynq-7000+AP+SoC+using+Buildroot> | Xilinx Wiki — the lightweight Buildroot path. |
-| <https://github.com/Digilent/Petalinux-Zybo-Z7-20> | Same XC7Z020; maintained `system-user.dtsi` worth cribbing from. |
-| <https://www.allpcb.com/allelectrohub/building-a-linux-system-on-zynq-7020> · <https://pcbsync.com/xilinx-zynq-linux/> | Blog-style from-scratch writeups. |
+| [habr 1042798](https://habr.com/ru/articles/1042798/) | Linux on Zynq RK-7020-F via **Buildroot + U-Boot SPL** (modern, no FSBL) |
+| [habr 845714](https://habr.com/ru/companies/yadro/articles/845714/) / [852780](https://habr.com/ru/companies/yadro/articles/852780/) / [860428](https://habr.com/ru/companies/yadro/articles/860428/) | YADRO's thorough "Embedded Linux on Zynq" series (PL project → OS build → bring-up) |
+| [habr 1052912](https://habr.com/ru/articles/1052912/) | Loading the bitstream from Linux via the FPGA Manager |
+| <https://github.com/Risto97/zturn_linux> | MYIR Z-Turn 7020 (near-identical core board), full from-scratch README |
+| [Xilinx Zynq7000 EDT, Ch. 7](https://xilinx.github.io/Embedded-Design-Tutorials/docs/2023.1/build/html/docs/Introduction/Zynq7000-EDT/7-linux-booting-debug.html) | Canonical FSBL → U-Boot → kernel → rootfs → `BOOT.BIN` |
+| [Xilinx Wiki: Buildroot for Zynq-7000](https://xilinx-wiki.atlassian.net/wiki/spaces/A/pages/18842369/) | Lightweight path |
+| <https://github.com/Digilent/Petalinux-Zybo-Z7-20> | Same XC7Z020; maintained `system-user.dtsi` to crib from |
 
 ### Recommended path
 
-1. Check for a **MicroPhase PetaLinux BSP / SD image** first (vendor download or
-   support). Re-point it at `output/arm_fpga_zynq_mini.xsa`.
-2. Otherwise **PetaLinux**: `petalinux-create -t project -n zynqlin`,
-   `petalinux-config --get-hw-description output/arm_fpga_zynq_mini.xsa`, fix the
-   Ethernet / SD / flash nodes in `project-spec/meta-user/.../system-user.dtsi`,
-   `petalinux-build`, `petalinux-package --boot`. With a known PHY: ~1 day.
-3. Or **Buildroot** (`zynq_*_defconfig` template) for a lighter, faster stack.
+1. Start from the **stock SD image** or Zaostrovnykh's Buildroot config
+   ([567408](https://habr.com/ru/articles/567408/)) and re-point the FSBL +
+   device tree at `output/arm_fpga_zynq_mini.xsa`.
+2. For fast iteration, boot over **JTAG with XSCT** as in
+   [835912](https://habr.com/ru/companies/timeweb/articles/835912/) — no card
+   swapping.
+3. PetaLinux works too (`petalinux-config --get-hw-description output/arm_fpga_zynq_mini.xsa`).
 
-SD card layout: p1 FAT32 (`BOOT.BIN`, `Image`, `system.dtb`, `boot.scr`),
-p2 ext4 (rootfs). Set the J1 jumper to SD boot.
+SD card layout: p1 FAT32 (`BOOT.BIN`, `uImage`/`Image`, `*.dtb`, `boot.scr` or
+`uramdisk.image.gz`), p2 ext4 (rootfs). Boot switch → SD.
 
 ### Using `axi_regs` from Linux
 
@@ -62,34 +83,25 @@ axi_regs@40000000 {
 };
 ```
 
-Then `mmap` via UIO, or just `devmem2 0x40000000` to poke SCRATCH0 / read
+Then `mmap` via UIO, or `devmem2 0x40000000` to poke SCRATCH0 / read
 `0x4000001C` (SIGNATURE = `0x5A5A1234`).
 
----
+## Ethernet PHY — resolved
 
-## ⚠ Ethernet PHY caveat
+Earlier drafts of this file flagged a possible RTL8201F / RMII / EMIO wiring.
+That was from mistaking the board for a MicroPhase Z7-Lite. **This board's GEM0
+is what the project already assumes:**
 
-The PS7 configuration in this project was lifted from the vendor's bare-metal
-`arm_13_lwip` example. It puts **GEM0 on MIO 16–27 as RGMII** with MDIO on
-MIO 52–53 — which implies a **gigabit RGMII PHY** (RTL8211-class).
+- **RTL8211E-class gigabit PHY, RGMII**, on **PS MIO 16–27**, MDIO on MIO 52–53
+- **PHY address 0**, `phy-mode = "rgmii-id"`, `macb` / `cadence-gem` driver
+- Bank 1 = 1.8 V (already set in `ps7_base_config.tcl`)
 
-But the **Z7-Lite reference manual says RTL8201F (10/100)**, and
-`github.com/smirnovich/microphase-z7` describes the PHY reached via **EMIO / RMII**,
-not MIO / RGMII. These disagree — most likely different board revisions.
+Confirmed by the vendor's own `arm_13_lwip` example, the QMTech twin in Habr
+[565368](https://habr.com/ru/articles/565368/), and the Zynq Mini `zynqmini.dtb`
+in Habr [835912](https://habr.com/ru/companies/timeweb/articles/835912/)
+(`ZYNQ GEM: e000b000 ... phyaddr 0, interface rgmii-id`).
 
-**Before writing the Linux Ethernet device-tree node, confirm against the actual
-board / schematic (`Z7-LITE_Rev1_1.pdf`):**
-
-- PHY chip (RTL8211E/F ⇒ RGMII gigabit, or RTL8201F ⇒ RMII 10/100)
-- MIO RGMII vs EMIO RMII (Zynq GEM via the MIO pin group is **RGMII-only**;
-  RMII/MII need EMIO)
-- MDIO/PHY address
-- PHY reset line (this design routes none from the PS — if the PHY needs a
-  GPIO reset it must be added in the block design, or it is handled by board
-  hardware/POR)
-
-If the board really is RGMII gigabit on MIO (as the current config assumes), the
-DT node is standard: `phy-mode = "rgmii-id"`, `macb`/`cadence-gem` driver, PHY at
-its MDIO address. If it is RTL8201F on EMIO/RMII, the PS7 config **and** the
-block design need reworking (EMIO ENET0, `phy-mode = "rmii"`) — that is a design
-change, not just a device-tree edit.
+The board review calls the PHY "connected to PL"; take that to mean the RGMII
+lines are also brought to a PL header — the primary path is PS GEM0 over MIO.
+The design routes **no PHY reset from the PS**; if a soft reset is ever needed
+it must be added (MIO/EMIO GPIO), otherwise the PHY relies on board POR.
