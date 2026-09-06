@@ -86,22 +86,27 @@ axi_regs@40000000 {
 Then `mmap` via UIO, or `devmem2 0x40000000` to poke SCRATCH0 / read
 `0x4000001C` (SIGNATURE = `0x5A5A1234`).
 
-## Ethernet PHY — resolved
+## Ethernet — the board has TWO gigabit PHYs
 
-Earlier drafts of this file flagged a possible RTL8201F / RMII / EMIO wiring.
-That was from mistaking the board for a MicroPhase Z7-Lite. **This board's GEM0
-is what the project already assumes:**
+Earlier drafts of this file flagged a possible RTL8201F / RMII / EMIO wiring,
+from mistaking the board for a MicroPhase Z7-Lite. Wrong — it's the Zynq Mini,
+and it has **two RTL8211E gigabit PHYs**:
 
-- **RTL8211E-class gigabit PHY, RGMII**, on **PS MIO 16–27**, MDIO on MIO 52–53
-- **PHY address 0**, `phy-mode = "rgmii-id"`, `macb` / `cadence-gem` driver
-- Bank 1 = 1.8 V (already set in `ps7_base_config.tcl`)
+1. **PS GEM0**, RGMII, on **MIO 16–27**, MDIO on MIO 52–53, **PHY address 0**,
+   `phy-mode = "rgmii-id"`, `macb` / `cadence-gem` driver, bank 1 = 1.8 V.
+   This is exactly what `ps7_base_config.tcl` sets. Confirmed by the vendor
+   `arm_13_lwip` example, the QMTech twin in Habr
+   [565368](https://habr.com/ru/articles/565368/), and the `zynqmini.dtb` in
+   Habr [835912](https://habr.com/ru/companies/timeweb/articles/835912/)
+   (`ZYNQ GEM: e000b000 ... phyaddr 0, interface rgmii-id`). This is the one
+   Linux uses out of the box.
 
-Confirmed by the vendor's own `arm_13_lwip` example, the QMTech twin in Habr
-[565368](https://habr.com/ru/articles/565368/), and the Zynq Mini `zynqmini.dtb`
-in Habr [835912](https://habr.com/ru/companies/timeweb/articles/835912/)
-(`ZYNQ GEM: e000b000 ... phyaddr 0, interface rgmii-id`).
+2. **A second RTL8211E wired to the PL fabric** (RGMII), the "Ethernet PHY
+   connected to PL" from the board review. Pins (from `arm_fpga_09_pl_lwip` /
+   `fpga_14_eth_pl_mdio`): MDC `G18`, MDIO `G19`, **reset `G17`**, TXC `J14`,
+   TX_CTL `K14`, TD `N16 J19 H20 N15`, RXC `L16`, RX_CTL `L17`,
+   RD `L20 K19 J18 J20`. Reach it via a soft MAC in the PL, or route GEM1 out
+   through EMIO. See [`board_pinout.md`](board_pinout.md).
 
-The board review calls the PHY "connected to PL"; take that to mean the RGMII
-lines are also brought to a PL header — the primary path is PS GEM0 over MIO.
-The design routes **no PHY reset from the PS**; if a soft reset is ever needed
-it must be added (MIO/EMIO GPIO), otherwise the PHY relies on board POR.
+The PS GEM0 PHY has **no reset routed from the PS** — it relies on board POR; add
+a MIO/EMIO GPIO reset if you ever need one. The PL PHY's reset is `G17`.

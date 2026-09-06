@@ -42,7 +42,7 @@ mirror: [pvsm.ru/fpga/383315](https://www.pvsm.ru/fpga/383315)).
 | SoC | XC7Z020-CLG400, speed grade -2 |
 | DDR3 | 512 MB, MT41J256M16 (16-bit, 533 MHz) |
 | QSPI flash | 16 MB, socketed SOIC-8 |
-| Ethernet | gigabit **RTL8211E-class, RGMII**, on **PS GEM0 / MIO 16–27**, MDIO on MIO 52–53, PHY address 0 |
+| Ethernet | **two** gigabit RTL8211E PHYs: one on **PS GEM0 / MIO 16–27** (MDIO 52–53, PHY addr 0), one wired to the **PL fabric** (RGMII) |
 | USB | host on USB-C, ULPI PHY |
 | storage | microSD (SDIO0) + on-board eMMC (SDIO1) |
 | video / display | HDMI direct from PL GPIO (no companion chip); 128×64 OLED bit-banged from PL |
@@ -77,6 +77,7 @@ and its QMTech sibling, **including building Linux** — see [`doc/notes.md`](do
 | `sim/tb_axi_regs.vhd`         | VUnit testbench: AXI3 master BFM driving `axi_regs` |
 | `sim/run.py`                  | VUnit run script (NVC backend) |
 | `doc/mio_map.md`              | full PS MIO map of the board |
+| `doc/board_pinout.md`        | PL pin map (LEDs, OLED, HDMI, 2nd Ethernet, cameras) from the vendor XDCs |
 | `doc/notes.md`                | board details, Linux-boot resources (Habr series), `axi_regs` from Linux |
 
 `build/` and `output/` are generated and git-ignored. Everything is VHDL-2008.
