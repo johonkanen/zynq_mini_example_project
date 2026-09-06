@@ -157,6 +157,12 @@ BR2_LINUX_KERNEL_CUSTOM_DTS_PATH="/home/jari/dev/zynq_mini_example_project/linux
 # --- U-Boot SPL PS7 init: use the ps7_init_gpl.c from step 2 -------------
 BR2_TARGET_UBOOT_ZYNQ=y
 BR2_TARGET_UBOOT_ZYNQ_PS7_INIT_FILE="/home/jari/dev/zynqmini-linux/xsa/ps7_init_gpl.c"
+
+# --- extras for the JTAG path (step 9); harmless for the SD path --------
+BR2_TARGET_UBOOT_FORMAT_ELF=y      # -> output/images/u-boot  (ELF)
+BR2_TARGET_ROOTFS_CPIO=y           # keep EXT2 on too -> sdcard.img still built
+BR2_TARGET_ROOTFS_CPIO_GZIP=y
+BR2_TARGET_ROOTFS_CPIO_UIMAGE=y    # -> output/images/rootfs.cpio.uboot
 ```
 
 - `BR2_LINUX_KERNEL_CUSTOM_DTS_PATH` copies `zynq-zynqmini.dts` into the kernel
@@ -208,11 +214,13 @@ downloads from `ftpmirror.gnu.org` may 502 and retry — harmless). Results land
 ```
 output/images/
  ├─ boot.bin              (U-Boot SPL — runs your ps7_init, then loads u-boot.img)
- ├─ u-boot.img
+ ├─ u-boot.img            (SD path)
+ ├─ u-boot                (ELF — JTAG path)
  ├─ uImage                (Linux 6.18-xilinx, load 0x8000)
  ├─ zynq-zynqmini.dtb
  ├─ system.dtb            -> zynq-zynqmini.dtb (symlink, what extlinux loads)
- ├─ rootfs.ext4           (-> rootfs.ext2)
+ ├─ rootfs.ext4           (-> rootfs.ext2)      SD path
+ ├─ rootfs.cpio.uboot     (ramdisk uImage)      JTAG path
  └─ sdcard.img            (32M FAT32 boot + 60M ext4 rootfs — flash this)
 ```
 
@@ -274,26 +282,34 @@ buildroot login: root
 
 ## 9. Fast iteration over JTAG (no card swapping)
 
-`output/images/` has `u-boot.elf` (enable `BR2_TARGET_UBOOT_FORMAT_ELF=y` if
-missing), `uImage` and `zynq-zynqmini.dtb`; add an initramfs
-(`BR2_TARGET_ROOTFS_CPIO` + `BR2_TARGET_ROOTFS_CPIO_UIMAGE`) for a card-less
-rootfs. Load them straight into DDR over the on-board JTAG — recipe in
-[`notes.md`](notes.md) → Habr
-[835912](https://habr.com/ru/companies/timeweb/articles/835912/):
+The `zynqmini_defconfig` here already enables `BR2_TARGET_UBOOT_FORMAT_ELF=y`
+(→ `output/images/u-boot`, an ELF, entry `0x0400_0000`) and the ramdisk
+(`BR2_TARGET_ROOTFS_CPIO` + `_GZIP` + `_UIMAGE` → `rootfs.cpio.uboot`, a
+`-T ramdisk` uImage). With those plus `uImage` and `zynq-zynqmini.dtb`, load
+everything into DDR over the on-board JTAG (cf. [`notes.md`](notes.md) → Habr
+[835912](https://habr.com/ru/companies/timeweb/articles/835912/)):
 
 ```tcl
+cd ~/dev/zynqmini-linux/buildroot/output/images
 connect
 targets -set -filter {name =~ "*Cortex-A9 #0"}
 rst -system
 source ~/dev/zynqmini-linux/xsa/ps7_init.tcl ; ps7_init ; ps7_post_config
-dow -data zynq-zynqmini.dtb 0x00010000
-dow u-boot.elf
-dow -data uImage 0x03000000
-dow -data rootfs.cpio.uboot 0x02000000
+dow            u-boot                              ;# ELF, self-locating
+dow -data      uImage             0x08000000
+dow -data      rootfs.cpio.uboot  0x0c000000
+dow -data      zynq-zynqmini.dtb  0x0e000000
 con
 ```
 
-Then in U-Boot: `bootm 0x03000000 0x02000000 0x00010000`.
+Stop autoboot, then in U-Boot:
+
+```
+bootm 0x08000000 0x0c000000 0x0e000000
+```
+
+(Addresses kept well clear of U-Boot's load/relocation area. `uImage` carries
+load `0x8000`, so `bootm` relocates the kernel down itself.)
 
 ---
 
