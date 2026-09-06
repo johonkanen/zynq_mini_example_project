@@ -23,8 +23,10 @@ sw\uart_test.bat build      :: build only  -> build_sw/uart_test/.../uart_test.e
 sw\uart_test.bat run        :: load + run only
 ```
 
-Verified on the board: the controller self-test reports
-`UART1 CONTROLLER SELF-TEST : PASS (256/256)` back over JTAG.
+Verified on the board, both halves: the controller self-test reports
+`UART1 CONTROLLER SELF-TEST : PASS (256/256)` back over JTAG, and the phase-2
+banner + echo appear on the serial terminal — so UART1 + MIO 48/49 + the CH340
+bridge all work.
 
 `sw/uart_test/src/main.c` does two things:
 
