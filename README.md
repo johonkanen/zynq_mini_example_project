@@ -76,7 +76,7 @@ and its QMTech sibling, **including building Linux** — see [`doc/notes.md`](do
 | `src/constrs/zynq_mini.xdc`   | (empty — no external PL I/O in this design) |
 | `sim/tb_axi_regs.vhd`         | VUnit testbench: AXI3 master BFM driving `axi_regs` |
 | `sim/run.py`                  | VUnit run script (NVC backend) |
-| `sw/`                         | **bare-metal UART1 test** — JTAG only, no SD card (`sw/README.md`) |
+| `sw/`                         | **bare-metal bring-up test** — PS UART1 + PS↔PL AXI, JTAG only (`sw/README.md`) |
 | `doc/mio_map.md`              | full PS MIO map of the board |
 | `doc/board_pinout.md`        | PL pin map (LEDs, OLED, HDMI, 2nd Ethernet, cameras) from the vendor XDCs |
 | `doc/notes.md`                | board details, Linux-boot resources (Habr series), `axi_regs` from Linux |
@@ -129,18 +129,22 @@ Cases: `signature`, `single_write_read`, `id_reflection` (BID/RID reflect
 AW/AR ID), `incr_burst_write_then_read`, `fixed_burst_write`, `pl_computes_sum`,
 `status_word`, `control_and_heartbeat`.
 
-## Test the board — UART1, no SD card
+## Test the board — no SD card
 
-With the board on JTAG only (Vitis 2024.2 + `xsct`, `output/*.xsa` built):
+With the board on JTAG only (Vitis 2024.2 + `xsct`, `output/*.xsa` + `*.bit` built):
 
 ```
-xsct sw/uart_poke.tcl     :: 15 s smoke test - pokes text to the UART1 TX FIFO
-sw\uart_test.bat          :: build + load a bare-metal app: loopback self-test
-                          ::   (PASS/FAIL read back over JTAG) + RX echo
+sw\uart_test.bat          :: build + load a bare-metal app that checks
+                          ::   1. PS UART1 (internal loopback, 256/256)
+                          ::   2. PS <-> PL: the M_AXI_GP0 bus to axi_regs
+                          ::      (SIGNATURE / loopback / SUM / HEARTBEAT / STATUS)
+                          ::   3. banner + RX echo
+xsct sw/uart_poke.tcl     :: 15 s UART1-only smoke test, no build
 ```
 
-Open a serial terminal at **115200 8N1** on the board's COM port to watch it.
-Details in [`sw/README.md`](sw/README.md).
+Both self-tests are read back over JTAG (`PASS`/`FAIL` without a terminal);
+open a serial terminal at **115200 8N1** for the full report + echo. Verified
+on hardware — both `PASS`. Details in [`sw/README.md`](sw/README.md).
 
 ## Register map (`axi_regs`)
 
