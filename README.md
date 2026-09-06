@@ -47,6 +47,7 @@ AXI slave written in VHDL.
 | `sim/tb_axi_regs.vhd`         | VUnit testbench: AXI3 master BFM driving `axi_regs` |
 | `sim/run.py`                  | VUnit run script (NVC backend) |
 | `doc/mio_map.md`              | full PS MIO map of the board |
+| `doc/notes.md`                | Linux-boot resources + the Ethernet PHY caveat |
 
 `build/` and `output/` are generated and git-ignored. Everything is VHDL-2008.
 
