@@ -1,0 +1,5 @@
+# Normalise line endings - keep LF in the repo for all text sources
+*           text=auto eol=lf
+*.bat       text eol=crlf
+*.bit       binary
+*.xsa       binary

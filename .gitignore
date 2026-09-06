@@ -1,0 +1,19 @@
+# Vivado build outputs
+/build/
+/output/
+/NA/
+*.jou
+*.log
+*.str
+.Xil/
+vivado*.backup.*
+usage_statistics_webtalk.*
+webtalk*.jou
+webtalk*.log
+
+# VUnit / NVC simulation outputs
+/vunit_out/
+*.wdb
+
+# generated, but keep the regenerable BD Tcl under version control if you like
+scripts/zynq_mini_bd.tcl
