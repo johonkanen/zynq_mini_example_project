@@ -27,6 +27,21 @@ Console: **UART1 on MIO 48/49**, `ttyPS0`, **115200 8N1** (the board's
 USB-serial port — see [`mio_map.md`](mio_map.md)). Ethernet: **GEM0 / RGMII /
 RTL8211E, PHY address 0, `phy-mode = "rgmii-id"`**.
 
+## TL;DR — one script
+
+[`linux/build-linux.sh`](../linux/build-linux.sh) runs steps 1–8 below
+(idempotent — re-run it any time):
+
+```bash
+./linux/build-linux.sh
+#   env knobs: LINUX_BUILD_DIR, BUILDROOT_VERSION, JOBS, SKIP_FPGA=1
+```
+
+It builds the `.xsa` if missing, extracts and patches `ps7_init_gpl.*`, clones
+Buildroot, writes the overlay + `configs/zynqmini_defconfig`, and `make`s — into
+`$LINUX_BUILD_DIR/buildroot/output/images/` (default `../zynqmini-linux`). The
+rest of this doc is what it does, step by step.
+
 ## Prerequisites
 
 | Tool | Notes |
