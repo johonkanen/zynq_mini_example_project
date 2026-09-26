@@ -6,7 +6,8 @@
 #   1. FPGA .xsa/.bit           (scripts/build.tcl, only if missing)
 #   2. ps7_init_gpl.{c,h}       (unzip from the .xsa + patch K&R prototypes)
 #   3. Buildroot checkout       (pinned, shallow clone)
-#   4. rootfs overlay           (S95fpga -> fpgautil loads the PL at boot)
+#   4. rootfs overlay           (S95fpga -> fpgautil loads the PL at boot,
+#                                root's SSH authorized_keys)
 #   5. configs/zynqmini_defconfig  (zynq_zed_defconfig + board-specific deltas)
 #   6. make                     (clean PATH so Buildroot tolerates WSL)
 #
@@ -19,6 +20,9 @@
 #   BUILDROOT_VERSION git tag                 (default: 2026.08)
 #   JOBS             make -j                  (default: nproc)
 #   SKIP_FPGA=1      don't run ./build.sh even if the .xsa is missing
+#   SSH_PUBKEYS      public key file(s) allowed to SSH in as root
+#                    (default: ~/.ssh/*.pub; the image has no root password,
+#                    so without a key SSH login is impossible - serial still works)
 #-----------------------------------------------------------------------------
 set -euo pipefail
 
@@ -103,6 +107,20 @@ esac
 EOS
 chmod +x "$OV/rootfs/etc/init.d/S95fpga"
 
+# SSH: key-only root login (root has no password; dropbear rejects blank
+# passwords unless run with -B, so password login over the network stays off)
+rm -rf "$OV/rootfs/root/.ssh"
+keys=$(ls ${SSH_PUBKEYS:-$HOME/.ssh/*.pub} 2>/dev/null || true)
+if [ -n "$keys" ]; then
+    mkdir -p "$OV/rootfs/root/.ssh"
+    chmod 700 "$OV/rootfs/root" "$OV/rootfs/root/.ssh"
+    cat $keys > "$OV/rootfs/root/.ssh/authorized_keys"
+    chmod 600 "$OV/rootfs/root/.ssh/authorized_keys"
+    echo "SSH: authorized_keys <- $(echo $keys | tr '\n' ' ')"
+else
+    printf '\033[1;33mWARNING: no SSH public key found (SSH_PUBKEYS / ~/.ssh/*.pub) - SSH login will not work\033[0m\n'
+fi
+
 cat > "$OV/copy-bitstream.sh" <<EOS
 #!/bin/sh
 # Buildroot POST_BUILD hook (\$1 = TARGET_DIR): stage the bitstream into the rootfs.
@@ -132,12 +150,19 @@ BR2_TARGET_ROOTFS_CPIO=y
 BR2_TARGET_ROOTFS_CPIO_GZIP=y
 BR2_TARGET_ROOTFS_CPIO_UIMAGE=y
 BR2_ROOTFS_OVERLAY="$OV/rootfs"
+BR2_SYSTEM_DHCP="eth0"
+BR2_PACKAGE_DROPBEAR=y
+BR2_PACKAGE_DROPBEAR_DISABLE_REVERSEDNS=y
 EOS
 
 #--- 6. build (clean PATH: Buildroot rejects the WSL Windows PATH) ------
 log "make zynqmini_defconfig && make -j$JOBS"
 env -i HOME="$HOME" PATH="$CLEAN_PATH" TERM="${TERM:-xterm}" \
-    bash -c "cd '$BR' && make zynqmini_defconfig && make -j$JOBS"
+    bash -c "cd '$BR' && make zynqmini_defconfig && \
+             { [ ! -d output/build/ifupdown-scripts ] || make ifupdown-scripts-reinstall; } && \
+             make -j$JOBS"
+# (ifupdown-scripts writes /etc/network/interfaces from BR2_SYSTEM_DHCP only at
+#  install time; reinstall it so a DHCP-setting change reaches an existing tree)
 
 #--- done ------------------------------------------------------------
 IMG="$BR/output/images"
@@ -149,5 +174,6 @@ cat <<EOS
   SD boot :  sudo dd if=$IMG/sdcard.img of=/dev/sdX bs=4M conv=fsync status=progress
              boot switch = SD
   console :  115200 8N1 on UART1 (MIO 48/49),  login: root  (no password)
+  network :  eth0 via DHCP;  ssh root@<board-ip>  (key auth only)
   JTAG    :  see doc/linux_build.md section 9
 EOS

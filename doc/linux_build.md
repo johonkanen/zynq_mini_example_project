@@ -182,7 +182,18 @@ BR2_TARGET_ROOTFS_CPIO_UIMAGE=y    # -> output/images/rootfs.cpio.uboot
 # --- auto-load the PL bitstream at boot (step 10) ----------------------
 BR2_ROOTFS_OVERLAY="<abs>/board/zynqmini/overlay/rootfs"
 BR2_ROOTFS_POST_BUILD_SCRIPT="board/zynq/post-build.sh <abs>/board/zynqmini/overlay/copy-bitstream.sh"
+
+# --- network: DHCP on eth0 + SSH (dropbear) ----------------------------
+BR2_SYSTEM_DHCP="eth0"
+BR2_PACKAGE_DROPBEAR=y
+BR2_PACKAGE_DROPBEAR_DISABLE_REVERSEDNS=y   # no DNS on the LAN -> no slow logins
 ```
+
+**SSH is key-only.** root has no password, and dropbear refuses blank passwords
+(unless started with `-B`), so password login over the network is impossible.
+`build-linux.sh` puts your public key(s) (`SSH_PUBKEYS`, default `~/.ssh/*.pub`)
+into the overlay as `/root/.ssh/authorized_keys`; then `ssh root@<board-ip>`.
+Host keys are generated on first boot and kept in `/etc/dropbear` (rootfs is rw).
 
 - `BR2_LINUX_KERNEL_CUSTOM_DTS_PATH` copies `zynq-zynqmini.dts` into the kernel
   tree; `..._INTREE_DTS_NAME` set to the same basename makes `board/zynq/`'s
