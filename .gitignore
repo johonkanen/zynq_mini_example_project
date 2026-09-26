@@ -21,3 +21,6 @@ webtalk*.log
 
 # generated, but keep the regenerable BD Tcl under version control if you like
 scripts/zynq_mini_bd.tcl
+
+# TFTP payload for linux/reflash-sd.sh (sdcard.img etc.)
+/build_tftp/

@@ -314,6 +314,7 @@ connect
 targets -set -filter {name =~ "*Cortex-A9 #0"}
 rst -system
 source ~/dev/zynqmini-linux/xsa/ps7_init.tcl ; ps7_init ; ps7_post_config
+dow -data      ../build/uboot-custom/u-boot.dtb  0x00100000  ;# U-Boot's OWN DT - the ELF has none
 dow            u-boot                              ;# ELF, self-locating
 dow -data      uImage             0x08000000
 dow -data      rootfs.cpio.uboot  0x0c000000
@@ -326,6 +327,10 @@ Stop autoboot, then in U-Boot:
 ```
 bootm 0x08000000 0x0c000000 0x0e000000
 ```
+
+A JTAG-loaded U-Boot ELF reads its device tree from `0x100000`
+(`CONFIG_XILINX_OF_BOARD_DTB_ADDR`); without that `dow` it has no DT and hangs.
+`u-boot.dtb` is U-Boot's `zynq-zed` tree from the build dir, not the kernel's.
 
 (Addresses kept well clear of U-Boot's load/relocation area. `uImage` carries
 load `0x8000`, so `bootm` relocates the kernel down itself.)
@@ -402,6 +407,62 @@ devmem2 0x40000010         # HEARTBEAT, changes every read
 
 See [`notes.md`](notes.md) → Habr [1052912](https://habr.com/ru/articles/1052912/)
 for the FPGA-manager / `fpga-region` route and the `axi_regs` UIO node.
+
+---
+
+## 11. Reflash the SD card in the board over TFTP
+
+Rewrite the microSD without taking it out: U-Boot is loaded over JTAG, pulls
+`sdcard.img` from a TFTP server into RAM, writes it to `mmc 0`, reads it back and
+compares, then boots the fresh card.
+
+**Once per build** (WSL) — fills `build_tftp/` (gitignored):
+
+```bash
+./linux/reflash-sd.sh <pc-ip>                # board uses DHCP
+./linux/reflash-sd.sh <pc-ip> <board-ip>     # or a static board IP
+```
+
+and serve `build_tftp/` over TFTP (UDP 69): on Windows Tftpd64 with its directory
+set to the `\\wsl.localhost\...\build_tftp` path the script prints; or
+`tftpd-hpa` inside WSL, which needs `networkingMode=mirrored` in `.wslconfig`
+(WSL2's default NAT hides it from the LAN).
+
+**Per card:** boot switch = **JTAG**, card in, Ethernet cable in, power on, then
+on Windows:
+
+```
+linux\reflash_sd.bat          :: set XSCT=...\xsct.bat if xsct is not on PATH
+```
+
+`reflash_sd.tcl` checks the boot mode register (refuses unless JTAG), runs
+`ps7_init`, loads `u-boot.dtb` @`0x100000`, `reflash.scr` @`0x3000000`
+(`${scriptaddr}`) and the U-Boot ELF. In JTAG boot mode U-Boot's distro boot runs
+`bootcmd_jtag` = `source ${scriptaddr}`, so the reflash starts on its own. The
+serial console (115200 8N1) shows:
+
+```
+================ reflash microSD (mmc 0) from TFTP ================
+reflash: tftp <pc-ip>:sdcard.img -> 0x08000000
+reflash: writing 0x2e001 blocks to mmc 0 ...
+reflash: reading back to verify ...
+Total of 24117504 word(s) were the same
+================ reflash: DONE - booting the new card ================
+```
+
+The script disables the `jtag`/`pxe`/`dhcp` boot targets after it runs, so on
+success distro boot continues to `mmc0` and boots the new image right away. On
+any failure it disables the rest too and stops at the U-Boot prompt. Set the
+switch back to SD for normal power-ups.
+
+Already at a U-Boot prompt on a board that boots (switch = SD)? Same script, one line:
+
+```
+setenv autoload no; dhcp; tftpboot ${scriptaddr} <pc-ip>:reflash.scr; source ${scriptaddr}
+```
+
+RAM buffers: image @`0x08000000`, read-back @`0x10000000`, so images up to
+128 MB (today's is 96 MB).
 
 ---
 
