@@ -1,0 +1,1 @@
+source "$BR2_EXTERNAL_ZYNQMINI_PATH/package/fpga-webstream/Config.in"

@@ -477,6 +477,56 @@ RAM buffers: image @`0x08000000`, read-back @`0x10000000`, so images up to
 
 ---
 
+## 12. Live PL data in the browser (`fpga-webstream`)
+
+`http://<board-ip>/` shows a live chart of data read from the PL. Step 1 streams
+the existing `axi_regs` `HEARTBEAT` counter (`0x4000_0010`, +1 per 100 MHz AXI
+clock). The page plots the raw counter (a sawtooth that wraps every ~43 s) and
+the PL clock measured from it (ΔHEARTBEAT/Δt ≈ 100 MHz), which exercises the
+whole path end to end.
+
+```
+PL axi_regs ──GP0──► /dev/uioN (mmap) ──► fpga-webstream ──SSE──► browser
+                                           sampler 200 Hz,           canvas chart,
+                                           20 batches/s              last 10 s
+```
+
+- **Server:** `linux/fpga-webstream/` — C, on the civetweb library (Buildroot
+  `BR2_PACKAGE_CIVETWEB_LIB`, MIT). The page (`index.html`) is compiled into the
+  binary (`page.S` `.incbin`); the board needs no internet. Endpoints:
+  `/` (page), `/events` (Server-Sent Events), `/api/status` (JSON).
+- **Why SSE, not WebSocket:** Buildroot's civetweb is built without WebSocket
+  support, and a display-only stream doesn't need it. SSE is plain HTTP and
+  `EventSource` reconnects on its own. Controls can be added as HTTP POSTs.
+- **Package:** `BR2_EXTERNAL` tree `linux/br2-external/` (`fpga-webstream`,
+  `S97fpga-webstream` init script — after `S95fpga` loads the PL).
+  `build-linux.sh` passes `BR2_EXTERNAL` and enables it.
+- **UIO binding:** the DTS node `axi_regs@40000000` is `compatible =
+  "generic-uio"`; the built-in `uio_pdrv_genirq` only binds it with
+  `uio_pdrv_genirq.of_id=generic-uio` on the kernel command line. SD boot gets
+  it from `extlinux.conf` (appended by the post-build hook), the JTAG/`bootm`
+  path from the DTS `chosen/bootargs`.
+- **Bus safety:** registers are read only while
+  `/sys/class/fpga_manager/fpga0/state` is `operating` *and* `SIGNATURE` reads
+  `0x5A5A1234` (a GP0 read with no PL design can stall the bus). Otherwise the
+  page shows *PL: not configured* and the server re-checks every sample.
+
+On the board:
+
+```sh
+/etc/init.d/S97fpga-webstream restart     # start/stop/restart
+logread | grep fpga-webstream             # its log (syslog)
+ls /sys/class/uio/                        # uio0 -> name "axi_regs"
+curl http://127.0.0.1/api/status
+```
+
+Try it on a PC without the board (fakes a 100 MHz counter): build
+`main.c page.S` against civetweb's `src/civetweb.c` (`-DNO_SSL`), then
+`FPGA_WEBSTREAM_SIM=1 ./fpga-webstream -p 8088 -f` and open
+`http://localhost:8088/`.
+
+---
+
 ## Version matrix
 
 | Component | Version | Config |

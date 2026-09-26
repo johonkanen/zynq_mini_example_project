@@ -1,0 +1,9 @@
+config BR2_PACKAGE_FPGA_WEBSTREAM
+	bool "fpga-webstream"
+	depends on BR2_TOOLCHAIN_HAS_THREADS
+	depends on BR2_USE_MMU
+	select BR2_PACKAGE_CIVETWEB
+	select BR2_PACKAGE_CIVETWEB_LIB
+	help
+	  Web page on port 80 that streams live data from the PL
+	  (axi_regs over UIO) to the browser with Server-Sent Events.

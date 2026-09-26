@@ -79,6 +79,8 @@ and its QMTech sibling, **including building Linux** — see [`doc/notes.md`](do
 | `sw/`                         | **bare-metal bring-up test** — PS UART1 + PS↔PL AXI, JTAG only (`sw/README.md`) |
 | `linux/build-linux.sh`        | one-shot Buildroot Linux image build (`doc/linux_build.md`) |
 | `linux/reflash-sd.sh` + `reflash_sd.bat`/`.tcl` | reflash the microSD in the board over TFTP, U-Boot driven via JTAG |
+| `linux/fpga-webstream/`       | live PL data web page (C + civetweb, Server-Sent Events) — `doc/linux_build.md` §12 |
+| `linux/br2-external/`         | Buildroot external tree: the `fpga-webstream` package + init script |
 | `linux/zynq-zynqmini.dts`     | kernel device tree for the board (used by `doc/linux_build.md`) |
 | `doc/mio_map.md`              | full PS MIO map of the board |
 | `doc/board_pinout.md`        | PL pin map (LEDs, OLED, HDMI, 2nd Ethernet, cameras) from the vendor XDCs |

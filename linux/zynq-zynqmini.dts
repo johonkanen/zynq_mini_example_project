@@ -38,7 +38,13 @@
 	};
 
 	chosen {
-		/* bootargs come from extlinux.conf; keep only the console hint */
+		/*
+		 * Used when U-Boot boots without bootargs (the JTAG/bootm path).
+		 * SD boot takes bootargs from extlinux.conf instead - build-linux.sh
+		 * appends the same uio_pdrv_genirq.of_id there. That argument binds
+		 * compatible = "generic-uio" nodes (axi_regs) to /dev/uioN.
+		 */
+		bootargs = "console=ttyPS0,115200 earlycon uio_pdrv_genirq.of_id=generic-uio";
 		stdout-path = "serial0:115200n8";
 	};
 
