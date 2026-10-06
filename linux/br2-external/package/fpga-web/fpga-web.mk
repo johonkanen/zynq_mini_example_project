@@ -10,6 +10,13 @@ FPGA_WEB_SITE_METHOD = local
 FPGA_WEB_LICENSE = MIT
 FPGA_WEB_DEPENDENCIES = fpgad civetweb
 
+# fpga-web's /ws endpoint needs civetweb built with WebSocket support, which
+# Buildroot's civetweb package leaves out. BR2_EXTERNAL makefiles are included
+# after Buildroot's own packages and CIVETWEB_BUILD_CMDS expands this lazily,
+# so appending here is enough. An already-built civetweb needs
+# `make civetweb-dirclean` once (build-linux.sh does it).
+CIVETWEB_CONF_OPTS += WITH_WEBSOCKET=1
+
 define FPGA_WEB_BUILD_CMDS
 	$(TARGET_MAKE_ENV) $(MAKE) $(TARGET_CONFIGURE_OPTS) -C $(@D)
 endef

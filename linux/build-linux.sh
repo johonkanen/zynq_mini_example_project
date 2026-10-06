@@ -213,6 +213,8 @@ env -i HOME="$HOME" PATH="$CLEAN_PATH" TERM="${TERM:-xterm}" \
              { [ ! -d output/build/ifupdown-scripts ] || make ifupdown-scripts-reinstall; } && \
              { [ ! -f output/images/zynq-zynqmini.dtb ] || [ ! '$DTS' -nt output/images/zynq-zynqmini.dtb ] \
                || make linux-rebuild; } && \
+             { ! ls output/target/usr/lib/libcivetweb.so.1.* >/dev/null 2>&1 || \
+               grep -aq 258EAFA5 output/target/usr/lib/libcivetweb.so.1.* || make civetweb-dirclean; } && \
              { [ ! -d output/build/fpgad-1.0 ] || make fpgad-rebuild; } && \
              { [ ! -d output/build/fpga-web-1.0 ] || make fpga-web-rebuild; } && \
              make -j$JOBS"
@@ -222,6 +224,8 @@ env -i HOME="$HOME" PATH="$CLEAN_PATH" TERM="${TERM:-xterm}" \
 #  - the custom DTS is copied into the kernel tree only during the linux build
 #    -> linux-rebuild when the repo DTS is newer than the built .dtb
 #  - fpgad / fpga-web are local-source packages -> rebuild to pick up source edits
+#  - civetweb built before fpga-web.mk turned on WITH_WEBSOCKET lacks the
+#    WebSocket handshake (its RFC 6455 GUID 258EAFA5-...) -> dirclean, rebuilt
 
 #--- done ------------------------------------------------------------
 IMG="$BR/output/images"

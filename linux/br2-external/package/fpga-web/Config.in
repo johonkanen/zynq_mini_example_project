@@ -6,5 +6,6 @@ config BR2_PACKAGE_FPGA_WEB
 	select BR2_PACKAGE_CIVETWEB
 	select BR2_PACKAGE_CIVETWEB_LIB
 	help
-	  Web UI on port 80: register read/write and a live HEARTBEAT
-	  stream. Talks only to fpgad; never maps the FPGA itself.
+	  Web UI on port 80: register read/write and live register plots
+	  (uPlot, binary WebSocket stream). Talks only to fpgad; never
+	  maps the FPGA itself. Turns on civetweb's WebSocket support.

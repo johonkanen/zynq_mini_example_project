@@ -10,7 +10,7 @@ fpga-web: main.o page.o
 main.o: main.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
 
-page.o: page.S index.html
+page.o: page.S index.html vendor/uPlot.iife.min.js vendor/uPlot.min.css
 	$(CC) $(CPPFLAGS) -c -o $@ page.S
 
 clean:

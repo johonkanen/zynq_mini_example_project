@@ -10,7 +10,7 @@
 #   dtb      output/images/zynq-zynqmini.dtb -> SD boot partition  /system.dtb
 #   bit      output/arm_fpga_zynq_mini.bit   -> /lib/firmware/*.bit.bin (via bit2bin.py), PL reloaded now
 #   fpgad    fpgad + fpgactl                 -> /usr/sbin, /usr/bin; fpgad restarted
-#   web      fpga-web                        -> /usr/bin, service restarted
+#   web      fpga-web + libcivetweb          -> /usr/bin, /usr/lib; service restarted
 #   all      all of the above
 #
 # Unchanged files (same md5 as on the board) are skipped. The board reboots
@@ -139,9 +139,13 @@ fi
 
 if want web; then
     log "fpga-web"
-    if push "$BR/target/usr/bin/fpga-web" /usr/bin/fpga-web 755; then
-        rsh "/etc/init.d/S97fpga-web restart"
-    fi
+    restart=0
+    # civetweb with WebSocket support (fpga-web.mk turns it on) for /ws
+    lib=$(cd "$BR/target/usr/lib" && ls libcivetweb.so.1.* 2>/dev/null | head -1)
+    [ -n "$lib" ] || die "missing $BR/target/usr/lib/libcivetweb.so.1.* - build it first"
+    push "$BR/target/usr/lib/$lib" "/usr/lib/$lib" 755 && restart=1
+    push "$BR/target/usr/bin/fpga-web" /usr/bin/fpga-web 755 && restart=1
+    [ "$restart" = 0 ] || rsh "/etc/init.d/S97fpga-web restart"
 fi
 
 if [ "$need_reboot" = 1 ]; then

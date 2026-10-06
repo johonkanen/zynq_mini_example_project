@@ -3,17 +3,20 @@
  * goes through fpgad (the process that owns the PL) via libfpgad-client.
  *
  *   GET  /                    the page (index.html, compiled into the binary)
+ *   GET  /uPlot.iife.min.js, /uPlot.min.css   vendored uPlot (vendor/, MIT)
  *   GET  /api/status          fpgad status JSON
  *   GET  /api/regs            all axi_regs registers: {"ok":true,"regs":[{...}]}
  *   GET  /api/reg?addr=0x1c   one register: {"ok":true,"addr":"0x1c","value":"0x5a5a1234"}
  *   POST /api/reg             addr=0x00&value=0x1234 (form body or query) -> {"ok":true}
  *   GET  /events              Server-Sent Events: HEARTBEAT batches + PL status changes
+ *   WS   /ws                  live register stream, binary frames (see "WebSocket" below)
  *
  * Errors come back as {"ok":false,"error":"..."} with HTTP 400 (bad request)
  * or 503 (fpgad unreachable / PL not ready).
  */
 #define _GNU_SOURCE
 #include <inttypes.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -25,8 +28,9 @@
 #include "civetweb.h"
 #include "fpgad_client.h"
 
-extern const char index_html[];       /* page.S */
-extern const char index_html_end[];
+extern const char index_html[], index_html_end[];      /* page.S */
+extern const char uplot_js[], uplot_js_end[];
+extern const char uplot_css[], uplot_css_end[];
 
 static volatile sig_atomic_t stopping;
 static const char *fpgad_sock;        /* NULL = library default */
@@ -130,16 +134,22 @@ static int parse_u32(const char *s, uint32_t *v)
 
 /* ---- handlers ------------------------------------------------------------ */
 
-static int index_handler(struct mg_connection *c, void *cb)
+/* files compiled into the binary (page.S) */
+struct asset { const char *data, *end, *type; };
+static const struct asset ASSET_INDEX = { index_html, index_html_end, "text/html; charset=utf-8" };
+static const struct asset ASSET_UPLOT_JS = { uplot_js, uplot_js_end, "text/javascript" };
+static const struct asset ASSET_UPLOT_CSS = { uplot_css, uplot_css_end, "text/css" };
+
+static int asset_handler(struct mg_connection *c, void *cb)
 {
-    (void)cb;
-    size_t len = (size_t)(index_html_end - index_html);
+    const struct asset *a = cb;
+    size_t len = (size_t)(a->end - a->data);
     mg_printf(c, "HTTP/1.1 200 OK\r\n"
-                 "Content-Type: text/html; charset=utf-8\r\n"
+                 "Content-Type: %s\r\n"
                  "Content-Length: %zu\r\n"
                  "Cache-Control: no-cache\r\n"
-                 "Connection: close\r\n\r\n", len);
-    mg_write(c, index_html, len);
+                 "Connection: close\r\n\r\n", a->type, len);
+    mg_write(c, a->data, len);
     return 200;
 }
 
@@ -267,6 +277,274 @@ static int events_handler(struct mg_connection *c, void *cb)
     return 200;
 }
 
+/* ---- WebSocket /ws: binary register stream --------------------------------
+ *
+ * browser -> server, text:  "stream <hz> <off> [<off>...]"   1..10000 Hz, 1..8 offsets
+ *                           "stop"
+ * server -> browser, text:  {"type":"stream","hz":200,"regs":[16,28]}  (re)started
+ *                           {"type":"status",...}   fpgad status (same fields as /api/status)
+ *                           {"type":"error","error":"..."}
+ * server -> browser, binary, one frame per batch (~25/s), little-endian:
+ *     u8 type = 1 | u8 nregs | u16 0 | u32 n          8-byte header
+ *     f64 t[n]                                        fpgad timestamps, µs
+ *     u32 v[nregs][n]                                 values, register by register
+ *   so the browser maps them straight onto a Float64Array and Uint32Arrays.
+ *
+ * Each connection gets a thread that relays one fpgad "stream" (fpgad's text
+ * batches -> binary). If fpgad goes away the thread reconnects once a second.
+ */
+#define WS_MAX_REGS  8
+#define WS_BATCH_HZ  25
+#define WS_MAX_N     10000                  /* samples per batch: 10 kHz at 1 batch/s */
+#define WS_LINE_MAX  (WS_MAX_N * (21 + 11 * WS_MAX_REGS) + 64)
+
+struct ws_client {
+    struct mg_connection *conn;
+    pthread_t th;
+    int th_started;
+    volatile int closing;
+    pthread_mutex_t lock;                   /* guards the request fields */
+    int changed;                            /* new request from the browser */
+    unsigned hz;                            /* 0 = stopped */
+    int nregs;
+    uint32_t regs[WS_MAX_REGS];
+};
+
+static int ws_text(struct ws_client *w, const char *fmt, ...)
+{
+    char buf[1200];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    if (n < 0)
+        return -1;
+    if ((size_t)n >= sizeof buf)
+        n = (int)sizeof buf - 1;
+    return mg_websocket_write(w->conn, MG_WEBSOCKET_OPCODE_TEXT, buf, (size_t)n) > 0 ? 0 : -1;
+}
+
+static int ws_error(struct ws_client *w, const char *msg)
+{
+    char esc[1024];
+    json_escape(esc, sizeof esc, msg);
+    return ws_text(w, "{\"type\":\"error\",\"error\":\"%s\"}", esc);
+}
+
+/* fpgad batch {"t":[...],"v":[[...],...]} -> t[n], v[r*n + i]; returns n or -1 */
+static int parse_batch(const char *s, int nregs, double *t, uint32_t *v)
+{
+    const char *p = strstr(s, "\"t\":[");
+    if (!p)
+        return -1;
+    p += 5;
+    int n = 0;
+    while (*p && *p != ']') {
+        char *e;
+        unsigned long long x = strtoull(p, &e, 10);
+        if (e == p || n >= WS_MAX_N)
+            return -1;
+        t[n++] = (double)x;
+        p = *e == ',' ? e + 1 : e;
+    }
+    if (!(p = strstr(p, "\"v\":[")))
+        return -1;
+    p += 5;
+    for (int r = 0; r < nregs; r++) {
+        if (*p == ',')
+            p++;
+        if (*p++ != '[')
+            return -1;
+        int k = 0;
+        while (*p && *p != ']') {
+            char *e;
+            unsigned long long x = strtoull(p, &e, 10);
+            if (e == p || k >= n)
+                return -1;
+            v[(size_t)r * n + k++] = (uint32_t)x;
+            p = *e == ',' ? e + 1 : e;
+        }
+        if (k != n || *p++ != ']')
+            return -1;
+    }
+    return n;
+}
+
+static void *ws_thread(void *arg)
+{
+    struct ws_client *w = arg;
+    struct fpgad_conn *f = NULL;
+    char *line = malloc(WS_LINE_MAX);
+    double *t = malloc(sizeof(double) * WS_MAX_N);
+    uint32_t *v = malloc(sizeof(uint32_t) * WS_MAX_N * WS_MAX_REGS);
+    uint8_t *bin = malloc(8 + (sizeof(double) + sizeof(uint32_t) * WS_MAX_REGS) * WS_MAX_N);
+    unsigned hz = 0;
+    int nregs = 0, retry = 0;
+    uint32_t regs[WS_MAX_REGS];
+    if (!line || !t || !v || !bin)
+        goto out;
+
+    while (!w->closing && !stopping) {
+        pthread_mutex_lock(&w->lock);
+        int changed = w->changed;
+        if (changed) {
+            w->changed = 0;
+            hz = w->hz;
+            nregs = w->nregs;
+            memcpy(regs, w->regs, sizeof regs);
+        }
+        pthread_mutex_unlock(&w->lock);
+        if (changed) {
+            fpgad_close(f);
+            f = NULL;
+            retry = 0;
+        }
+        if (!hz) {                          /* stopped */
+            usleep(100000);
+            continue;
+        }
+        if (!f) {
+            if (retry > 0) {                /* fpgad down: try again in ~1 s */
+                retry--;
+                usleep(100000);
+                continue;
+            }
+            char req[160], msg[1024];
+            int o = snprintf(req, sizeof req, "stream %u %u", hz, hz < WS_BATCH_HZ ? hz : WS_BATCH_HZ);
+            for (int i = 0; i < nregs; i++)
+                o += snprintf(req + o, sizeof req - (size_t)o, " 0x%" PRIx32, regs[i]);
+            f = fpgad_open(fpgad_sock);
+            int rc = f ? fpgad_request(f, req, msg, sizeof msg) : -1;
+            if (rc != 0) {
+                fpgad_close(f);
+                f = NULL;
+                retry = 10;
+                if (ws_error(w, rc < 0 ? "fpgad not reachable, retrying" : msg) < 0)
+                    break;
+                continue;
+            }
+            char list[WS_MAX_REGS * 12] = "";
+            for (int i = 0, lo = 0; i < nregs; i++)
+                lo += snprintf(list + lo, sizeof list - (size_t)lo, "%s%" PRIu32, i ? "," : "", regs[i]);
+            if (ws_text(w, "{\"type\":\"stream\",\"hz\":%u,\"regs\":[%s]}", hz, list) < 0)
+                break;
+        }
+        int n = fpgad_readline(f, line, WS_LINE_MAX, 100);
+        if (n == 0)
+            continue;
+        if (n < 0) {                        /* fpgad restarted / died */
+            fpgad_close(f);
+            f = NULL;
+            retry = 10;
+            if (ws_error(w, "fpgad stream ended, reconnecting") < 0)
+                break;
+            continue;
+        }
+        if (!strncmp(line, "status ", 7) && line[7] == '{') {
+            if (ws_text(w, "{\"type\":\"status\",%s", line + 8) < 0)
+                break;
+        } else if (!strncmp(line, "data ", 5)) {
+            int ns = parse_batch(line + 5, nregs, t, v);
+            if (ns <= 0)
+                continue;
+            bin[0] = 1;
+            bin[1] = (uint8_t)nregs;
+            bin[2] = bin[3] = 0;
+            uint32_t un = (uint32_t)ns;
+            memcpy(bin + 4, &un, 4);
+            memcpy(bin + 8, t, sizeof(double) * (size_t)ns);
+            memcpy(bin + 8 + sizeof(double) * (size_t)ns, v, sizeof(uint32_t) * (size_t)ns * nregs);
+            size_t len = 8 + (sizeof(double) + sizeof(uint32_t) * (size_t)nregs) * (size_t)ns;
+            if (mg_websocket_write(w->conn, MG_WEBSOCKET_OPCODE_BINARY, (const char *)bin, len) <= 0)
+                break;                      /* browser gone */
+        }
+    }
+out:
+    fpgad_close(f);
+    free(line);
+    free(t);
+    free(v);
+    free(bin);
+    return NULL;
+}
+
+static int ws_connect(const struct mg_connection *c, void *cb)
+{
+    (void)c;
+    (void)cb;
+    return 0;                               /* accept */
+}
+
+static void ws_ready(struct mg_connection *c, void *cb)
+{
+    (void)cb;
+    struct ws_client *w = calloc(1, sizeof *w);
+    if (!w)
+        return;
+    w->conn = c;
+    pthread_mutex_init(&w->lock, NULL);
+    mg_set_user_connection_data(c, w);
+    w->th_started = pthread_create(&w->th, NULL, ws_thread, w) == 0;
+}
+
+static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, void *cb)
+{
+    (void)cb;
+    struct ws_client *w = mg_get_user_connection_data(c);
+    int op = bits & 0x0F;
+    if (op == MG_WEBSOCKET_OPCODE_CONNECTION_CLOSE)
+        return 0;
+    if (op != MG_WEBSOCKET_OPCODE_TEXT || !w)
+        return 1;
+
+    char buf[256], *argv[2 + WS_MAX_REGS + 1];
+    int argc = 0;
+    if (len >= sizeof buf)
+        len = sizeof buf - 1;
+    memcpy(buf, data, len);
+    buf[len] = 0;
+    for (char *tok = strtok(buf, " \t\r\n"); tok && argc < (int)(sizeof argv / sizeof argv[0]);
+         tok = strtok(NULL, " \t\r\n"))
+        argv[argc++] = tok;
+
+    uint32_t hz = 0, regs[WS_MAX_REGS];
+    int nregs = argc - 2;
+    if (argc == 1 && !strcmp(argv[0], "stop")) {
+        hz = 0;
+        nregs = 0;
+    } else if (argc >= 3 && !strcmp(argv[0], "stream") && nregs <= WS_MAX_REGS &&
+               !parse_u32(argv[1], &hz) && hz >= 1 && hz <= 10000) {
+        for (int i = 0; i < nregs; i++)
+            if (parse_u32(argv[2 + i], &regs[i]) || regs[i] % 4 || regs[i] >= 0x1000) {
+                ws_error(w, "bad register offset (0x0..0xffc, 4-byte aligned)");
+                return 1;
+            }
+    } else {
+        ws_error(w, "usage: stream <hz 1..10000> <off> [<off>... up to 8] | stop");
+        return 1;
+    }
+    pthread_mutex_lock(&w->lock);
+    w->hz = hz;
+    w->nregs = nregs;
+    memcpy(w->regs, regs, sizeof(uint32_t) * (size_t)nregs);
+    w->changed = 1;
+    pthread_mutex_unlock(&w->lock);
+    return 1;
+}
+
+static void ws_close(const struct mg_connection *c, void *cb)
+{
+    (void)cb;
+    struct ws_client *w = mg_get_user_connection_data(c);
+    if (!w)
+        return;
+    w->closing = 1;
+    if (w->th_started)
+        pthread_join(w->th, NULL);          /* thread notices within ~100 ms */
+    pthread_mutex_destroy(&w->lock);
+    free(w);
+}
+
 /* ---- main ---------------------------------------------------------------- */
 
 static void on_signal(int sig)
@@ -306,7 +584,8 @@ int main(int argc, char **argv)
     signal(SIGPIPE, SIG_IGN);
 
     mg_init_library(0);
-    const char *options[] = { "listening_ports", port, "num_threads", "16", NULL };
+    /* every open WebSocket holds a worker thread for its lifetime */
+    const char *options[] = { "listening_ports", port, "num_threads", "32", NULL };
     struct mg_callbacks cbs;
     memset(&cbs, 0, sizeof cbs);
     struct mg_context *ctx = mg_start(&cbs, NULL, options);
@@ -318,8 +597,14 @@ int main(int argc, char **argv)
     mg_set_request_handler(ctx, "/api/status", status_handler, NULL);
     mg_set_request_handler(ctx, "/api/regs", regs_handler, NULL);
     mg_set_request_handler(ctx, "/api/reg$", reg_handler, NULL);
-    mg_set_request_handler(ctx, "/$", index_handler, NULL);
-    mg_set_request_handler(ctx, "/index.html$", index_handler, NULL);
+    mg_set_request_handler(ctx, "/$", asset_handler, (void *)&ASSET_INDEX);
+    mg_set_request_handler(ctx, "/index.html$", asset_handler, (void *)&ASSET_INDEX);
+    mg_set_request_handler(ctx, "/uPlot.iife.min.js$", asset_handler, (void *)&ASSET_UPLOT_JS);
+    mg_set_request_handler(ctx, "/uPlot.min.css$", asset_handler, (void *)&ASSET_UPLOT_CSS);
+    mg_set_websocket_handler(ctx, "/ws$", ws_connect, ws_ready, ws_data, ws_close, NULL);
+    if (!mg_check_feature(16))
+        syslog(LOG_WARNING, "civetweb built without WebSocket support: /ws will not work "
+                            "(rebuild civetweb with WITH_WEBSOCKET=1)");
     syslog(LOG_INFO, "listening on port %s, fpgad at %s", port, sock_path());
 
     while (!stopping)

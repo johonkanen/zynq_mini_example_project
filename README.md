@@ -83,7 +83,7 @@ and its QMTech sibling, **including building Linux** — see [`doc/notes.md`](do
 | `linux/build-linux.sh`        | one-shot Buildroot Linux image build (`doc/linux_build.md`) |
 | `linux/reflash-sd.sh` + `reflash_sd.bat`/`.tcl` | reflash the microSD in the board over TFTP, U-Boot driven via JTAG |
 | `linux/fpgad/`                | `fpgad` (the one process that touches the FPGA), `fpgactl`, client library — `doc/linux_build.md` §12 |
-| `linux/fpga-web/`             | web UI: register read/write + live stream, talks only to `fpgad` |
+| `linux/fpga-web/`             | web UI: register read/write + live uPlot charts over a binary WebSocket (`/ws`), talks only to `fpgad`; `vendor/` = uPlot (MIT) |
 | `linux/br2-external/`         | Buildroot external tree: `fpgad` + `fpga-web` packages and init scripts |
 | `linux/update-board.sh`       | push kernel/dtb/bitstream/web server to a running board over SSH — `doc/linux_build.md` §13 |
 | `linux/zynq-zynqmini.dts`     | kernel device tree for the board (used by `doc/linux_build.md`) |

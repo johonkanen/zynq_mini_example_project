@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Zynq Mini · FPGA</title>
+<link rel="stylesheet" href="uPlot.min.css">
 <style>
   :root { --bg:#0f1115; --panel:#171a21; --text:#e6e6e6; --dim:#8b93a1; --line:#2a2f3a;
           --a:#5ab0ff; --b:#ffb454; --ok:#4cc38a; --bad:#ff6b6b; }
@@ -22,7 +23,20 @@
   .card h2 { font-size:.9rem; font-weight:600; margin:0 0 .5rem; color:var(--dim); }
   .big { font-size:1.6rem; font-variant-numeric:tabular-nums; }
   .stats { display:flex; flex-wrap:wrap; gap:1.5rem; }
-  canvas { width:100%; height:180px; display:block; }
+  .controls { display:flex; flex-wrap:wrap; gap:.5rem 1.25rem; align-items:center; margin-bottom:.5rem; }
+  .controls label { display:inline-flex; gap:.3rem; align-items:center; white-space:nowrap; }
+  .regpick { display:flex; flex-wrap:wrap; gap:.25rem .9rem; }
+  select { background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:4px;
+           padding:.2rem .3rem; font:inherit; }
+  input[type=checkbox] { width:auto; accent-color:var(--a); }
+  input.short { width:7rem; }
+  button.on { background:#4a3a22; border-color:#70572f; }
+  .plot { margin-top:.5rem; min-width:0; }
+  .plot h3 { font-size:.8rem; font-weight:500; color:var(--dim); margin:.25rem 0; }
+  .uplot { font-family:inherit; color:var(--text); }
+  .u-legend { font-size:.8rem; text-align:left; }
+  .u-legend th { color:var(--text); }
+  .u-select { background:rgba(90,176,255,.15); }
   small, .dim { color:var(--dim); }
   .mono { font-family:ui-monospace, "Cascadia Mono", Consolas, monospace; font-variant-numeric:tabular-nums; }
   .table-wrap { overflow-x:auto; }
@@ -68,10 +82,27 @@
     <div><h2>PL clock (from HEARTBEAT)</h2><div class="big" id="mhz">–</div></div>
     <div><h2>HEARTBEAT</h2><div class="big mono" id="hb">–</div></div>
     <div><h2>samples received</h2><div class="big" id="rate">–</div></div>
+    <div><h2>WebSocket</h2><div class="big" id="kbps">–</div></div>
   </section>
-  <section class="card"><h2>HEARTBEAT counter (0x10) — last 10 s</h2><canvas id="c1"></canvas></section>
-  <section class="card"><h2>PL clock, MHz = ΔHEARTBEAT / Δt — last 10 s</h2><canvas id="c2"></canvas></section>
+  <section class="card">
+    <h2>Live plot — registers sampled by fpgad, binary WebSocket stream</h2>
+    <div class="controls">
+      <div class="regpick" id="regpick"><span class="dim">registers…</span></div>
+    </div>
+    <div class="controls">
+      <label>extra offsets <input id="extra" class="short mono" placeholder="0x40 0x44"></label>
+      <label>rate <select id="hz">
+        <option>10</option><option>50</option><option selected>200</option>
+        <option>1000</option><option>5000</option><option>10000</option></select> Hz</label>
+      <label>window <select id="win">
+        <option>2</option><option selected>10</option><option>30</option><option>60</option></select> s</label>
+      <button id="pause">pause</button>
+      <small class="dim" id="hint">paused: drag to zoom, double-click to reset</small>
+    </div>
+    <div id="plots"></div>
+  </section>
 </main>
+<script src="uPlot.iife.min.js"></script>
 <script>
 "use strict";
 const $ = id => document.getElementById(id);
@@ -112,6 +143,7 @@ function buildTable(regs) {
     if (e.key === "Enter") i.nextElementSibling.click();
   });
   built = true;
+  buildRegPick(regs);
 }
 async function refreshRegs() {
   try {
@@ -135,81 +167,190 @@ $("rwrite").onclick = () => {
 };
 refreshRegs(); setInterval(refreshRegs, 500);
 
-/* ---------- live HEARTBEAT stream ---------- */
-const WINDOW_US = 10e6;
-const t = [], hb = [], mhz = [];
-let received = 0, rxWindowStart = performance.now(), rxRate = 0;
-function onBatch(d) {
-  const v = d.v[0];
-  for (let i = 0; i < d.t.length; i++) {
-    const n = t.length;
-    if (n) {
-      const dt = d.t[i] - t[n - 1], dc = (v[i] - hb[n - 1]) >>> 0;
-      mhz.push(dt > 0 ? dc / dt : NaN);
-    } else mhz.push(NaN);
-    t.push(d.t[i]); hb.push(v[i]);
+/* ---------- live plot: WebSocket /ws -> uPlot ---------- */
+/* Binary frame (fpga-web/main.c): u8 type=1, u8 nregs, u16 0, u32 n | f64 t[n] (µs) | u32 v[nregs][n] */
+const COLORS = ["#5ab0ff", "#ffb454", "#4cc38a", "#c792ea", "#ff6b6b", "#7fdbca", "#f78c6c", "#e6db74"];
+const HEARTBEAT = 0x10;
+let names = {};                         // offset -> register name, from /api/regs
+let ws = null, cfg = null;              // cfg = stream the server acknowledged
+let paused = false, dirty = false;
+let lastT = 0;                          // newest sample, s (fpgad clock)
+let times = null, series = [];          // ring buffers; series[i] = {name, ring, plot}
+let samples = 0, bytes = 0, statT0 = performance.now();
+
+/* fixed-capacity ring over a 2x Float64Array: push is O(1), view() is a subarray */
+class Ring {
+  constructor(cap) { this.cap = cap; this.buf = new Float64Array(cap * 2); this.s = 0; this.n = 0; }
+  push(x) {
+    if (this.s + this.n === this.buf.length) { this.buf.copyWithin(0, this.s, this.s + this.n); this.s = 0; }
+    this.buf[this.s + this.n++] = x;
+    if (this.n > this.cap) { this.s++; this.n--; }
   }
-  received += d.t.length;
-  const cut = t[t.length - 1] - WINDOW_US;
-  let k = 0; while (k < t.length && t[k] < cut) k++;
-  if (k) { t.splice(0, k); hb.splice(0, k); mhz.splice(0, k); }
+  last() { return this.n ? this.buf[this.s + this.n - 1] : NaN; }
+  view() { return this.buf.subarray(this.s, this.s + this.n); }
+  clear() { this.s = this.n = 0; }
 }
+
+const regName = off => names[off] || "0x" + off.toString(16).padStart(2, "0");
+function si(v) {
+  const a = Math.abs(v);
+  return a >= 1e9 ? (v / 1e9).toFixed(2) + "G" : a >= 1e6 ? (v / 1e6).toFixed(2) + "M"
+       : a >= 1e4 ? (v / 1e3).toFixed(1) + "k" : +v.toFixed(3) + "";
+}
+
+/* x ticks anchored at the newest sample, a round step apart: -10s ... -1s 0s */
+function xSplits(u, ax, min, max) {
+  const span = max - min, raw = span / 8, mag = 10 ** Math.floor(Math.log10(raw));
+  const step = [1, 2, 5, 10].map(m => m * mag).find(st => st >= raw) || raw;
+  const out = [];
+  for (let v = lastT - Math.ceil((lastT - max) / step) * step; v >= min - 1e-9; v -= step) out.push(v);
+  return out.reverse();
+}
+const xLabel = (v, span) => (v - lastT).toFixed(span < 5 ? 1 : 0) + "s";
+
+function makePlot(title, label, color, fmt) {
+  const box = document.createElement("div");
+  box.className = "plot";
+  box.innerHTML = `<h3>${title}</h3>`;
+  $("plots").appendChild(box);
+  const opts = {
+    width: Math.max(300, box.clientWidth), height: 170,
+    scales: { x: { time: false } },
+    cursor: { sync: { key: "live" }, drag: { x: true, y: false } },
+    series: [
+      { label: "t", value: (u, v) => v == null ? "–" : (v - lastT).toFixed(3) + " s" },
+      { label, stroke: color, width: 1.5, points: { show: false },
+        value: (u, v) => v == null ? "–" : fmt(v) },
+    ],
+    axes: [
+      { stroke: "#8b93a1", grid: { stroke: "#2a2f3a" }, ticks: { stroke: "#2a2f3a" },
+        splits: xSplits,
+        values: (u, vals) => vals.map(v => xLabel(v, u.scales.x.max - u.scales.x.min)) },
+      { stroke: "#8b93a1", grid: { stroke: "#2a2f3a" }, ticks: { stroke: "#2a2f3a" }, size: 64,
+        values: (u, vals) => vals.map(si) },
+    ],
+  };
+  const plot = new uPlot(opts, [[], []], box);
+  new ResizeObserver(() => plot.setSize({ width: Math.max(300, box.clientWidth), height: 170 })).observe(box);
+  return plot;
+}
+
+/* (re)build buffers + charts for the stream the server just acknowledged */
+function setupPlots(hz, regs) {
+  for (const s of series) s.plot.destroy();
+  $("plots").innerHTML = "";
+  const cap = Math.ceil(hz * 60 * 1.05) + 64;              // enough for the longest window
+  times = new Ring(cap);
+  series = regs.map((off, i) => ({
+    off, ring: new Ring(cap),
+    plot: makePlot(`${regName(off)} (0x${off.toString(16)})`, regName(off), COLORS[i % COLORS.length], hex),
+  }));
+  const hbIdx = regs.indexOf(HEARTBEAT);
+  if (hbIdx >= 0) {                                         // derived: ΔHEARTBEAT / Δt
+    series.push({ derivedFrom: hbIdx, ring: new Ring(cap), x: new Ring(cap),   // own x: valid points only
+      plot: makePlot("PL clock, MHz = ΔHEARTBEAT / Δt", "MHz", "#ffb454", v => v.toFixed(3) + " MHz") });
+  }
+  cfg = { hz, regs };
+}
+
+function onFrame(buf) {
+  const dv = new DataView(buf);
+  if (dv.getUint8(0) !== 1 || !cfg) return;
+  const nr = dv.getUint8(1), n = dv.getUint32(4, true);
+  if (nr !== cfg.regs.length || buf.byteLength !== 8 + n * (8 + 4 * nr)) return;
+  const t = new Float64Array(buf, 8, n);
+  const v = [];
+  for (let r = 0; r < nr; r++) v.push(new Uint32Array(buf, 8 + 8 * n + 4 * n * r, n));
+  const d = series.find(s => s.derivedFrom !== undefined);
+  for (let i = 0; i < n; i++) {
+    const ts = t[i] / 1e6;
+    if (d && times.n) {                                     // MHz = counts per µs
+      const dt = (ts - times.last()) * 1e6, prev = series[d.derivedFrom].ring.last();
+      if (dt > 0) { d.x.push(ts); d.ring.push(((v[d.derivedFrom][i] - prev) >>> 0) / dt); }
+    }
+    for (let r = 0; r < nr; r++) series[r].ring.push(v[r][i]);
+    times.push(ts);
+  }
+  lastT = times.last();
+  samples += n; bytes += buf.byteLength; dirty = true;
+}
+
+function requestStream() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const regs = [...document.querySelectorAll("#regpick input:checked")].map(c => +c.value);
+  for (const tok of $("extra").value.split(/[\s,]+/)) {
+    const o = Number(tok);
+    if (tok && Number.isInteger(o) && o >= 0 && o < 0x1000 && o % 4 === 0 && !regs.includes(o)) regs.push(o);
+  }
+  if (!regs.length) regs.push(HEARTBEAT);
+  ws.send(`stream ${$("hz").value} ${regs.slice(0, 8).map(o => "0x" + o.toString(16)).join(" ")}`);
+}
+
 function connect() {
-  const es = new EventSource("/events");
-  es.onopen = () => pill($("conn"), "live", "ok");
-  es.onerror = () => pill($("conn"), "reconnecting…", "bad");
-  es.onmessage = e => onBatch(JSON.parse(e.data));
-  es.addEventListener("status", e => {
-    const s = JSON.parse(e.data);
-    pill($("pl"), "PL: " + s.pl + (s.sim ? " (sim)" : ""), s.ok ? "ok" : "bad");
-    $("msg").textContent = s.msg;
-    if (!s.ok) { t.length = hb.length = mhz.length = 0; }
-  });
+  ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => { pill($("conn"), "live", "ok"); requestStream(); };
+  ws.onclose = () => { pill($("conn"), "reconnecting…", "bad"); setTimeout(connect, 1000); };
+  ws.onmessage = e => {
+    if (typeof e.data !== "string") { onFrame(e.data); return; }
+    const m = JSON.parse(e.data);
+    if (m.type === "stream") setupPlots(m.hz, m.regs);
+    else if (m.type === "status") {
+      pill($("pl"), "PL: " + m.pl + (m.sim ? " (sim)" : ""), m.ok ? "ok" : "bad");
+      $("msg").textContent = m.msg;
+      if (!m.ok && times) {
+        times.clear();
+        for (const s of series) { s.ring.clear(); if (s.x) s.x.clear(); }
+        dirty = true;
+      }
+    } else if (m.type === "error") $("msg").textContent = m.error;
+  };
 }
-function plot(canvas, xs, ys, color, fixedMin, fixedMax) {
-  const dpr = window.devicePixelRatio || 1, w = canvas.clientWidth, h = canvas.clientHeight;
-  if (canvas.width !== w * dpr || canvas.height !== h * dpr) { canvas.width = w * dpr; canvas.height = h * dpr; }
-  const g = canvas.getContext("2d");
-  g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
-  const padL = 70, padB = 18, pw = w - padL - 8, ph = h - padB - 8;
-  let lo = fixedMin, hi = fixedMax;
-  if (lo === undefined) {
-    lo = Infinity; hi = -Infinity;
-    for (const v of ys) if (Number.isFinite(v)) { if (v < lo) lo = v; if (v > hi) hi = v; }
-    if (!Number.isFinite(lo)) { lo = 0; hi = 1; }
-    const m = (hi - lo) * 0.1 || Math.abs(hi) * 0.001 || 1; lo -= m; hi += m;
-  }
-  const x1 = xs.length ? xs[xs.length - 1] : 0, x0 = x1 - WINDOW_US;
-  const X = v => padL + (v - x0) / WINDOW_US * pw, Y = v => 8 + (1 - (v - lo) / (hi - lo)) * ph;
-  g.strokeStyle = "#2a2f3a"; g.fillStyle = "#8b93a1"; g.font = "11px system-ui"; g.lineWidth = 1;
-  for (let i = 0; i <= 4; i++) {
-    const v = lo + (hi - lo) * i / 4, y = Y(v);
-    g.beginPath(); g.moveTo(padL, y); g.lineTo(padL + pw, y); g.stroke();
-    g.fillText(Math.abs(hi) >= 1e6 ? v.toExponential(2) : v.toFixed(3), 4, y + 4);
-  }
-  for (let s = 0; s <= 10; s += 2) g.fillText("-" + (10 - s) + "s", X(x0 + s * 1e6) - 10, h - 4);
-  g.strokeStyle = color; g.lineWidth = 1.5; g.beginPath();
-  let pen = false;
-  for (let i = 0; i < xs.length; i++) {
-    const v = ys[i];
-    if (!Number.isFinite(v)) { pen = false; continue; }
-    const x = X(xs[i]), y = Y(v);
-    if (pen) g.lineTo(x, y); else { g.moveTo(x, y); pen = true; }
-  }
-  g.stroke();
+
+/* register checkboxes, once /api/regs has named the registers */
+function buildRegPick(regs) {
+  names = {};
+  for (const r of regs) names[parseInt(r.addr, 16)] = r.name;
+  $("regpick").innerHTML = regs.map(r => {
+    const off = parseInt(r.addr, 16);
+    return `<label><input type="checkbox" value="${off}"${off === HEARTBEAT ? " checked" : ""}>${r.name}</label>`;
+  }).join("");
+  $("regpick").querySelectorAll("input").forEach(c => c.onchange = requestStream);
 }
+
+$("hz").onchange = requestStream;
+$("extra").onchange = requestStream;
+$("win").onchange = () => { dirty = true; };
+$("pause").onclick = () => {
+  paused = !paused;
+  $("pause").textContent = paused ? "live" : "pause";
+  $("pause").classList.toggle("on", paused);
+  $("hint").style.visibility = paused ? "visible" : "hidden";
+  dirty = true;
+};
+$("hint").style.visibility = "hidden";
+
 function frame(now) {
-  if (now - rxWindowStart >= 1000) { rxRate = received * 1000 / (now - rxWindowStart); received = 0; rxWindowStart = now; }
-  const n = t.length;
-  if (n) {
-    let s = 0, c = 0;
-    for (let i = Math.max(1, n - 50); i < n; i++) if (Number.isFinite(mhz[i])) { s += mhz[i]; c++; }
-    $("mhz").textContent = c ? (s / c).toFixed(3) + " MHz" : "–";
-    $("hb").textContent = hex(hb[n - 1]);
+  if (now - statT0 >= 1000) {
+    const s = (now - statT0) / 1000;
+    $("rate").textContent = (samples / s).toFixed(0) + " /s";
+    $("kbps").textContent = (bytes / s / 1024).toFixed(1) + " kB/s";
+    samples = bytes = 0; statT0 = now;
   }
-  $("rate").textContent = rxRate.toFixed(0) + " /s";
-  plot($("c1"), t, hb, "#5ab0ff", 0, 4294967296);
-  plot($("c2"), t, mhz, "#ffb454");
+  if (dirty && !paused && times) {
+    dirty = false;
+    const x = times.view(), win = +$("win").value;
+    for (const s of series) {
+      s.plot.setData([s.x ? s.x.view() : x, s.ring.view()], false);
+      s.plot.setScale("x", { min: lastT - win, max: lastT });
+    }
+    const hb = series.findIndex(s => s.off === HEARTBEAT), d = series.find(s => s.derivedFrom !== undefined);
+    $("hb").textContent = hb >= 0 ? hex(series[hb].ring.last()) : "–";
+    if (d && d.ring.n) {
+      const last = d.ring.view().subarray(-50);
+      $("mhz").textContent = (last.reduce((a, b) => a + b, 0) / last.length).toFixed(3) + " MHz";
+    } else $("mhz").textContent = "–";
+  }
   requestAnimationFrame(frame);
 }
 connect();

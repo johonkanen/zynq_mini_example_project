@@ -537,14 +537,36 @@ into the `axi_regs` window (`0x0`–`0xFFC`, 4-byte aligned).
 
 `http://<board-ip>/` shows a **register table** (the named `axi_regs` registers, refreshed
 twice a second, with write fields for the R/W ones), a raw read/write row for any
-offset, and the live `HEARTBEAT` charts (PL clock derived from it ≈ 100 MHz).
+offset, and a **live plot**: tick up to 8 registers (or type extra offsets), pick a
+rate (10 Hz–10 kHz) and a window (2–60 s), and each one gets a
+[uPlot](https://github.com/leeoniya/uPlot) chart, with cursors synced across
+charts. With `HEARTBEAT` selected the page also plots the PL clock it implies
+(≈ 100 MHz). **pause** freezes the charts; then drag to zoom, double-click to reset.
+uPlot (MIT, `linux/fpga-web/vendor/`) is compiled into the binary with the page,
+so the board needs no internet access.
+
+The plot data comes over a **WebSocket, `/ws`, as binary frames**. fpga-web relays
+one fpgad `stream` per connection and repacks fpgad's text batches:
+
+| direction | frame | content |
+|---|---|---|
+| browser → board | text | `stream <hz> <off> [<off>…]` (1–10000 Hz, 1–8 offsets) or `stop` |
+| board → browser | text | `{"type":"stream","hz":…,"regs":[…]}` when a stream (re)starts, `{"type":"status",…}` (as `/api/status`), `{"type":"error","error":"…"}` |
+| board → browser | binary | one per batch (~25/s), little-endian: `u8 type=1, u8 nregs, u16 0, u32 n` · `f64 t[n]` (µs) · `u32 v[nregs][n]`, so the browser maps them straight onto a `Float64Array` and `Uint32Array`s |
+
+Frames after a `stream` ack belong to that stream. If fpgad restarts, the board
+sends an error frame and reconnects every second. Measured on the board: 1 kHz ×
+2 registers ≈ 16 kB/s; asking for 10 kHz gives about 9 kHz, which is fpgad's
+user-space polling limit. Buildroot's civetweb leaves WebSocket support out;
+`fpga-web.mk` turns it on (`WITH_WEBSOCKET=1`). `build-linux.sh` rebuilds an old
+civetweb, and `update-board.sh web` pushes `libcivetweb` along with `fpga-web`.
 
 ```bash
 curl http://<ip>/api/status
 curl http://<ip>/api/regs                               # all registers, named
 curl "http://<ip>/api/reg?addr=0x1c"                    # read
 curl -X POST -d 'addr=0x00&value=0x12340000' http://<ip>/api/reg   # write
-curl -N http://<ip>/events                              # Server-Sent Events stream
+curl -N http://<ip>/events                              # Server-Sent Events (HEARTBEAT, JSON)
 ```
 
 Errors come back as `{"ok":false,"error":"..."}` with HTTP 400 (bad request) or 503
@@ -592,7 +614,7 @@ As a Buildroot package: `FOO_DEPENDENCIES = fpgad` (copy
 behaves (SUM, STATUS bits, CONTROL bit 1 holding HEARTBEAT at 0, 100 MHz counter,
 OLED_CTRL / OLED_TEXT with the reset text).
 Then `FPGAD_SOCKET=/tmp/fpgad.sock fpga-web -p 8088 -f` (built natively against
-civetweb's `src/civetweb.c` with `-DNO_SSL`) and open `http://localhost:8088/`.
+civetweb's `src/civetweb.c` with `-DNO_SSL -DUSE_WEBSOCKET`) and open `http://localhost:8088/`.
 
 Verified on the board (2026-10-06): writes, PL-computed `SUM`, `STATUS` bits,
 `CONTROL` bit 1 freezing `HEARTBEAT`, error replies, and a `fpgactl load` during
