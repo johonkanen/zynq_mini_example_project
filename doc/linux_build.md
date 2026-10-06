@@ -438,10 +438,18 @@ compares, then boots the fresh card.
 ./linux/reflash-sd.sh <pc-ip> <board-ip>     # or a static board IP
 ```
 
-and serve `build_tftp/` over TFTP (UDP 69): on Windows Tftpd64 with its directory
-set to the `\\wsl.localhost\...\build_tftp` path the script prints; or
-`tftpd-hpa` inside WSL, which needs `networkingMode=mirrored` in `.wslconfig`
-(WSL2's default NAT hides it from the LAN).
+and serve `build_tftp/` over TFTP (UDP 69) **from Windows**: WSL2's default NAT
+hides a server inside WSL from the LAN. [`linux/tftp_server.py`](../linux/tftp_server.py)
+is a stdlib-only read-only TFTP server (`blksize`/`tsize`, block-number rollover
+for files > 96 MB) that runs under Windows Python:
+
+```bat
+python linux\tftp_server.py -d C:\path\to\build_tftp     :: copy build_tftp\ to a Windows folder first; faster than \\wsl$
+```
+
+Windows Firewall must allow inbound UDP for that `python.exe` on the network's
+profile (often *Public*). Tftpd64, or `tftpd-hpa` in WSL with
+`networkingMode=mirrored`, work too.
 
 **Per card:** boot switch = **JTAG**, card in, Ethernet cable in, power on, then
 on Windows:
@@ -465,10 +473,15 @@ Total of 24117504 word(s) were the same
 ================ reflash: DONE - booting the new card ================
 ```
 
-The script disables the `jtag`/`pxe`/`dhcp` boot targets after it runs, so on
-success distro boot continues to `mmc0` and boots the new image right away. On
-any failure it disables the rest too and stops at the U-Boot prompt. Set the
-switch back to SD for normal power-ups.
+The script first zeroes `MULTIBOOT_ADDR` and wakes the Ethernet PHY (see
+*Soft reboot* and *PHY power-down* below), then fetches with an explicit
+`<pc-ip>:sdcard.img` (U-Boot's `dhcp` replaces `serverip` with the DHCP
+server's address). On success it boots the new card (`run mmc_boot` on mmc 0);
+on any failure it disables the remaining boot targets and stops at the U-Boot
+prompt. Set the switch back to SD for normal power-ups.
+
+Verified on hardware: 96 MB over TFTP from the Windows server in 21 s
+(4.5 MB/s), written and read back identical, then booted to a login prompt.
 
 Already at a U-Boot prompt on a board that boots (switch = SD)? Same script, one line:
 
@@ -538,21 +551,19 @@ For day-to-day changes, push only what changed to a board that's up on the netwo
 ```bash
 ./linux/update-board.sh <board-ip>              # kernel + dtb + bitstream + web server
 ./linux/update-board.sh <board-ip> bit web      # just some parts: kernel dtb bit web all
-./linux/update-board.sh --reboot <board-ip>     # soft-reboot after a kernel/dtb change (see below)
+./linux/update-board.sh --no-reboot <board-ip>  # new kernel/dtb wait for the next boot
 ./linux/update-board.sh --new-hostkey <ip>      # after reflashing (dropbear made a new host key)
 ```
 
 | part | from | to | then |
 |---|---|---|---|
-| `kernel` | `output/images/uImage` | SD p1 `/uImage` | power-cycle |
-| `dtb` | `output/images/zynq-zynqmini.dtb` | SD p1 `/system.dtb` | power-cycle |
+| `kernel` | `output/images/uImage` | SD p1 `/uImage` | reboot |
+| `dtb` | `output/images/zynq-zynqmini.dtb` | SD p1 `/system.dtb` | reboot |
 | `bit` | `output/arm_fpga_zynq_mini.bit` → `bit2bin.py` | `/lib/firmware/*.bit.bin` | web server stopped, PL reloaded, restarted |
 | `web` | `fpga-webstream` | `/usr/bin/` | service restarted |
 
-- Unchanged files (same md5 on the board) are skipped. A new kernel/dtb takes
-  effect on the next boot; the script **doesn't reboot by default** and tells you
-  to **power-cycle** instead, because a soft reboot doesn't come back on this
-  board (see *Known issues*).
+- Unchanged files (same md5 on the board) are skipped; the board reboots only if
+  the kernel or dtb actually changed.
 - Copies go through `ssh … 'cat > file.new'`, are md5-checked, then renamed into
   place: atomic, and safe for a running binary. No `scp`: recent OpenSSH `scp`
   uses SFTP, which dropbear doesn't provide.
@@ -565,20 +576,51 @@ New packages or changes elsewhere in the rootfs still need a full reflash (§11)
 
 ---
 
-## Known issues (found on hardware, 2026-10-06)
+## Hardware notes (found on the board, 2026-10-06)
 
-- **Soft reboot doesn't boot from SD.** After a Linux `reboot`, a JTAG
-  `rst -system` or a U-Boot `reset`, the BootROM stops with `REBOOT_STATUS`
-  error `0x200A` and the console stays silent; a **power cycle** boots fine. The
-  schematic rules out the SD switch (TXS02612 `SEL` is tied to GND, so TF1 is
-  always selected) and there's no SD power switch: the card stays powered
-  across a soft reset. The likely cause is card state left by U-Boot/Linux
-  that the BootROM can't recover from. Not yet confirmed or fixed.
-  `update-board.sh` therefore doesn't reboot by default.
-- **SD1 is a second microSD slot (TF2), not an eMMC.** The schematic labels TF1
-  (on SD0, via the TXS02612) as the only bootable slot and TF2 (SD1) as
-  "doesn't support booting". The DTS still describes `sdhci1` as a
-  non-removable eMMC, so a card in TF2 is only seen if present at boot.
+### Soft reboot after a failed boot: `MULTIBOOT_ADDR` (fixed)
+
+Symptom: after a Linux `reboot`, a JTAG `rst -system` or a U-Boot `reset`, the
+console stays silent; the BootROM sits at `0xFFFFFF28` with `REBOOT_STATUS`
+error `0x200A` (= *no boot image found on the SD card*); only a power cycle
+brings the board back.
+
+Cause: `devcfg.MULTIBOOT_ADDR` (`0xF800702C`) survives warm resets. Once any
+BootROM boot attempt fails (a card without `BOOT.BIN`, a bad image, …), the
+BootROM moves the image number in `MULTIBOOT_ADDR[12:0]` to 1, and in SD mode
+that changes the file it looks for from `BOOT.BIN` to `BOOT0001.BIN`. Every
+later warm reset then fails, whatever is on the card. A power-on reset zeroes the
+register. A Xilinx FSBL normally resets it; U-Boot SPL doesn't. Proven on the
+board both ways: image number 1 → reboot fails with `0x200A`; image number 0 → boots.
+
+Fix: `S01multiboot` (written by `build-linux.sh`) zeroes the register at every
+boot (devcfg unlock key `0x757BDF0D` @ `0xF8007034`, then 0 → `0xF800702C`),
+and the U-Boot reflash script does the same. A board that's already stuck can
+be recovered over JTAG without a power cycle: `mwr 0xF8007034 0x757BDF0D;
+mwr 0xF800702C 0; rst -system`.
+
+Red herrings ruled out along the way: the debugger (soft reboots work with
+`hw_server`/xsct attached), the SD card, its FAT layout, the TXS02612 switch.
+
+### PHY power-down: U-Boot Ethernet after a soft reboot
+
+The RTL8211E has **no reset line** from the PS. When Linux takes `eth0` down at
+shutdown, phylib sets `BMCR.PDOWN`. Linux clears it again on the next boot, but
+U-Boot's generic PHY setup doesn't, so after a soft reboot U-Boot shows
+*"Waiting for PHY auto negotiation to complete…… TIMEOUT"* and has no network.
+Workaround at the U-Boot prompt (the reflash script does this itself): enable
+GEM0's MDIO port and write BMCR = `0x1340`:
+
+```
+mw.l 0xE000B000 0x10; mw.l 0xE000B034 0x50021340; sleep 3
+```
+
+### SD1 is a second microSD slot (TF2), not an eMMC
+
+The schematic labels TF1 (SD0, behind a TXS02612 1.8 V↔3.3 V switch with `SEL`
+tied low) as the only bootable slot and TF2 (SD1) as *not bootable*. The DTS
+still describes `sdhci1` as a non-removable eMMC, so a card in TF2 is only seen
+if present at boot.
 
 ---
 

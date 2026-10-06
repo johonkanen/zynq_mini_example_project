@@ -117,6 +117,33 @@ esac
 EOS
 chmod +x "$OV/rootfs/etc/init.d/S95fpga"
 
+# Zero devcfg.MULTIBOOT_ADDR at boot so a soft reboot always finds BOOT.BIN
+# (see the script's header and doc/linux_build.md 'Soft reboot').
+cat > "$OV/rootfs/etc/init.d/S01multiboot" <<'EOS'
+#!/bin/sh
+#
+# Zero devcfg.MULTIBOOT_ADDR (0xF800702C) at boot.
+#
+# The register survives warm resets. After any failed BootROM boot attempt it
+# is left non-zero, and from then on every warm reset (reboot, watchdog,
+# U-Boot reset) makes the BootROM look for BOOT000<n>.BIN instead of BOOT.BIN
+# on the SD card -> REBOOT_STATUS error 0x200A, silent console, and the board
+# only comes back after a power cycle. Zeroing it here means "reboot" always
+# finds BOOT.BIN again. (A Xilinx FSBL does this job; U-Boot SPL doesn't.)
+#
+case "$1" in
+	start)
+		devmem 0xF8007034 32 0x757BDF0D   # devcfg UNLOCK key (harmless if already unlocked)
+		mb=$(devmem 0xF800702C 32)
+		devmem 0xF800702C 32 0
+		[ "$((mb & 0x1FFF))" -ne 0 ] && echo "multiboot: reset MULTIBOOT_ADDR $mb -> 0 (a boot had failed since power-on)"
+		exit 0 ;;
+	stop|restart|reload) ;;
+	*) echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
+esac
+EOS
+chmod +x "$OV/rootfs/etc/init.d/S01multiboot"
+
 # SSH: key-only root login (root has no password; dropbear rejects blank
 # passwords unless run with -B, so password login over the network stays off)
 rm -rf "$OV/rootfs/root/.ssh"

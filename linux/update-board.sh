@@ -12,14 +12,12 @@
 #   web      fpga-webstream binary           -> /usr/bin, service restarted
 #   all      all of the above
 #
-# Unchanged files (same md5 as on the board) are skipped. A changed kernel or
-# dtb takes effect on the next boot. The script does NOT reboot by default:
-# on this board a soft reboot (Linux reboot, JTAG rst -system, U-Boot reset)
-# does not boot from SD - the BootROM fails with error 0x200A until the board
-# is power-cycled. Power-cycle it instead.
+# Unchanged files (same md5 as on the board) are skipped. The board reboots
+# afterwards only if the kernel or the dtb actually changed. (Soft reboots work
+# as long as the image has S01multiboot - see doc/linux_build.md.)
 #
 # options:
-#   --reboot        soft-reboot anyway after a kernel/dtb change
+#   --no-reboot     don't reboot (new kernel/dtb take effect on the next boot)
 #   --new-hostkey   forget the board's old SSH host key first (do this after
 #                   reflashing the card: dropbear makes a new key on 1st boot)
 #
@@ -39,18 +37,18 @@ KNOWN="$LINUX_BUILD_DIR/known_hosts"
 log() { printf '\033[1;34m==> %s\033[0m\n' "$*"; }
 die() { printf '\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 
-reboot_ok=0 forget=0
+reboot_ok=1 forget=0
 while [ $# -gt 0 ]; do
     case "$1" in
-        --reboot)      reboot_ok=1; shift ;;
-        --no-reboot)   reboot_ok=0; shift ;;   # default; kept for compatibility
+        --no-reboot)   reboot_ok=0; shift ;;
+        --reboot)      reboot_ok=1; shift ;;   # the default; accepted for compatibility
         --new-hostkey) forget=1; shift ;;
         -h|--help)     sed -n '2,30p' "$0"; exit 0 ;;
         -*)            die "unknown option $1" ;;
         *)             break ;;
     esac
 done
-[ $# -ge 1 ] || die "usage: $0 [--reboot] [--new-hostkey] <board-ip> [kernel|dtb|bit|web|all]..."
+[ $# -ge 1 ] || die "usage: $0 [--no-reboot] [--new-hostkey] <board-ip> [kernel|dtb|bit|web|all]..."
 BOARD=$1; shift
 parts=("${@:-all}")
 want() { local p; for p in "${parts[@]}"; do [ "$p" = all ] || [ "$p" = "$1" ] && return 0; done; return 1; }
@@ -134,10 +132,10 @@ fi
 if [ "$need_reboot" = 1 ]; then
     if [ "$reboot_ok" = 1 ]; then
         cleanup; boot_mounted=0
-        log "kernel/dtb changed - soft-rebooting (--reboot; may need a power cycle to come back)"
+        log "kernel/dtb changed - rebooting the board"
         rsh "reboot" || true
     else
-        log "kernel/dtb changed - POWER-CYCLE the board to boot it (soft reboot doesn't boot from SD here)"
+        log "kernel/dtb changed - takes effect on the next reboot (--no-reboot)"
     fi
 fi
 log "done"

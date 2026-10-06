@@ -71,6 +71,19 @@ setenv bootcmd_pxe  echo reflash: skipping pxe
 setenv bootcmd_dhcp echo reflash: skipping dhcp
 setenv autoload no
 setenv serverip $SERVER_IP
+setenv rf_srv $SERVER_IP
+# Zero devcfg.MULTIBOOT_ADDR: after a failed BootROM boot it's left non-zero and
+# every warm reset then looks for BOOT000<n>.BIN instead of BOOT.BIN (0x200A).
+mw.l 0xF8007034 0x757BDF0D
+mw.l 0xF800702C 0
+# Wake the Ethernet PHY (RTL8211E @ MDIO addr 0): Linux powers it down
+# (BMCR.PDOWN) when eth0 goes down at shutdown, the board has no PHY reset
+# line, and U-Boot's PHY setup never clears PDOWN - so after a soft reboot
+# U-Boot's Ethernet would time out. Raw GEM0 MDIO: enable the management port
+# (NET_CTRL.MDEN), then write BMCR = 0x1340 (autoneg on + restart, PDOWN off).
+mw.l 0xE000B000 0x10
+mw.l 0xE000B034 0x50021340
+sleep 3
 setenv rf_buf 0x08000000
 setenv rf_chk 0x10000000
 setenv rf_ok 0
@@ -78,8 +91,9 @@ $IP_SETUP
 if itest \${rf_net} -eq 0; then
   echo "reflash: ERROR network setup failed (no DHCP answer?)"
 elif mmc dev 0; then
-  echo "reflash: tftp \${serverip}:sdcard.img -> \${rf_buf}"
-  if tftpboot \${rf_buf} sdcard.img; then
+  # explicit server: dhcp may have replaced serverip with the DHCP server's address
+  echo "reflash: tftp \${rf_srv}:sdcard.img -> \${rf_buf}"
+  if tftpboot \${rf_buf} \${rf_srv}:sdcard.img; then
     if itest \${filesize} -gt 0x08000000; then
       echo "reflash: ERROR image is larger than 128 MB, will not fit the RAM buffers"
     else
@@ -108,6 +122,7 @@ fi
 if itest \${rf_ok} -eq 1; then
   mmc rescan
   echo "================ reflash: DONE - booting the new card ================"
+  setenv devnum 0; run mmc_boot
 else
   echo "================ reflash: FAILED - staying at the U-Boot prompt ================"
   for t in mmc0 mmc1 qspi nand nor usb0 usb1; do setenv bootcmd_\${t} echo reflash: skipping \${t}; done
