@@ -37,6 +37,18 @@
   .u-legend { font-size:.8rem; text-align:left; }
   .u-legend th { color:var(--text); }
   .u-select { background:rgba(90,176,255,.15); }
+  #scope { width:100%; height:440px; display:block; background:#0b0d10; border-radius:6px; touch-action:none; }
+  .ctl-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); gap:.75rem; margin-top:.75rem; }
+  .ctl-grid fieldset { border:1px solid var(--line); border-radius:6px; padding:.4rem .7rem .6rem; margin:0; min-width:0; }
+  .ctl-grid legend { color:var(--dim); font-size:.8rem; padding:0 .3rem; }
+  .ctl-grid label { display:flex; justify-content:space-between; gap:.5rem; align-items:center; margin:.2rem 0; }
+  .chrow { display:grid; grid-template-columns:auto auto minmax(9rem, 16rem) auto auto; justify-content:start; gap:.4rem; align-items:center; margin:.2rem 0; }
+  .sw { width:.8rem; height:.8rem; border-radius:2px; display:inline-block; }
+  input.num { width:5.5rem; }
+  input[type=range] { width:9rem; accent-color:var(--a); }
+  button.run { background:#1f4a33; border-color:#2f6d4b; min-width:4.5rem; }
+  button.stop { background:#5a2424; border-color:#7a3333; min-width:4.5rem; }
+  #meas td, #meas th { padding:.2rem .6rem; }
   small, .dim { color:var(--dim); }
   .mono { font-family:ui-monospace, "Cascadia Mono", Consolas, monospace; font-variant-numeric:tabular-nums; }
   .table-wrap { overflow-x:auto; }
@@ -83,6 +95,39 @@
     <div><h2>HEARTBEAT</h2><div class="big mono" id="hb">–</div></div>
     <div><h2>samples received</h2><div class="big" id="rate">–</div></div>
     <div><h2>WebSocket</h2><div class="big" id="kbps">–</div></div>
+  </section>
+  <section class="card">
+    <h2>Oscilloscope — 4 channels × 4096 samples, triggered capture in the PL (scope_capture.vhd)</h2>
+    <canvas id="scope"></canvas>
+    <div class="controls" style="margin-top:.5rem">
+      <button id="srun" class="run">Run</button>
+      <button id="ssingle">Single</button>
+      <label>mode <select id="smode"><option value="auto" selected>auto</option><option value="normal">normal</option></select></label>
+      <span id="sstate" class="pill">stopped</span>
+      <small class="dim" id="sinfo"></small>
+    </div>
+    <div class="ctl-grid">
+      <fieldset><legend>timebase</legend>
+        <label>time/div <select id="tdiv"></select></label>
+        <label>trigger position <span><input type="range" id="tpos" min="0" max="100" value="50"> <span id="tposv" class="mono">50%</span></span></label>
+      </fieldset>
+      <fieldset><legend>trigger <small class="dim">— drag the ◀ marker on the right edge</small></legend>
+        <label>source <select id="tch"></select></label>
+        <label>edge <select id="tedge"><option value="rise">rising ↑</option><option value="fall">falling ↓</option></select></label>
+        <label>level (counts) <input id="tlevel" class="num mono" type="number" min="-32768" max="32767" value="0"></label>
+      </fieldset>
+      <fieldset><legend>test generators (scope_siggen)</legend>
+        <label>A: sine / triangle / square, Hz <input id="fa" class="num mono" type="number" min="1" max="50000000" value="1000000"></label>
+        <label>B: sine, Hz <input id="fb" class="num mono" type="number" min="1" max="50000000" value="250000"></label>
+      </fieldset>
+    </div>
+    <fieldset class="ctl-grid" style="display:block;border:1px solid var(--line);border-radius:6px;padding:.4rem .7rem .6rem">
+      <legend style="color:var(--dim);font-size:.8rem">channels — <span class="dim">show · source · counts/div · offset (div)</span></legend>
+      <div id="chans"></div>
+    </fieldset>
+    <div class="table-wrap" style="margin-top:.5rem">
+      <table id="meas"><thead><tr><th></th><th>source</th><th>min</th><th>max</th><th>p-p</th><th>mean</th><th>frequency</th></tr></thead><tbody></tbody></table>
+    </div>
   </section>
   <section class="card">
     <h2>Live plot — registers sampled by fpgad, binary WebSocket stream</h2>
@@ -289,12 +334,17 @@ function requestStream() {
 function connect() {
   ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
   ws.binaryType = "arraybuffer";
-  ws.onopen = () => { pill($("conn"), "live", "ok"); requestStream(); };
+  ws.onopen = () => { pill($("conn"), "live", "ok"); requestStream(); if (scopeRunning) scopeSend(); };
   ws.onclose = () => { pill($("conn"), "reconnecting…", "bad"); setTimeout(connect, 1000); };
   ws.onmessage = e => {
-    if (typeof e.data !== "string") { onFrame(e.data); return; }
+    if (typeof e.data !== "string") {
+      const type = new DataView(e.data).getUint8(0);
+      if (type === 1) onFrame(e.data); else if (type === 2) onScope(e.data);
+      return;
+    }
     const m = JSON.parse(e.data);
     if (m.type === "stream") setupPlots(m.hz, m.regs);
+    else if (m.type === "scope") onScopeState(m.state);
     else if (m.type === "status") {
       pill($("pl"), "PL: " + m.pl + (m.sim ? " (sim)" : ""), m.ok ? "ok" : "bad");
       $("msg").textContent = m.msg;
@@ -353,6 +403,242 @@ function frame(now) {
   }
   requestAnimationFrame(frame);
 }
+/* ---------- oscilloscope: WebSocket "scope run ..." -> capture frames -> canvas ---------- */
+/* Frame (fpga-web/main.c): u8 type=2, u8 nch, u16 flags (bit0 triggered), u32 n, u32 pre,
+   u32 div, f64 fs | i16 v[nch][n] in time order, trigger sample = pre */
+const FCLK = 100e6, DEPTH = 4096;
+const SC_COLORS = ["#f5d742", "#3fd0e0", "#e05ad8", "#5ad46a"];
+const SOURCES = ["off (0)", "sine A", "triangle A", "square A", "sine B", "noise", "sine A + noise",
+                 "OLED SPI pins (logic)", "ext 0", "ext 1", "ext 2", "ext 3"];
+const SCALES = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000];
+const TDIVS = [50e-9, 100e-9, 200e-9, 500e-9, 1e-6, 2e-6, 5e-6, 10e-6, 20e-6, 50e-6, 100e-6, 200e-6,
+               500e-6, 1e-3, 2e-3, 5e-3, 10e-3, 20e-3, 50e-3, 100e-3, 200e-3];
+const chans = [1, 2, 4, 7].map((src, i) => ({ show: true, src, scale: src === 7 ? 5 : 10000, off: src === 7 ? -3.5 : 0 }));
+let scopeRunning = false, scopeData = null, scopeDirty = true, scopeState = "stopped";
+let scopeFrames = 0, scopeFps = 0, scopeT0 = performance.now(), sendTimer = null;
+
+const fmtTime = s => { const a = Math.abs(s);
+  return a >= 1 ? +s.toFixed(3) + " s" : a >= 1e-3 ? +(s * 1e3).toFixed(3) + " ms"
+       : a >= 1e-6 ? +(s * 1e6).toFixed(3) + " µs" : +(s * 1e9).toFixed(1) + " ns"; };
+const fmtHz = f => f >= 1e6 ? +(f / 1e6).toFixed(4) + " MHz" : f >= 1e3 ? +(f / 1e3).toFixed(3) + " kHz" : +f.toFixed(2) + " Hz";
+const fmtRate = f => f >= 1e6 ? +(f / 1e6).toFixed(3) + " MSa/s" : f >= 1e3 ? +(f / 1e3).toFixed(3) + " kSa/s" : +f.toFixed(1) + " Sa/s";
+const opt = (v, t, sel) => `<option value="${v}"${sel ? " selected" : ""}>${t}</option>`;
+
+/* settings -> fpgad capture keys */
+function scopeParams() {
+  const tdiv = +$("tdiv").value || 1e-6, T = 10 * tdiv, frac = $("tpos").value / 100;
+  const div = Math.min(100000, Math.max(1, Math.ceil(T * FCLK / DEPTH)));
+  return { tdiv, T, frac, div, pre: Math.round(frac * (DEPTH - 1)), trig: +$("tch").value,
+           edge: $("tedge").value, level: Math.max(-32768, Math.min(32767, Math.round(+$("tlevel").value || 0))) };
+}
+function scopeArgs() {
+  const p = scopeParams();
+  return `src=${chans.map(c => c.src).join(",")} div=${p.div} trig=${p.trig} edge=${p.edge} level=${p.level} pre=${p.pre}`;
+}
+function scopeSend(single) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(single ? `scope run single ${scopeArgs()}` : scopeRunning ? `scope run ${$("smode").value} ${scopeArgs()}` : "scope stop");
+}
+function settingsChanged() {                  // debounce: a drag sends a burst of changes
+  scopeDirty = true;
+  if (!scopeRunning) return;
+  clearTimeout(sendTimer);
+  sendTimer = setTimeout(() => scopeSend(), 120);
+}
+function setRunning(r) {
+  scopeRunning = r;
+  $("srun").textContent = r ? "Stop" : "Run";
+  $("srun").className = r ? "stop" : "run";
+}
+function onScopeState(st) {
+  scopeState = st;
+  if (st === "stopped" && scopeRunning) setRunning(false);   // single shot done / error
+  updateStatePill();
+}
+function updateStatePill() {
+  const trig = scopeData && scopeData.triggered;
+  const [txt, cls] = scopeState === "waiting" ? ["waiting for trigger", "bad"]
+    : scopeState === "running" ? [trig ? "Trig'd" : "Auto (no trigger)", trig ? "ok" : ""]
+    : ["stopped", ""];
+  pill($("sstate"), txt, cls);
+}
+
+function onScope(buf) {
+  const dv = new DataView(buf);
+  const nch = dv.getUint8(1), flags = dv.getUint16(2, true), n = dv.getUint32(4, true);
+  if (buf.byteLength !== 24 + 2 * nch * n) return;
+  const v = [];
+  for (let c = 0; c < nch; c++) v.push(new Int16Array(buf, 24 + 2 * n * c, n));
+  scopeData = { n, nch, pre: dv.getUint32(8, true), div: dv.getUint32(12, true), fs: dv.getFloat64(16, true),
+                triggered: !!(flags & 1), v };
+  scopeFrames++; scopeDirty = true;
+  updateStatePill();
+}
+
+/* geometry shared by drawing and the trigger-level drag */
+function scopeGeom() {
+  const cv = $("scope"), w = cv.clientWidth, h = cv.clientHeight;
+  return { cv, w, h, dx: w / 10, dy: h / 8, mid: h / 2 };
+}
+const yOf = (g, c, v) => g.mid - (v / chans[c].scale + chans[c].off) * g.dy;
+const vOf = (g, c, y) => ((g.mid - y) / g.dy - chans[c].off) * chans[c].scale;
+
+function drawScope() {
+  const g = scopeGeom(), dpr = window.devicePixelRatio || 1, p = scopeParams();
+  if (g.cv.width !== Math.round(g.w * dpr) || g.cv.height !== Math.round(g.h * dpr)) {
+    g.cv.width = Math.round(g.w * dpr); g.cv.height = Math.round(g.h * dpr);
+  }
+  const x = g.cv.getContext("2d");
+  x.setTransform(dpr, 0, 0, dpr, 0, 0);
+  x.clearRect(0, 0, g.w, g.h);
+  // graticule: 10 x 8 divisions, centre axes with minor ticks
+  x.lineWidth = 1; x.strokeStyle = "#232833";
+  x.beginPath();
+  for (let i = 1; i < 10; i++) { x.moveTo(Math.round(i * g.dx) + .5, 0); x.lineTo(Math.round(i * g.dx) + .5, g.h); }
+  for (let j = 1; j < 8; j++) { x.moveTo(0, Math.round(j * g.dy) + .5); x.lineTo(g.w, Math.round(j * g.dy) + .5); }
+  x.stroke();
+  x.strokeStyle = "#3a4150"; x.beginPath();
+  const cx = Math.round(5 * g.dx) + .5, cy = Math.round(4 * g.dy) + .5;
+  for (let i = 0; i <= 50; i++) { const xx = Math.round(i * g.dx / 5) + .5; x.moveTo(xx, cy - 3); x.lineTo(xx, cy + 3); }
+  for (let j = 0; j <= 40; j++) { const yy = Math.round(j * g.dy / 5) + .5; x.moveTo(cx - 3, yy); x.lineTo(cx + 3, yy); }
+  x.stroke();
+
+  const tLeft = -p.frac * p.T, X = t => (t - tLeft) / p.T * g.w;
+  if (scopeData) {
+    const d = scopeData, ts = 1 / d.fs;
+    const i0 = Math.max(0, Math.floor(d.pre + tLeft / ts) - 1), i1 = Math.min(d.n - 1, Math.ceil(d.pre + (tLeft + p.T) / ts) + 1);
+    x.lineWidth = 1.3; x.lineJoin = "round";
+    for (let c = 0; c < d.nch; c++) {
+      if (!chans[c].show) continue;
+      const a = d.v[c];
+      x.strokeStyle = SC_COLORS[c]; x.beginPath();
+      for (let i = i0; i <= i1; i++) {
+        const xx = X((i - d.pre) * ts), yy = yOf(g, c, a[i]);
+        if (i === i0) x.moveTo(xx, yy); else x.lineTo(xx, yy);
+      }
+      x.stroke();
+    }
+  }
+  // trigger time (top) and level (right edge, in the trigger channel's colour)
+  const tx = X(0), tc = p.trig, ly = yOf(g, tc, p.level);
+  x.fillStyle = "#ff9a3c";
+  x.beginPath(); x.moveTo(tx - 6, 0); x.lineTo(tx + 6, 0); x.lineTo(tx, 8); x.fill();
+  x.fillStyle = SC_COLORS[tc];
+  x.beginPath(); x.moveTo(g.w, ly - 7); x.lineTo(g.w, ly + 7); x.lineTo(g.w - 11, ly); x.fill();
+  if (dragging) {
+    x.strokeStyle = SC_COLORS[tc]; x.setLineDash([4, 4]);
+    x.beginPath(); x.moveTo(0, ly); x.lineTo(g.w, ly); x.stroke(); x.setLineDash([]);
+  }
+  // labels
+  x.font = "12px ui-monospace, Consolas, monospace"; x.textBaseline = "top";
+  let lx = 8;
+  for (let c = 0; c < 4; c++) {
+    if (!chans[c].show) continue;
+    const t = `CH${c + 1} ${si(chans[c].scale)}/div`;
+    x.fillStyle = SC_COLORS[c]; x.fillText(t, lx, 6); lx += x.measureText(t).width + 14;
+  }
+  x.fillStyle = "#c9ced8"; x.textAlign = "right";
+  x.fillText(`${fmtTime(p.tdiv)}/div   ${scopeData ? fmtRate(scopeData.fs) : ""}`, g.w - 18, 6);
+  x.textAlign = "left";
+  if (!scopeData) { x.fillStyle = "#8b93a1"; x.fillText("no capture yet — press Run", 8, g.h - 20); }
+}
+
+function measure() {
+  const tb = $("meas").querySelector("tbody");
+  if (!scopeData) { tb.innerHTML = ""; return; }
+  const d = scopeData, rows = [];
+  for (let c = 0; c < d.nch; c++) {
+    if (!chans[c].show) continue;
+    const a = d.v[c];
+    let mn = 32767, mx = -32768, sum = 0;
+    for (const v of a) { if (v < mn) mn = v; if (v > mx) mx = v; sum += v; }
+    const mean = sum / a.length, hy = (mx - mn) * 0.1;
+    // frequency: rising crossings of the mid level, with 10% hysteresis
+    const midv = (mx + mn) / 2;
+    let armed = false, first = -1, last = -1, cnt = 0;
+    if (mx - mn > 2) for (let i = 0; i < a.length; i++) {
+      if (a[i] < midv - hy) armed = true;
+      else if (armed && a[i] >= midv) { armed = false; if (first < 0) first = i; last = i; cnt++; }
+    }
+    const f = cnt >= 2 ? (cnt - 1) / ((last - first) / d.fs) : NaN;
+    rows.push(`<tr><td><span class="sw" style="background:${SC_COLORS[c]}"></span> CH${c + 1}</td>` +
+      `<td class="dim">${SOURCES[chans[c].src]}</td><td class="mono">${mn}</td><td class="mono">${mx}</td>` +
+      `<td class="mono">${mx - mn}</td><td class="mono">${mean.toFixed(1)}</td>` +
+      `<td class="mono">${Number.isFinite(f) ? fmtHz(f) : "–"}</td></tr>`);
+  }
+  tb.innerHTML = rows.join("");
+}
+
+/* controls */
+$("tdiv").innerHTML = TDIVS.map(t => opt(t, fmtTime(t), t === 1e-6)).join("");
+$("tch").innerHTML = [0, 1, 2, 3].map(c => opt(c, "CH" + (c + 1), c === 0)).join("");
+$("chans").innerHTML = chans.map((ch, c) =>
+  `<div class="chrow"><span class="sw" style="background:${SC_COLORS[c]}"></span>` +
+  `<label style="margin:0"><input type="checkbox" id="cs${c}" checked> CH${c + 1}</label>` +
+  `<select id="csrc${c}">${SOURCES.map((s, i) => opt(i, s, i === ch.src)).join("")}</select>` +
+  `<select id="csc${c}">${SCALES.map(v => opt(v, si(v), v === ch.scale)).join("")}</select>` +
+  `<input id="coff${c}" class="num mono" type="number" step="0.5" value="${ch.off}" style="width:4.5rem"></div>`).join("");
+for (let c = 0; c < 4; c++) {
+  $("cs" + c).onchange = e => { chans[c].show = e.target.checked; scopeDirty = true; };
+  $("csrc" + c).onchange = e => {
+    chans[c].src = +e.target.value;
+    if (chans[c].src === 7) { chans[c].scale = 5; chans[c].off = -3.5; }        // logic: 0..15
+    else if (chans[c].scale < 1000) { chans[c].scale = 10000; chans[c].off = 0; }
+    $("csc" + c).value = chans[c].scale; $("coff" + c).value = chans[c].off;
+    settingsChanged();
+  };
+  $("csc" + c).onchange = e => { chans[c].scale = +e.target.value; scopeDirty = true; };
+  $("coff" + c).oninput = e => { chans[c].off = +e.target.value || 0; scopeDirty = true; };
+}
+for (const id of ["tdiv", "tch", "tedge", "tlevel"]) $(id).addEventListener("change", settingsChanged);
+$("tlevel").addEventListener("input", () => { scopeDirty = true; });
+$("tpos").oninput = () => { $("tposv").textContent = $("tpos").value + "%"; settingsChanged(); };
+$("smode").onchange = settingsChanged;
+$("srun").onclick = () => { setRunning(!scopeRunning); scopeSend(); };
+$("ssingle").onclick = () => { setRunning(false); scopeSend(true); pill($("sstate"), "single: armed", "bad"); };
+
+/* generator frequencies -> GEN_FTW_A/B (f = ftw * 100 MHz / 2^32) */
+function setGen(id, addr) {
+  const f = Math.max(1, Math.min(50e6, +$(id).value || 1));
+  const ftw = Math.round(f * 4294967296 / FCLK) >>> 0;
+  writeReg(addr, "0x" + ftw.toString(16)).catch(e => log(e.message, true));
+}
+$("fa").onchange = () => setGen("fa", "0x60");
+$("fb").onchange = () => setGen("fb", "0x64");
+
+/* drag the trigger level: grab the right edge of the screen */
+let dragging = false;
+const cv = $("scope");
+cv.addEventListener("pointermove", e => {
+  const r = cv.getBoundingClientRect();
+  cv.style.cursor = dragging || e.clientX - r.left > r.width - 40 ? "ns-resize" : "default";
+  if (!dragging) return;
+  const lv = Math.round(Math.max(-32768, Math.min(32767, vOf(scopeGeom(), +$("tch").value, e.clientY - r.top))));
+  $("tlevel").value = lv;
+  settingsChanged();
+});
+cv.addEventListener("pointerdown", e => {
+  const r = cv.getBoundingClientRect();
+  if (e.clientX - r.left > r.width - 40) { dragging = true; cv.setPointerCapture(e.pointerId); scopeDirty = true; }
+});
+cv.addEventListener("pointerup", () => { if (dragging) { dragging = false; scopeDirty = true; } });
+new ResizeObserver(() => { scopeDirty = true; }).observe(cv);
+
+function scopeFrame(now) {
+  if (now - scopeT0 >= 1000) { scopeFps = scopeFrames * 1000 / (now - scopeT0); scopeFrames = 0; scopeT0 = now; }
+  if (scopeDirty) {
+    scopeDirty = false;
+    drawScope();
+    measure();
+    const p = scopeParams();
+    $("sinfo").textContent = `${fmtRate(FCLK / p.div)}, ${DEPTH} samples = ${fmtTime(DEPTH * p.div / FCLK)} captured, ` +
+      `trigger at sample ${p.pre} · ${scopeFps.toFixed(1)} captures/s`;
+  }
+  requestAnimationFrame(scopeFrame);
+}
+setRunning(true);                               // start in auto mode once the socket is up
+requestAnimationFrame(scopeFrame);
+
 connect();
 requestAnimationFrame(frame);
 </script>

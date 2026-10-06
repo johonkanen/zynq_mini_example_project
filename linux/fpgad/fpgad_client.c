@@ -83,6 +83,27 @@ int fpgad_readline(struct fpgad_conn *c, char *out, size_t outlen, int timeout_m
     }
 }
 
+int fpgad_read_bytes(struct fpgad_conn *c, void *buf, size_t n, int timeout_ms)
+{
+    char *out = buf;
+    size_t k = c->len < n ? c->len : n;         /* whatever readline already buffered */
+    memcpy(out, c->buf, k);
+    memmove(c->buf, c->buf + k, c->len - k);
+    c->len -= k;
+    while (k < n) {
+        if (timeout_ms >= 0) {
+            struct pollfd p = { .fd = c->fd, .events = POLLIN };
+            if (poll(&p, 1, timeout_ms) <= 0)
+                return -1;
+        }
+        ssize_t r = recv(c->fd, out + k, n - k, 0);
+        if (r <= 0)
+            return -1;
+        k += (size_t)r;
+    }
+    return 0;
+}
+
 int fpgad_request(struct fpgad_conn *c, const char *line, char *msg, size_t msglen)
 {
     size_t n = strlen(line);

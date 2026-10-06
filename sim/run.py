@@ -31,11 +31,15 @@ lib = vu.add_library("lib")
 # The AXI package + slave + testbench. zynq_mini_top.vhd needs the generated
 # block design and is not part of the unit sim.
 lib.add_source_files(ROOT / "src" / "hdl" / "axi_pkg.vhd")
+lib.add_source_files(ROOT / "src" / "hdl" / "scope_pkg.vhd")
 lib.add_source_files(ROOT / "src" / "hdl" / "axi_regs.vhd")
 lib.add_source_files(ROOT / "src" / "hdl" / "font8x8_pkg.vhd")
 lib.add_source_files(ROOT / "src" / "hdl" / "ssd1306_text.vhd")
+lib.add_source_files(ROOT / "src" / "hdl" / "scope_siggen.vhd")
+lib.add_source_files(ROOT / "src" / "hdl" / "scope_capture.vhd")
 lib.add_source_files(ROOT / "sim" / "tb_axi_regs.vhd")
 lib.add_source_files(ROOT / "sim" / "tb_ssd1306_text.vhd")
+lib.add_source_files(ROOT / "sim" / "tb_scope_capture.vhd")
 
 vu.set_sim_option("nvc.sim_flags", ["--ieee-warnings=off"])
 

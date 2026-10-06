@@ -18,6 +18,15 @@
  *   oled <row> <text>             -> ok                (OLED row 0..7, 16 chars;
  *                                     the rest of the line, spaces kept)
  *   oled clear                    -> ok
+ *   capture [key=value...]        -> ok capture {meta...,"bytes":N} + N raw bytes
+ *        one oscilloscope acquisition (src/hdl/scope_capture.vhd). Keys (any
+ *        left out keep their current register value):
+ *          src=a,b,c,d  channel sources 0..15     div=N    sample every N clk, 1..100000
+ *          trig=0..3    trigger channel           edge=rise|fall    level=-32768..32767
+ *          pre=0..4095  samples before trigger    timeout=ms  wait for a trigger, 0..5000
+ *          auto=0|1     force a trigger after the timeout (1) or reply "ok timeout" (0)
+ *        Data: int16 little-endian, channel-major [ch][n], in time order; the
+ *        trigger sample is number "pre".
  *   stream <hz> <batch_hz> <off>... -> ok streaming, then until disconnect:
  *        data {"t":[us,...],"v":[[r0,...],[r1,...]]}   one line per batch
  *        status {...}                                   when the PL state changes
@@ -32,6 +41,7 @@
 #include <fcntl.h>
 #include <glob.h>
 #include <inttypes.h>
+#include <math.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -60,6 +70,21 @@
 #define REG_OLED_TEXT   0x80            /* 128 chars, 4 per word, little-endian */
 #define OLED_COLS       16
 #define OLED_ROWS       8
+#define REG_SCOPE_CMD   0x40            /* bit0 arm, bit1 force, bit2 abort */
+#define REG_SCOPE_STAT  0x44
+#define REG_SCOPE_TRIG  0x48
+#define REG_SCOPE_PRE   0x4C
+#define REG_SCOPE_DIV   0x50
+#define REG_SCOPE_SRC   0x54
+#define REG_SCOPE_INFO  0x58
+#define REG_GEN_FTW_A   0x60
+#define REG_GEN_FTW_B   0x64
+#define SCOPE_RAM       0x8000
+#define SCOPE_CH        4
+#define SCOPE_DEPTH     4096
+#define SCOPE_INFO_VAL  0x00640C04u     /* 100 MHz, 2^12 deep, 4 channels */
+#define SCOPE_FCLK_HZ   100000000.0
+#define SCOPE_DIV_MAX   100000
 #define MAX_CLIENTS     32
 #define MAX_STREAM_REGS 8
 
@@ -164,6 +189,8 @@ static uint32_t sim_regs[4];            /* SCRATCH0..2, CONTROL */
 static uint64_t sim_hb_zero_ns;         /* when HEARTBEAT was last 0 */
 static uint32_t sim_oled_ctrl = 0x00007F01;
 static uint32_t sim_oled_text[32];      /* reset text set up in main() */
+/* SCOPE_TRIG, PRE, DIV, SRC, -, -, GEN_FTW_A, B (reset values as in axi_regs.vhd) */
+static uint32_t sim_scope[8] = { 0, 2048, 1, 0x7421, 0, 0, 0x028F5C29, 0x00A3D70A };
 
 static uint32_t sim_heartbeat(void)
 {
@@ -180,6 +207,9 @@ static uint32_t sim_read(uint32_t off)
     uint32_t hb = sim_heartbeat();
     if (idx >= REG_OLED_TEXT / 4)
         return sim_oled_text[idx - REG_OLED_TEXT / 4];
+    if (idx >= REG_SCOPE_TRIG / 4 && idx <= REG_GEN_FTW_B / 4 && idx != REG_SCOPE_INFO / 4 &&
+        idx != REG_SCOPE_INFO / 4 + 1)
+        return sim_scope[idx - REG_SCOPE_TRIG / 4];
     switch (idx) {
     case 0: case 1: case 2: case 3: return sim_regs[idx];
     case 4: return hb;
@@ -193,6 +223,8 @@ static uint32_t sim_read(uint32_t off)
     case 7: return SIGNATURE_VALUE;
     case REG_OLED_CTRL / 4: return sim_oled_ctrl;
     case REG_OLED_STAT / 4: return ((uint32_t)((now_ns() - t0_ns) / 33333333u) << 16) | 1;
+    case REG_SCOPE_INFO / 4: return SCOPE_INFO_VAL;
+    case REG_SCOPE_STAT / 4: return 4;  /* done; sim captures happen in sim_capture() */
     default: return 0;
     }
 }
@@ -215,6 +247,9 @@ static void sim_write(uint32_t off, uint32_t v)
         sim_regs[idx] = v;
     } else if (idx == REG_OLED_CTRL / 4) {
         sim_oled_ctrl = v;
+    } else if (idx >= REG_SCOPE_TRIG / 4 && idx <= REG_GEN_FTW_B / 4 && idx != REG_SCOPE_INFO / 4 &&
+               idx != REG_SCOPE_INFO / 4 + 1) {
+        sim_scope[idx - REG_SCOPE_TRIG / 4] = v;
     } else if (idx >= REG_OLED_TEXT / 4) {
         sim_oled_text[idx - REG_OLED_TEXT / 4] = v;
     }
@@ -410,6 +445,242 @@ static int pl_load(const char *name, char *err, size_t n)
     return rc;
 }
 
+/* ---- oscilloscope capture ------------------------------------------------- */
+
+static pthread_mutex_t scope_lock = PTHREAD_MUTEX_INITIALIZER;   /* one capture at a time */
+
+/* n words from off under one read lock; 0 or -1 with err */
+static int reg_read_block(uint32_t off, uint32_t *out, size_t n, char *err, size_t errlen)
+{
+    if (off % 4 || off + 4 * n > map_size) {
+        snprintf(err, errlen, "0x%" PRIx32 "+%zu words outside the 0x%zx-byte window", off, n,
+                 map_size);
+        return -1;
+    }
+    pthread_rwlock_rdlock(&pl_lock);
+    if (!pl_ok) {
+        pthread_rwlock_unlock(&pl_lock);
+        snprintf(err, errlen, "PL not ready");
+        return -1;
+    }
+    for (size_t i = 0; i < n; i++)
+        out[i] = raw_read(off + 4 * (uint32_t)i);
+    pthread_rwlock_unlock(&pl_lock);
+    return 0;
+}
+
+/* the client hung up (or sent something) while we wait: give up the capture */
+static int client_gone(int fd)
+{
+    struct pollfd p = { .fd = fd, .events = POLLIN };
+    char c;
+    return poll(&p, 1, 0) > 0 && recv(fd, &c, 1, MSG_PEEK | MSG_DONTWAIT) <= 0;
+}
+
+/* one sample of source src at time t (s) - the FPGAD_SIM stand-in for the PL */
+static int16_t sim_source(unsigned src, double t)
+{
+    double fa = sim_scope[6] * SCOPE_FCLK_HZ / 4294967296.0;
+    double fb = sim_scope[7] * SCOPE_FCLK_HZ / 4294967296.0;
+    double pa = fmod(t * fa, 1.0), noise = (rand() / (double)RAND_MAX - 0.5) * 2.0;
+    switch (src) {
+    case 1: return (int16_t)lrint(30000 * sin(2 * M_PI * pa));
+    case 2: return (int16_t)lrint(pa < 0.5 ? -30000 + 120000 * pa : 90000 - 120000 * pa);
+    case 3: return pa < 0.5 ? 30000 : -30000;
+    case 4: return (int16_t)lrint(30000 * sin(2 * M_PI * fmod(t * fb, 1.0)));
+    case 5: return (int16_t)lrint(32767 * noise);
+    case 6: return (int16_t)lrint(15000 * sin(2 * M_PI * pa) + 4096 * noise);
+    case 7: {                           /* OLED SPI: a 1.66 ms burst every 33 ms, 5 MHz SCLK */
+        double f = fmod(t, 1.0 / 30), b = f * 5e6;
+        if (f > 1.66e-3)
+            return 4;                   /* RES# high, idle */
+        int bit = (int)b % 8, byte = (int)(b / 8);
+        return (int16_t)(4 | (byte >= 12 ? 8 : 0) | (fmod(b, 1.0) >= 0.5 ? 2 : 0) |
+                         (((0xA5u >> (7 - bit)) ^ (unsigned)byte) & 1));
+    }
+    default: return 0;
+    }
+}
+
+static int sim_capture(unsigned trig, int falling, int level, unsigned pre, unsigned div,
+                       const unsigned src[SCOPE_CH], int force, int16_t *out, int *triggered)
+{
+    const double ts = div / SCOPE_FCLK_HZ, t0 = (now_ns() - t0_ns) * 1e-9;
+    enum { LOOK = 4 * SCOPE_DEPTH };
+    int start = -1;
+    int16_t prev = sim_source(src[trig], t0 + (pre - 1.0) * ts);
+    for (int i = (int)pre; i < LOOK && start < 0; i++) {
+        int16_t cur = sim_source(src[trig], t0 + i * ts);
+        if (falling ? (prev > level && cur <= level) : (prev < level && cur >= level))
+            start = i - (int)pre;
+        prev = cur;
+    }
+    *triggered = start >= 0;
+    if (start < 0) {
+        if (!force)
+            return -1;
+        start = 0;
+    }
+    for (int c = 0; c < SCOPE_CH; c++)
+        for (int i = 0; i < SCOPE_DEPTH; i++)
+            out[c * SCOPE_DEPTH + i] = sim_source(src[c], t0 + (start + i) * ts);
+    return 0;
+}
+
+static void do_capture(int fd, char **argv, int argc)
+{
+    char err[320];
+    uint32_t cfg[4];                    /* TRIG PRE DIV SRC */
+    uint32_t timeout = 200, autof = 1;
+
+    pthread_mutex_lock(&scope_lock);
+    uint32_t info = 0;
+    if (map_size < SCOPE_RAM + 4 * 2 * SCOPE_DEPTH && !sim) {
+        sendf(fd, "err capture RAM (0x8000..0xffff) is outside the 0x%zx-byte UIO window: "
+                  "update the device tree (axi_regs reg size 0x10000)\n", map_size);
+        goto out;
+    }
+    if (reg_access(0, REG_SCOPE_INFO, &info, err, sizeof err) || reg_read_block(REG_SCOPE_TRIG, cfg, 4, err, sizeof err)) {
+        sendf(fd, "err %s\n", err);
+        goto out;
+    }
+    if (info != SCOPE_INFO_VAL) {
+        sendf(fd, "err no oscilloscope in this PL design (SCOPE_INFO 0x%08" PRIx32 ")\n", info);
+        goto out;
+    }
+
+    for (int i = 1; i < argc; i++) {
+        char *k = argv[i], *v = strchr(k, '=');
+        long x;
+        char *end;
+        if (!v) {
+            sendf(fd, "err bad argument '%s' (key=value)\n", k);
+            goto out;
+        }
+        *v++ = 0;
+        x = strtol(v, &end, 0);
+        int num_ok = *v && !*end;
+        if (!strcmp(k, "src")) {
+            uint32_t s4 = 0;
+            int n = 0;
+            for (char *t = strtok(v, ","); t; t = strtok(NULL, ","), n++) {
+                long e = strtol(t, &end, 0);
+                if (*end || e < 0 || e > 15 || n >= SCOPE_CH)
+                    break;
+                s4 |= (uint32_t)e << (4 * n);
+            }
+            if (n != SCOPE_CH) {
+                sendf(fd, "err src needs %d sources 0..15, e.g. src=1,2,4,7\n", SCOPE_CH);
+                goto out;
+            }
+            cfg[3] = s4;
+        } else if (!strcmp(k, "div") && num_ok && x >= 1 && x <= SCOPE_DIV_MAX) {
+            cfg[2] = (uint32_t)x;
+        } else if (!strcmp(k, "trig") && num_ok && x >= 0 && x < SCOPE_CH) {
+            cfg[0] = (cfg[0] & ~3u) | (uint32_t)x;
+        } else if (!strcmp(k, "edge") && (!strcmp(v, "rise") || !strcmp(v, "fall"))) {
+            cfg[0] = (cfg[0] & ~0x10u) | (v[0] == 'f' ? 0x10u : 0);
+        } else if (!strcmp(k, "level") && num_ok && x >= -32768 && x <= 32767) {
+            cfg[0] = (cfg[0] & 0xFFFFu) | ((uint32_t)(x & 0xFFFF) << 16);
+        } else if (!strcmp(k, "pre") && num_ok && x >= 0 && x < SCOPE_DEPTH) {
+            cfg[1] = (uint32_t)x;
+        } else if (!strcmp(k, "timeout") && num_ok && x >= 0 && x <= 5000) {
+            timeout = (uint32_t)x;
+        } else if (!strcmp(k, "auto") && num_ok && (x == 0 || x == 1)) {
+            autof = (uint32_t)x;
+        } else {
+            sendf(fd, "err bad %s=%s (src div trig edge level pre timeout auto)\n", k, v);
+            goto out;
+        }
+    }
+
+    const unsigned trig = cfg[0] & 3, pre = cfg[1] & (SCOPE_DEPTH - 1), div = cfg[2] ? cfg[2] : 1;
+    const int falling = (cfg[0] >> 4) & 1, level = (int16_t)(cfg[0] >> 16);
+    unsigned src[SCOPE_CH];
+    for (int c = 0; c < SCOPE_CH; c++)
+        src[c] = (cfg[3] >> (4 * c)) & 15;
+    for (int i = 0; i < 4; i++)
+        if (reg_access(1, REG_SCOPE_TRIG + 4 * (uint32_t)i, &cfg[i], err, sizeof err)) {
+            sendf(fd, "err %s\n", err);
+            goto out;
+        }
+
+    static int16_t data[SCOPE_CH * SCOPE_DEPTH];
+    static uint32_t words[2 * SCOPE_DEPTH];
+    int triggered = 0;
+    if (sim) {
+        if (sim_capture(trig, falling, level, pre, div, src, autof, data, &triggered) < 0) {
+            sendf(fd, "ok timeout\n");
+            goto out;
+        }
+    } else {
+        /* arm; the capture itself takes DEPTH * div / fclk */
+        const uint64_t fill_ns = (uint64_t)((double)SCOPE_DEPTH * div / SCOPE_FCLK_HZ * 1e9);
+        const uint64_t t_arm = now_ns();
+        uint64_t deadline = t_arm + fill_ns + (uint64_t)timeout * 1000000ull;
+        uint32_t cmd = 1, st = 0;
+        int forced = 0;
+        if (reg_access(1, REG_SCOPE_CMD, &cmd, err, sizeof err))
+            goto fail;
+        for (;;) {
+            if (reg_access(0, REG_SCOPE_STAT, &st, err, sizeof err))
+                goto fail;
+            if (st & 4)
+                break;                  /* done */
+            uint64_t now = now_ns();
+            if (client_gone(fd) || stopping) {
+                cmd = 4;
+                reg_access(1, REG_SCOPE_CMD, &cmd, err, sizeof err);
+                goto out;
+            }
+            if (now > deadline) {
+                if (!autof || forced) {
+                    cmd = 4;            /* abort */
+                    if (reg_access(1, REG_SCOPE_CMD, &cmd, err, sizeof err))
+                        goto fail;
+                    if (forced) {
+                        snprintf(err, sizeof err, "capture did not finish after a forced trigger");
+                        goto fail;
+                    }
+                    sendf(fd, "ok timeout\n");
+                    goto out;
+                }
+                cmd = 2;                /* auto: force a trigger, then wait for the post fill */
+                if (reg_access(1, REG_SCOPE_CMD, &cmd, err, sizeof err))
+                    goto fail;
+                forced = 1;
+                deadline = now + fill_ns + 100000000ull;
+            }
+            usleep(fill_ns > 20000000 ? 5000 : 300);
+        }
+        triggered = (st >> 3) & 1;
+        const unsigned ptr = (st >> 16) & (SCOPE_DEPTH - 1);
+        if (reg_read_block(SCOPE_RAM, words, 2 * SCOPE_DEPTH, err, sizeof err))
+            goto fail;
+        /* unroll the ring: sample i of the capture is RAM index ptr - pre + i */
+        for (int i = 0; i < SCOPE_DEPTH; i++) {
+            unsigned r = (ptr - pre + (unsigned)i) & (SCOPE_DEPTH - 1);
+            uint32_t lo = words[2 * r], hi = words[2 * r + 1];
+            data[0 * SCOPE_DEPTH + i] = (int16_t)(lo & 0xFFFF);
+            data[1 * SCOPE_DEPTH + i] = (int16_t)(lo >> 16);
+            data[2 * SCOPE_DEPTH + i] = (int16_t)(hi & 0xFFFF);
+            data[3 * SCOPE_DEPTH + i] = (int16_t)(hi >> 16);
+        }
+    }
+
+    if (sendf(fd, "ok capture {\"n\":%d,\"ch\":%d,\"pre\":%u,\"div\":%u,\"fs\":%.6g,"
+                  "\"trig\":%u,\"edge\":\"%s\",\"level\":%d,\"triggered\":%s,"
+                  "\"src\":[%u,%u,%u,%u],\"bytes\":%zu}\n",
+              SCOPE_DEPTH, SCOPE_CH, pre, div, SCOPE_FCLK_HZ / div, trig, falling ? "fall" : "rise",
+              level, triggered ? "true" : "false", src[0], src[1], src[2], src[3], sizeof data) == 0)
+        send_all(fd, (const char *)data, sizeof data);
+    goto out;
+fail:
+    sendf(fd, "err %s\n", err);
+out:
+    pthread_mutex_unlock(&scope_lock);
+}
+
 /* ---- OLED text ----------------------------------------------------------- */
 
 /* write one 16-character row of the OLED text buffer (padded with spaces,
@@ -588,8 +859,10 @@ static void handle_line(int fd, char *line)
             sendf(fd, "ok operating\n");
     } else if (!strcmp(argv[0], "stream")) {
         do_stream(fd, argv, argc);
+    } else if (!strcmp(argv[0], "capture")) {
+        do_capture(fd, argv, argc);
     } else {
-        sendf(fd, "err unknown command '%s' (ping status read write load stream oled)\n",
+        sendf(fd, "err unknown command '%s' (ping status read write load stream oled capture)\n",
               argv[0]);
     }
 }
@@ -649,6 +922,8 @@ int main(int argc, char **argv)
         }
     }
     sim = getenv("FPGAD_SIM") != NULL;
+    if (sim)
+        map_size = 0x10000;             /* like the real UIO window: regs + capture RAM */
     openlog("fpgad", LOG_PID | (foreground ? LOG_PERROR : 0), LOG_DAEMON);
     t0_ns = sim_hb_zero_ns = now_ns();
     static const char *const sim_text[OLED_ROWS] = {   /* OLED_TEXT_RESET in axi_regs.vhd */

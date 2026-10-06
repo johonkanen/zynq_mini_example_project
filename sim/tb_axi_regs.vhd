@@ -17,6 +17,7 @@ library vunit_lib;
 context vunit_lib.vunit_context;
 
 use work.axi_pkg.all;
+use work.scope_pkg.all;
 
 entity tb_axi_regs is
     generic (runner_cfg : string);
@@ -40,6 +41,13 @@ architecture sim of tb_axi_regs is
     signal oled_char_addr : std_logic_vector(6 downto 0) := (others => '0');
     signal oled_char      : std_logic_vector(7 downto 0);
 
+    signal scope_cfg     : scope_cfg_t;
+    signal scope_stat    : scope_stat_t := (state => ST_POST, done => '1', trig_cond => '1',
+                                            trig_ptr => to_unsigned(16#ABC#, SCOPE_DEPTH_LOG2));
+    signal scope_rd_addr : unsigned(SCOPE_DEPTH_LOG2 downto 0);
+    signal scope_rd_data : std_logic_vector(31 downto 0) := (others => '0');
+    signal cmd_seen      : std_logic_vector(2 downto 0) := (others => '0');
+
     type slv32_array is array (natural range <>) of std_logic_vector(31 downto 0);
 
 begin
@@ -58,8 +66,28 @@ begin
             reg_ps2pl_o => reg_ps2pl, pl_active_o => pl_active,
             oled_ctrl_o => oled_ctrl, oled_stat_i => x"00070001",
             oled_char_addr_i => oled_char_addr, oled_char_o => oled_char,
+            scope_cfg_o => scope_cfg, scope_stat_i => scope_stat,
+            scope_rd_addr_o => scope_rd_addr, scope_rd_data_i => scope_rd_data,
             s_axi_aclk => aclk, s_axi_aresetn => aresetn,
             s_axi_i => m2s, s_axi_o => s2m);
+
+    -- capture RAM model: word w reads 0xC0DE_0000 + w, one clock after the address
+    ram_model : process (aclk)
+    begin
+        if rising_edge(aclk) then
+            scope_rd_data <= std_logic_vector(x"C0DE0000" + resize(scope_rd_addr, 32));
+        end if;
+    end process;
+
+    -- latch the one-clock command pulses
+    cmd_latch : process (aclk)
+    begin
+        if rising_edge(aclk) then
+            if scope_cfg.arm = '1' then cmd_seen(0) <= '1'; end if;
+            if scope_cfg.force_trig = '1' then cmd_seen(1) <= '1'; end if;
+            if scope_cfg.abort = '1' then cmd_seen(2) <= '1'; end if;
+        end if;
+    end process;
 
     main : process
 
@@ -240,6 +268,59 @@ begin
                 axi_write(16#24#, x"FFFFFFFF");                 -- read-only
                 axi_read(16#24#, r);
                 check_equal(r, std_logic_vector'(x"00070001"), "OLED_STAT ignores writes");
+
+            elsif run("scope_registers") then
+                axi_read(16#48#, r); check_equal(r, std_logic_vector'(x"00000000"), "SCOPE_TRIG reset");
+                axi_read(16#4C#, r); check_equal(r, std_logic_vector'(x"00000800"), "SCOPE_PRE reset 2048");
+                axi_read(16#50#, r); check_equal(r, std_logic_vector'(x"00000001"), "SCOPE_DIV reset 1");
+                axi_read(16#54#, r); check_equal(r, std_logic_vector'(x"00007421"), "SCOPE_SRC reset");
+                axi_read(16#58#, r); check_equal(r, std_logic_vector'(x"00640C04"), "SCOPE_INFO 100 MHz, 2^12, 4 ch");
+                axi_read(16#60#, r); check_equal(r, std_logic_vector'(x"028F5C29"), "GEN_FTW_A 1 MHz");
+                axi_write(16#48#, x"EC780011");                 -- level -5000, falling, ch1
+                axi_write(16#4C#, x"00000064");
+                axi_write(16#50#, x"0000000A");
+                axi_write(16#54#, x"00001357");
+                axi_write(16#64#, x"12345678");
+                tick(1);
+                check_equal(scope_cfg.trig_ch, to_unsigned(1, 2), "trig_ch");
+                check_equal(scope_cfg.trig_falling, '1', "trig_falling");
+                check_equal(to_integer(scope_cfg.trig_level), -5000, "trig_level");
+                check_equal(to_integer(scope_cfg.pre), 100, "pre");
+                check_equal(to_integer(scope_cfg.div), 10, "div");
+                check_equal(to_integer(scope_cfg.src(0)), 7, "src ch0");
+                check_equal(to_integer(scope_cfg.src(3)), 1, "src ch3");
+                check_equal(scope_cfg.ftw_b, to_unsigned(16#12345678#, 32), "ftw_b");
+                axi_read(16#44#, r);
+                check_equal(r, std_logic_vector'(x"0ABC000F"), "SCOPE_STAT: ptr 0xABC, cond, done, post");
+
+            elsif run("scope_command_pulses") then
+                check_equal(cmd_seen, std_logic_vector'("000"), "no command at reset");
+                axi_write(16#40#, x"00000001");
+                tick(2);
+                check_equal(cmd_seen, std_logic_vector'("001"), "arm pulse");
+                check_equal(scope_cfg.arm, '0', "arm is a pulse");
+                axi_write(16#40#, x"00000006");
+                tick(2);
+                check_equal(cmd_seen, std_logic_vector'("111"), "force + abort pulses");
+                axi_read(16#40#, r);
+                check_equal(r, std_logic_vector'(x"00000000"), "SCOPE_CMD reads 0");
+
+            elsif run("scope_ram_reads") then
+                axi_read(16#8000#, r);
+                check_equal(r, std_logic_vector'(x"C0DE0000"), "RAM word 0");
+                axi_read(16#8004#, r);
+                check_equal(r, std_logic_vector'(x"C0DE0001"), "RAM word 1");
+                axi_read(16#FFFC#, r);
+                check_equal(r, std_logic_vector'(x"C0DE1FFF"), "RAM word 8191 (last)");
+                axi_read_burst(16#8100#, 4, v4, id => 16#9#);   -- INCR burst through the RAM
+                for i in 0 to 3 loop
+                    check_equal(v4(i), std_logic_vector(x"C0DE0040" + to_unsigned(i, 32)),
+                                "RAM burst beat " & integer'image(i));
+                end loop;
+                axi_read(16#1C#, r);                            -- registers still fine after
+                check_equal(r, std_logic_vector'(x"5A5A1234"), "SIGNATURE after RAM reads");
+                axi_read(16#401C#, r);                          -- regs repeat below 0x8000
+                check_equal(r, std_logic_vector'(x"5A5A1234"), "SIGNATURE alias at 0x401C");
 
             elsif run("oled_text_buffer") then
                 -- reset text: "Hello, Zynq Mini" in row 0, little-endian per word

@@ -528,16 +528,30 @@ your next process ───────────┘   (line protocol)        
 | `load <file>` | `ok operating` — reprogram the PL from `/lib/firmware/<file>` |
 | `oled <row> <text>` | `ok` — put up to 16 characters on OLED row 0–7 (rest of the line, spaces kept, padded) |
 | `oled clear` | `ok` — blank all 8 rows |
+| `capture [key=value…]` | one oscilloscope acquisition: `ok capture {"n":4096,"ch":4,"pre":…,"div":…,"fs":…,"triggered":…,"bytes":32768}` followed by **32768 raw bytes**: int16 little-endian, channel-major, in time order, trigger at sample `pre`. Keys (others keep their register value): `src=a,b,c,d` (0–15) `div=1..100000` `trig=0..3` `edge=rise\|fall` `level=-32768..32767` `pre=0..4095` `timeout=0..5000` (ms to wait for a trigger) `auto=0\|1` (force a trigger after the timeout, or reply `ok timeout`). One capture at a time; a client that hangs up aborts its capture. |
 | `stream <hz> <batch_hz> <off>...` | `ok streaming`, then `data {"t":[µs…],"v":[[…],…]}` per batch and `status {…}` on PL state changes, until the client disconnects |
 
 Errors are `err <message>`. Numbers are `0x…` or decimal; `<off>` is a byte offset
-into the `axi_regs` window (`0x0`–`0xFFC`, 4-byte aligned).
+into the `axi_regs` window (`0x0`–`0xFFFC`, 4-byte aligned; registers below
+`0x100`, the capture RAM at `0x8000`). The window is 64 KB since the oscilloscope:
+`reg = <0x40000000 0x10000>` in `linux/zynq-zynqmini.dts`. With an older dtb
+(4 KB) everything but `capture` still works, and `capture` says to update the dtb.
 
 ### Web UI and HTTP API
 
 `http://<board-ip>/` shows a **register table** (the named `axi_regs` registers, refreshed
 twice a second, with write fields for the R/W ones), a raw read/write row for any
-offset, and a **live plot**: tick up to 8 registers (or type extra offsets), pick a
+offset, an **oscilloscope**, and a **live plot**.
+
+The **oscilloscope** shows the PL capture (README, "Oscilloscope"): 4 channels on a
+10 × 8 division screen with per-channel source, counts/div and offset; time/div
+50 ns – 200 ms (the page computes `div` from it); trigger channel, edge and level
+(type it in, or drag the ◀ marker on the right edge), trigger position; Run/Stop,
+Single, and auto or normal mode; min/max/p-p/mean/frequency per channel; and the
+generator A/B frequencies (written to `GEN_FTW_A/B`). It starts in auto mode and
+runs at up to 30 captures a second.
+
+In the **live plot**, tick up to 8 registers (or type extra offsets), pick a
 rate (10 Hz–10 kHz) and a window (2–60 s), and each one gets a
 [uPlot](https://github.com/leeoniya/uPlot) chart, with cursors synced across
 charts. With `HEARTBEAT` selected the page also plots the PL clock it implies
@@ -553,6 +567,9 @@ one fpgad `stream` per connection and repacks fpgad's text batches:
 | browser → board | text | `stream <hz> <off> [<off>…]` (1–10000 Hz, 1–8 offsets) or `stop` |
 | board → browser | text | `{"type":"stream","hz":…,"regs":[…]}` when a stream (re)starts, `{"type":"status",…}` (as `/api/status`), `{"type":"error","error":"…"}` |
 | board → browser | binary | one per batch (~25/s), little-endian: `u8 type=1, u8 nregs, u16 0, u32 n` · `f64 t[n]` (µs) · `u32 v[nregs][n]`, so the browser maps them straight onto a `Float64Array` and `Uint32Array`s |
+| browser → board | text | `scope run <auto\|normal\|single> [key=value…]` (keys as fpgad `capture`: `src div trig edge level pre`), `scope stop` |
+| board → browser | text | `{"type":"scope","state":"running\|waiting\|stopped"}` |
+| board → browser | binary | one per capture (≤ 30/s): `u8 type=2, u8 nch, u16 flags (bit0 triggered), u32 n, u32 pre, u32 div, f64 fs` (24 bytes) · `i16 v[nch][n]` in time order |
 
 Frames after a `stream` ack belong to that stream. If fpgad restarts, the board
 sends an error frame and reconnects every second. Measured on the board: 1 kHz ×

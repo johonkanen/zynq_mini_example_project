@@ -29,6 +29,9 @@ AXI slave written in VHDL.
    |     reg_ps2pl[127:0] / pl_active      |
    |            v                          v
    +-- placeholder PL user logic    +-- u_oled : ssd1306_text  -> SPI -> 0.96" OLED
+   |                                +-- u_siggen : scope_siggen  (test signals)
+   |                                +-- u_scope : scope_capture  (4 ch x 4096, triggered,
+   |                                      read back through axi_regs 0x8000-0xFFFF)
 ```
 
 ## The board
@@ -75,15 +78,19 @@ and its QMTech sibling, **including building Linux** — see [`doc/notes.md`](do
 | `src/hdl/zynq_mini_top.vhd`   | **synthesis top** — `u_ps` + `u_axi_regs` + `u_oled` + user logic, PS↔PL bus is 2 record signals |
 | `src/hdl/ssd1306_text.vhd`    | **OLED driver** — SSD1306 reset/init + 16×8 text mode refreshed over SPI from the `axi_regs` text buffer |
 | `src/hdl/font8x8_pkg.vhd`     | 8×8 ASCII font ROM in SSD1306 column order (public-domain font8x8) |
+| `src/hdl/scope_pkg.vhd`       | oscilloscope types and constants (4 channels, 4096 deep, sources) |
+| `src/hdl/scope_capture.vhd`   | **oscilloscope acquisition** — decimation, edge trigger, pre/post-trigger fill, BRAM ring buffer |
+| `src/hdl/scope_siggen.vhd`    | oscilloscope test signals: 2 DDS (sine/triangle/square), LFSR noise |
 | `src/constrs/zynq_mini.xdc`   | OLED pins; every other PL pin of the board listed, commented out |
 | `sim/tb_axi_regs.vhd`         | VUnit testbench: AXI3 master BFM driving `axi_regs` |
 | `sim/tb_ssd1306_text.vhd`     | VUnit testbench: SPI panel model checking init, frame commands and rendered text |
+| `sim/tb_scope_capture.vhd`    | VUnit testbench: capture with timestamped inputs — trigger position/condition, decimation, pre-trigger edge cases, abort; test signals |
 | `sim/run.py`                  | VUnit run script (NVC backend) |
 | `sw/`                         | **bare-metal bring-up test** — PS UART1 + PS↔PL AXI, JTAG only (`sw/README.md`) |
 | `linux/build-linux.sh`        | one-shot Buildroot Linux image build (`doc/linux_build.md`) |
 | `linux/reflash-sd.sh` + `reflash_sd.bat`/`.tcl` | reflash the microSD in the board over TFTP, U-Boot driven via JTAG |
 | `linux/fpgad/`                | `fpgad` (the one process that touches the FPGA), `fpgactl`, client library — `doc/linux_build.md` §12 |
-| `linux/fpga-web/`             | web UI: register read/write + live uPlot charts over a binary WebSocket (`/ws`), talks only to `fpgad`; `vendor/` = uPlot (MIT) |
+| `linux/fpga-web/`             | web UI: register read/write, **oscilloscope**, live uPlot charts — binary WebSocket (`/ws`), talks only to `fpgad`; `vendor/` = uPlot (MIT) |
 | `linux/br2-external/`         | Buildroot external tree: `fpgad` + `fpga-web` packages and init scripts |
 | `linux/update-board.sh`       | push kernel/dtb/bitstream/web server to a running board over SSH — `doc/linux_build.md` §13 |
 | `linux/zynq-zynqmini.dts`     | kernel device tree for the board (used by `doc/linux_build.md`) |
@@ -142,6 +149,10 @@ AW/AR ID), `incr_burst_write_then_read`, `fixed_burst_write`, `pl_computes_sum`,
 `status_word`, `control_and_heartbeat`, `oled_ctrl_and_status`, `oled_text_buffer`;
 OLED driver: `init_sequence`, `first_frame_renders_text` (all 1024 display bytes
 vs. the text buffer through the font), `controls_apply_next_frame`, `reset_restarts`.
+`axi_regs` scope side: `scope_registers`, `scope_command_pulses`, `scope_ram_reads`.
+Capture: `forced_trigger_full_depth`, `decimation`, `rising_edge_trigger`,
+`falling_edge_trigger`, `trigger_on_other_channel`, `pre_zero_and_max`,
+`abort_and_rearm`, `siggen_signals`.
 
 ## Test the board — no SD card
 
@@ -162,8 +173,10 @@ on hardware — both `PASS`. Details in [`sw/README.md`](sw/README.md).
 
 ## Register map (`axi_regs`)
 
-The slave decodes AXI address bits `[7:2]` → 64 words (the map repeats every
-256 bytes), at the base of the `M_AXI_GP0` window (**`0x4000_0000`**). Anything on GP0 lands here; from
+The slave decodes AXI address bits `[7:2]` → 64 register words (repeating every
+256 bytes up to `0x7FFF`) and `0x8000`–`0xFFFF` → the oscilloscope capture RAM, at
+the base of the `M_AXI_GP0` window (**`0x4000_0000`**). Every read takes one extra
+clock (the capture RAM is block RAM). Anything on GP0 lands here; from
 bare-metal just use `0x40000000` (there is no `xparameters.h` entry because the
 slave is not a BD IP).
 
@@ -179,7 +192,17 @@ slave is not a BD IP).
 | `0x1C` | SIGNATURE | RO  | PL → PS | constant `0x5A5A_1234` |
 | `0x20` | OLED_CTRL | R/W | PS → PL | bit0 display on, bit1 invert, bit2 flip 180°, bits[15:8] contrast; reset `0x0000_7F01` |
 | `0x24` | OLED_STAT | RO  | PL → PS | bit0 ready (init done), bits[31:16] frames sent |
+| `0x40` | SCOPE_CMD  | W   | PS → PL | bit0 arm, bit1 force trigger, bit2 abort (one-clock pulses; reads 0) |
+| `0x44` | SCOPE_STAT | RO  | PL → PS | [1:0] state (idle/pre-fill/armed/post-fill), bit2 done, bit3 triggered by the condition, [27:16] RAM index of the trigger sample |
+| `0x48` | SCOPE_TRIG | R/W | PS → PL | [1:0] channel, bit4 falling, [31:16] level (signed) |
+| `0x4C` | SCOPE_PRE  | R/W | PS → PL | samples before the trigger, 0–4095 (reset 2048) |
+| `0x50` | SCOPE_DIV  | R/W | PS → PL | one sample every DIV clocks (reset 1 = 100 MSa/s) |
+| `0x54` | SCOPE_SRC  | R/W | PS → PL | source of channel *n* in bits [4n+3:4n] (reset `0x7421`) |
+| `0x58` | SCOPE_INFO | RO  | PL → PS | `0x00640C04`: 100 MHz, 2¹² deep, 4 channels |
+| `0x60` | GEN_FTW_A  | R/W | PS → PL | generator A frequency, f = FTW × 100 MHz / 2³² (reset 1 MHz) |
+| `0x64` | GEN_FTW_B  | R/W | PS → PL | generator B (reset 250 kHz) |
 | `0x80`–`0xFC` | OLED_TEXT | R/W | PS → PL | 16×8 characters, 4 per word, little-endian |
+| `0x8000`–`0xFFFF` | SCOPE_RAM | RO | PL → PS | capture ring buffer: word 2*i* = ch1:ch0, 2*i*+1 = ch3:ch2 of RAM sample *i* |
 
 Other offsets read 0.
 
@@ -211,6 +234,26 @@ fpgactl oled clear
 fpgactl write 0x20 0x00FF0003      # on + inverted, full contrast
 fpgactl write 0x20 0x00007F05      # upright text if the panel is mounted upside down
 ```
+
+## Oscilloscope (`scope_capture`)
+
+Four 16-bit channels, 4096 samples each, captured in the PL and shown in the web
+page (`http://<board-ip>/`, see `doc/linux_build.md` §12).
+
+- **Sample rate:** 100 MSa/s from FCLK_CLK0, decimated by `SCOPE_DIV` (the page
+  picks it from time/div, 50 ns/div … 200 ms/div). Decimation keeps every Nth
+  sample; there is no averaging.
+- **Trigger:** rising or falling edge through a level on any channel. The capture
+  keeps `SCOPE_PRE` samples before the trigger and fills the rest after it. In
+  auto mode fpgad forces a trigger after 100 ms; normal and single wait for one.
+- **Sources** (per channel, `SCOPE_SRC`): 1 sine A, 2 triangle A, 3 square A, 4 sine B,
+  5 noise, 6 sine A + noise, **7 the OLED's SPI pins** (bit0 SDIN, bit1 SCLK,
+  bit2 RES#, bit3 D/C#: a real signal, the 30 frames/s display refresh), 8–11
+  `ext_in` (tied to 0 in `zynq_mini_top`, for an ADC later), 0 and 12–15 zero.
+  Generators A and B are DDS (`GEN_FTW_A/B`).
+- **Readback:** fpgad arms the capture, polls `SCOPE_STAT`, reads the 32 KB RAM
+  through `0x8000`–`0xFFFF` and puts the samples in time order (from RAM index
+  trigger − pre). This needs the 64 KB UIO window in `linux/zynq-zynqmini.dts`.
 
 Bare-metal smoke test:
 

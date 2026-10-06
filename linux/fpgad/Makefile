@@ -7,7 +7,7 @@ AR      ?= ar
 all: fpgad fpgactl libfpgad-client.a
 
 fpgad: fpgad.o
-	$(CC) $(LDFLAGS) -o $@ $^ -lpthread
+	$(CC) $(LDFLAGS) -o $@ $^ -lpthread -lm
 
 fpgactl: fpgactl.o libfpgad-client.a
 	$(CC) $(LDFLAGS) -o $@ fpgactl.o -L. -lfpgad-client

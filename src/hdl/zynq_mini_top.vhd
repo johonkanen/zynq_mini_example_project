@@ -9,6 +9,8 @@
 --     +-- u_ps  : zynq_ps_wrapper   (block design + M_AXI_GP0 -> records)
 --     +-- u_axi_regs : axi_regs     (AXI slave, VHDL)
 --     +-- u_oled : ssd1306_text     (128x64 OLED, text from axi_regs OLED_TEXT)
+--     +-- u_siggen : scope_siggen   (oscilloscope test signals)
+--     +-- u_scope : scope_capture   (4-channel triggered capture, read via axi_regs)
 --     +-- placeholder PL user logic
 --
 -- Entity ports = the physical device pins: DDR_* + FIXED_IO_* (constrained
@@ -20,6 +22,7 @@ use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
 use work.axi_pkg.all;
+use work.scope_pkg.all;
 
 entity zynq_mini_top is
     port (
@@ -73,6 +76,16 @@ architecture rtl of zynq_mini_top is
     signal oled_char      : std_logic_vector(7 downto 0);
     signal oled_ready     : std_logic;
     signal oled_frames    : std_logic_vector(15 downto 0);
+    signal oled_pins      : std_logic_vector(3 downto 0);   -- SDIN, SCLK, RES#, D/C#
+
+    -- oscilloscope
+    signal scope_cfg      : scope_cfg_t;
+    signal scope_stat     : scope_stat_t;
+    signal scope_rd_addr  : unsigned(SCOPE_DEPTH_LOG2 downto 0);
+    signal scope_rd_data  : std_logic_vector(31 downto 0);
+    signal sources        : source_array_t := (others => (others => '0'));
+    signal scope_in       : sample_array_t := (others => (others => '0'));
+    signal ext_in         : sample_array_t := (others => (others => '0'));  -- for an ADC later
 
     -- ===== placeholder PL user logic ====================================
     signal heartbeat  : unsigned(27 downto 0) := (others => '0');
@@ -125,6 +138,10 @@ begin
             oled_stat_i      => oled_stat,
             oled_char_addr_i => oled_char_addr,
             oled_char_o      => oled_char,
+            scope_cfg_o      => scope_cfg,
+            scope_stat_i     => scope_stat,
+            scope_rd_addr_o  => scope_rd_addr,
+            scope_rd_data_i  => scope_rd_data,
             s_axi_aclk    => clk,
             s_axi_aresetn => resetn,
             s_axi_i       => ps_axi_o,
@@ -147,13 +164,64 @@ begin
             char_i      => oled_char,
             ready_o     => oled_ready,
             frames_o    => oled_frames,
-            oled_sclk   => oled_sclk,
-            oled_sdin   => oled_sdin,
-            oled_dc     => oled_dc,
-            oled_res_n  => oled_res_n
+            oled_sclk   => oled_pins(1),
+            oled_sdin   => oled_pins(0),
+            oled_dc     => oled_pins(3),
+            oled_res_n  => oled_pins(2)
         );
 
-    oled_stat <= oled_frames & x"000" & "000" & oled_ready;
+    oled_sdin  <= oled_pins(0);
+    oled_sclk  <= oled_pins(1);
+    oled_res_n <= oled_pins(2);
+    oled_dc    <= oled_pins(3);
+    oled_stat  <= oled_frames & x"000" & "000" & oled_ready;
+
+    ---------------------------------------------------------------------------
+    -- Oscilloscope: test signals + the OLED's SPI pins -> 4 channels -> capture
+    ---------------------------------------------------------------------------
+    u_siggen : entity work.scope_siggen
+        port map (
+            clk        => clk,
+            resetn     => resetn,
+            ftw_a      => scope_cfg.ftw_a,
+            ftw_b      => scope_cfg.ftw_b,
+            sine_a     => sources(SRC_SINE_A),
+            triangle_a => sources(SRC_TRIANGLE_A),
+            square_a   => sources(SRC_SQUARE_A),
+            sine_b     => sources(SRC_SINE_B),
+            noise      => sources(SRC_NOISE),
+            sine_noise => sources(SRC_SINE_NOISE)
+        );
+
+    -- the real SPI lines, as a 4-bit logic value: D/C# high <=> value >= 8
+    sources(SRC_OLED_SPI) <= resize(signed('0' & oled_pins), 16);
+    ext_src : for i in 0 to SCOPE_CH-1 generate
+        sources(SRC_EXT0 + i) <= ext_in(i);
+    end generate;
+    sources(SRC_ZERO) <= (others => '0');
+    unused_src : for i in SRC_EXT0 + SCOPE_CH to 15 generate
+        sources(i) <= (others => '0');
+    end generate;
+
+    source_mux : process (clk)
+    begin
+        if rising_edge(clk) then
+            for i in 0 to SCOPE_CH-1 loop
+                scope_in(i) <= sources(to_integer(scope_cfg.src(i)));
+            end loop;
+        end if;
+    end process;
+
+    u_scope : entity work.scope_capture
+        port map (
+            clk     => clk,
+            resetn  => resetn,
+            cfg     => scope_cfg,
+            ch_i    => scope_in,
+            stat_o  => scope_stat,
+            rd_addr => scope_rd_addr,
+            rd_data => scope_rd_data
+        );
 
     ---------------------------------------------------------------------------
     -- placeholder PL user logic - replace it

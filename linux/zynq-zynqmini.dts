@@ -77,10 +77,11 @@
 	 * axi_regs — the VHDL AXI slave at the base of M_AXI_GP0 (src/hdl/axi_regs.vhd).
 	 * Not a block-design IP, so no generated node; reach it via UIO once the PL
 	 * is configured.  SIGNATURE at 0x4000001C reads 0x5A5A1234.  See doc/notes.md.
+	 * 64 KB: registers at 0x0000, the oscilloscope capture RAM at 0x8000-0xFFFF.
 	 */
 	axi_regs@40000000 {
 		compatible = "generic-uio";
-		reg = <0x40000000 0x1000>;
+		reg = <0x40000000 0x10000>;
 	};
 };
 

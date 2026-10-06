@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <syslog.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "civetweb.h"
@@ -281,33 +282,51 @@ static int events_handler(struct mg_connection *c, void *cb)
  *
  * browser -> server, text:  "stream <hz> <off> [<off>...]"   1..10000 Hz, 1..8 offsets
  *                           "stop"
+ *                           "scope run <auto|normal|single> [key=value...]"   oscilloscope;
+ *                               keys as fpgad's "capture" (src div trig edge level pre)
+ *                           "scope stop"
  * server -> browser, text:  {"type":"stream","hz":200,"regs":[16,28]}  (re)started
  *                           {"type":"status",...}   fpgad status (same fields as /api/status)
+ *                           {"type":"scope","state":"running|waiting|stopped"}
  *                           {"type":"error","error":"..."}
- * server -> browser, binary, one frame per batch (~25/s), little-endian:
+ * server -> browser, binary, little-endian:
+ *   register batch, one per ~40 ms:
  *     u8 type = 1 | u8 nregs | u16 0 | u32 n          8-byte header
  *     f64 t[n]                                        fpgad timestamps, µs
  *     u32 v[nregs][n]                                 values, register by register
- *   so the browser maps them straight onto a Float64Array and Uint32Arrays.
+ *   scope capture, one per acquisition (at most ~30/s):
+ *     u8 type = 2 | u8 nch | u16 flags (bit0 triggered) | u32 n | u32 pre | u32 div
+ *     f64 fs                                          sample rate, Hz   (24-byte header)
+ *     i16 v[nch][n]                                   samples in time order, trigger at pre
+ *   so the browser maps them straight onto typed arrays.
  *
  * Each connection gets a thread that relays one fpgad "stream" (fpgad's text
- * batches -> binary). If fpgad goes away the thread reconnects once a second.
+ * batches -> binary), and, once the page starts the scope, a second one that
+ * loops fpgad "capture". Both reconnect to fpgad once a second if it goes away.
  */
 #define WS_MAX_REGS  8
 #define WS_BATCH_HZ  25
 #define WS_MAX_N     10000                  /* samples per batch: 10 kHz at 1 batch/s */
 #define WS_LINE_MAX  (WS_MAX_N * (21 + 11 * WS_MAX_REGS) + 64)
 
+#define SCOPE_MAX_FPS 30
+#define SCOPE_ARGS    200
+
+enum { SCOPE_STOP, SCOPE_AUTO, SCOPE_NORMAL, SCOPE_SINGLE };
+
 struct ws_client {
     struct mg_connection *conn;
-    pthread_t th;
-    int th_started;
+    pthread_t th, scope_th;
+    int th_started, scope_started;
     volatile int closing;
     pthread_mutex_t lock;                   /* guards the request fields */
     int changed;                            /* new request from the browser */
     unsigned hz;                            /* 0 = stopped */
     int nregs;
     uint32_t regs[WS_MAX_REGS];
+    int scope_mode;                         /* SCOPE_*, guarded by lock */
+    unsigned scope_gen;                     /* bumped on every scope command */
+    char scope_args[SCOPE_ARGS];            /* key=value... for fpgad "capture" */
 };
 
 static int ws_text(struct ws_client *w, const char *fmt, ...)
@@ -468,6 +487,157 @@ out:
     return NULL;
 }
 
+/* oscilloscope: loop fpgad "capture" while the page has the scope running */
+static void *scope_thread(void *arg)
+{
+    struct ws_client *w = arg;
+    struct fpgad_conn *f = NULL;
+    enum { HDR = 24 };
+    const size_t max_bytes = 4 * 4096 * sizeof(int16_t);
+    uint8_t *frame = malloc(HDR + max_bytes);
+    unsigned seen_gen = ~0u;
+    int last_state = -1;                    /* 0 waiting, 1 running, 2 stopped (sent) */
+    if (!frame)
+        return NULL;
+
+    while (!w->closing && !stopping) {
+        char args[SCOPE_ARGS];
+        pthread_mutex_lock(&w->lock);
+        int mode = w->scope_mode;
+        unsigned gen = w->scope_gen;
+        memcpy(args, w->scope_args, sizeof args);
+        pthread_mutex_unlock(&w->lock);
+        if (gen != seen_gen) {
+            seen_gen = gen;
+            last_state = -1;
+        }
+        if (mode == SCOPE_STOP) {
+            if (last_state != 2 && ws_text(w, "{\"type\":\"scope\",\"state\":\"stopped\"}") == 0)
+                last_state = 2;
+            fpgad_close(f);
+            f = NULL;
+            usleep(50000);
+            continue;
+        }
+        if (!f && !(f = fpgad_open(fpgad_sock))) {
+            ws_error(w, "scope: fpgad not reachable, retrying");
+            sleep(1);
+            continue;
+        }
+
+        /* auto: force a trigger after 100 ms; normal/single: wait, re-ask every 500 ms */
+        char req[SCOPE_ARGS + 64], meta[1024];
+        snprintf(req, sizeof req, "capture %s timeout=%d auto=%d", args,
+                 mode == SCOPE_AUTO ? 100 : 500, mode == SCOPE_AUTO);
+        uint64_t t0 = 0;
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        t0 = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+        int rc = fpgad_request(f, req, meta, sizeof meta);
+        if (rc < 0) {
+            fpgad_close(f);
+            f = NULL;
+            continue;
+        }
+        if (rc == 1) {                      /* bad settings / no scope in the PL: stop */
+            ws_error(w, meta);
+            pthread_mutex_lock(&w->lock);
+            if (w->scope_gen == gen)
+                w->scope_mode = SCOPE_STOP;
+            pthread_mutex_unlock(&w->lock);
+            continue;
+        }
+        if (!strcmp(meta, "timeout")) {     /* normal / single: still waiting */
+            if (last_state != 0 && ws_text(w, "{\"type\":\"scope\",\"state\":\"waiting\"}") == 0)
+                last_state = 0;
+            continue;
+        }
+        /* "capture {...}": pick the fields out of fpgad's JSON, then the samples */
+        unsigned n = 0, nch = 0, pre = 0, div = 1;
+        double fs = 0;
+        size_t bytes = 0;
+        const char *p;
+        if ((p = strstr(meta, "\"n\":")))     n = (unsigned)strtoul(p + 4, NULL, 10);
+        if ((p = strstr(meta, "\"ch\":")))    nch = (unsigned)strtoul(p + 5, NULL, 10);
+        if ((p = strstr(meta, "\"pre\":")))   pre = (unsigned)strtoul(p + 6, NULL, 10);
+        if ((p = strstr(meta, "\"div\":")))   div = (unsigned)strtoul(p + 6, NULL, 10);
+        if ((p = strstr(meta, "\"fs\":")))    fs = strtod(p + 5, NULL);
+        if ((p = strstr(meta, "\"bytes\":"))) bytes = strtoul(p + 8, NULL, 10);
+        int trig = strstr(meta, "\"triggered\":true") != NULL;
+        if (strncmp(meta, "capture ", 8) || !n || !nch || nch > 255 ||
+            bytes != (size_t)n * nch * sizeof(int16_t) || bytes > max_bytes ||
+            fpgad_read_bytes(f, frame + HDR, bytes, 5000) < 0) {
+            fpgad_close(f);                 /* out of step with fpgad: start over */
+            f = NULL;
+            continue;
+        }
+        frame[0] = 2;
+        frame[1] = (uint8_t)nch;
+        uint16_t flags = (uint16_t)trig;
+        memcpy(frame + 2, &flags, 2);
+        memcpy(frame + 4, &n, 4);
+        memcpy(frame + 8, &pre, 4);
+        memcpy(frame + 12, &div, 4);
+        memcpy(frame + 16, &fs, 8);
+        if (last_state != 1 && ws_text(w, "{\"type\":\"scope\",\"state\":\"running\"}") == 0)
+            last_state = 1;
+        if (mg_websocket_write(w->conn, MG_WEBSOCKET_OPCODE_BINARY, (const char *)frame, HDR + bytes) <= 0)
+            break;                          /* browser gone */
+        if (mode == SCOPE_SINGLE) {
+            pthread_mutex_lock(&w->lock);
+            if (w->scope_gen == gen)
+                w->scope_mode = SCOPE_STOP;
+            pthread_mutex_unlock(&w->lock);
+        }
+        /* at most SCOPE_MAX_FPS acquisitions a second */
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        uint64_t el = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000 - t0;
+        if (el < 1000 / SCOPE_MAX_FPS)
+            usleep((useconds_t)(1000 / SCOPE_MAX_FPS - el) * 1000);
+    }
+    fpgad_close(f);
+    free(frame);
+    return NULL;
+}
+
+/* "scope run <mode> key=value..." / "scope stop" */
+static void ws_scope_cmd(struct ws_client *w, char *line)
+{
+    char *save, *verb = strtok_r(line, " \t\r\n", &save);   /* "scope" */
+    verb = strtok_r(NULL, " \t\r\n", &save);
+    int mode = -1;
+    char args[SCOPE_ARGS] = "";
+    if (verb && !strcmp(verb, "stop")) {
+        mode = SCOPE_STOP;
+    } else if (verb && !strcmp(verb, "run")) {
+        char *m = strtok_r(NULL, " \t\r\n", &save);
+        mode = !m ? -1 : !strcmp(m, "auto") ? SCOPE_AUTO : !strcmp(m, "normal") ? SCOPE_NORMAL
+             : !strcmp(m, "single") ? SCOPE_SINGLE : -1;
+        size_t o = 0;
+        for (char *t; mode >= 0 && (t = strtok_r(NULL, " \t\r\n", &save));) {
+            /* only key=value with plain characters reaches fpgad */
+            if (strspn(t, "abcdefghijklmnopqrstuvwxyz0123456789=,-") != strlen(t) || !strchr(t, '=') ||
+                o + strlen(t) + 2 > sizeof args) {
+                mode = -1;
+                break;
+            }
+            o += (size_t)snprintf(args + o, sizeof args - o, "%s%s", o ? " " : "", t);
+        }
+    }
+    if (mode < 0) {
+        ws_error(w, "usage: scope run <auto|normal|single> [src=a,b,c,d div= trig= edge= level= pre=] "
+                    "| scope stop");
+        return;
+    }
+    pthread_mutex_lock(&w->lock);
+    w->scope_mode = mode;
+    w->scope_gen++;
+    memcpy(w->scope_args, args, sizeof args);
+    pthread_mutex_unlock(&w->lock);
+    if (!w->scope_started && mode != SCOPE_STOP)
+        w->scope_started = pthread_create(&w->scope_th, NULL, scope_thread, w) == 0;
+}
+
 static int ws_connect(const struct mg_connection *c, void *cb)
 {
     (void)c;
@@ -503,6 +673,10 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
         len = sizeof buf - 1;
     memcpy(buf, data, len);
     buf[len] = 0;
+    if (!strncmp(buf, "scope ", 6)) {
+        ws_scope_cmd(w, buf);
+        return 1;
+    }
     for (char *tok = strtok(buf, " \t\r\n"); tok && argc < (int)(sizeof argv / sizeof argv[0]);
          tok = strtok(NULL, " \t\r\n"))
         argv[argc++] = tok;
@@ -541,6 +715,8 @@ static void ws_close(const struct mg_connection *c, void *cb)
     w->closing = 1;
     if (w->th_started)
         pthread_join(w->th, NULL);          /* thread notices within ~100 ms */
+    if (w->scope_started)
+        pthread_join(w->scope_th, NULL);    /* waits out one capture in flight (<= ~5 s) */
     pthread_mutex_destroy(&w->lock);
     free(w);
 }
