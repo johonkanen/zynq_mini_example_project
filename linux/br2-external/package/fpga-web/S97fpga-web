@@ -1,25 +1,24 @@
 #!/bin/sh
 #
-# fpga-webstream: live PL data web page on port 80 (after S95fpga loads the PL).
-# Logs go to syslog (/var/log/messages).
+# fpga-web - FPGA web UI on port 80 (talks to fpgad, never to the hardware)
+# Logs go to syslog (/var/log/messages). Extra args: /etc/default/fpga-web (ARGS=...).
 #
-DAEMON=/usr/bin/fpga-webstream
-PIDFILE=/var/run/fpga-webstream.pid
+DAEMON=/usr/bin/fpga-web
+PIDFILE=/var/run/fpga-web.pid
 ARGS=""
-[ -r /etc/default/fpga-webstream ] && . /etc/default/fpga-webstream
+[ -r /etc/default/fpga-web ] && . /etc/default/fpga-web
 
 case "$1" in
 	start)
-		printf "Starting fpga-webstream: "
+		printf "Starting fpga-web: "
 		start-stop-daemon -S -q -b -m -p "$PIDFILE" -x "$DAEMON" -- $ARGS \
 			&& echo "OK" || echo "FAIL"
 		;;
 	stop)
-		printf "Stopping fpga-webstream: "
+		printf "Stopping fpga-web: "
 		pid=$(cat "$PIDFILE" 2>/dev/null)
 		start-stop-daemon -K -q -p "$PIDFILE"
-		# wait until it has really exited: it holds port 80 and reads the PL
-		# over GP0 until then (S95fpga must not reprogram the PL under it)
+		# wait until it has really exited before returning (it holds a socket/port)
 		i=0
 		while [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && [ $i -lt 50 ]; do
 			sleep 0.1; i=$((i + 1))
@@ -32,7 +31,7 @@ case "$1" in
 		rm -f "$PIDFILE"
 		;;
 	restart|reload)
-		"$0" stop; sleep 1; "$0" start
+		"$0" stop; "$0" start
 		;;
 	*)
 		echo "Usage: $0 {start|stop|restart}"; exit 1

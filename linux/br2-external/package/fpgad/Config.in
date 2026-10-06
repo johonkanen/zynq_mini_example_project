@@ -1,0 +1,9 @@
+config BR2_PACKAGE_FPGAD
+	bool "fpgad"
+	depends on BR2_TOOLCHAIN_HAS_THREADS
+	help
+	  The one process that touches the FPGA: owns the axi_regs window
+	  (via UIO) and the FPGA manager, and serves register read/write,
+	  streaming and PL reload to other processes over a UNIX socket
+	  (/var/run/fpgad.sock). Also installs fpgactl (CLI client) and,
+	  in staging, libfpgad-client.a + fpgad_client.h for new clients.

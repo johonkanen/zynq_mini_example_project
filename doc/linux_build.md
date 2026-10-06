@@ -399,7 +399,7 @@ the PL comes up ~2 s into userspace either way. Check it with
 > **Never read `0x4000_0000` while the PL isn't `operating`.** With no design
 > behind `M_AXI_GP0` the read never completes and the whole SoC hangs (this
 > happened during bring-up; only a JTAG `rst -system` or a power cycle recovers).
-> `fpga-webstream` checks the state and `SIGNATURE` before it touches anything.
+> `fpgad` checks the state and `SIGNATURE` before every access (§12).
 
 ### Load it earlier, from U-Boot (optional)
 
@@ -494,53 +494,106 @@ RAM buffers: image @`0x08000000`, read-back @`0x10000000`, so images up to
 
 ---
 
-## 12. Live PL data in the browser (`fpga-webstream`)
+## 12. FPGA access: `fpgad` + web UI (`fpga-web`)
 
-`http://<board-ip>/` shows a live chart of data read from the PL. Step 1 streams
-the existing `axi_regs` `HEARTBEAT` counter (`0x4000_0010`, +1 per 100 MHz AXI
-clock). The page plots the raw counter (a sawtooth that wraps every ~43 s) and
-the PL clock measured from it (ΔHEARTBEAT/Δt ≈ 100 MHz), which exercises the
-whole path end to end.
+**One process owns the FPGA; everything else asks it.**
 
 ```
-PL axi_regs ──GP0──► /dev/uioN (mmap) ──► fpga-webstream ──SSE──► browser
-                                           sampler 200 Hz,           canvas chart,
-                                           20 batches/s              last 10 s
+browser ──HTTP──► fpga-web ──┐
+fpgactl (shell) ─────────────┼── /var/run/fpgad.sock ──► fpgad ──► /dev/uio0 ──► PL (axi_regs)
+your next process ───────────┘   (line protocol)          │
+                                                          └──► /sys/class/fpga_manager (PL reload)
 ```
 
-- **Server:** `linux/fpga-webstream/` — C, on the civetweb library (Buildroot
-  `BR2_PACKAGE_CIVETWEB_LIB`, MIT). The page (`index.html`) is compiled into the
-  binary (`page.S` `.incbin`); the board needs no internet. Endpoints:
-  `/` (page), `/events` (Server-Sent Events), `/api/status` (JSON).
-- **Why SSE, not WebSocket:** Buildroot's civetweb is built without WebSocket
-  support, and a display-only stream doesn't need it. SSE is plain HTTP and
-  `EventSource` reconnects on its own. Controls can be added as HTTP POSTs.
-- **Package:** `BR2_EXTERNAL` tree `linux/br2-external/` (`fpga-webstream`,
-  `S97fpga-webstream` init script — after `S95fpga` loads the PL).
-  `build-linux.sh` passes `BR2_EXTERNAL` and enables it.
-- **UIO binding:** the DTS node `axi_regs@40000000` is `compatible =
-  "generic-uio"`; the built-in `uio_pdrv_genirq` only binds it with
-  `uio_pdrv_genirq.of_id=generic-uio` on the kernel command line. SD boot gets
-  it from `extlinux.conf` (appended by the post-build hook), the JTAG/`bootm`
-  path from the DTS `chosen/bootargs`.
-- **Bus safety:** registers are read only while
-  `/sys/class/fpga_manager/fpga0/state` is `operating` *and* `SIGNATURE` reads
-  `0x5A5A1234` (a GP0 read with no PL design can stall the bus). Otherwise the
-  page shows *PL: not configured* and the server re-checks every sample.
+- **`fpgad`** ([`linux/fpgad/`](../linux/fpgad/)) is the only process that maps
+  `axi_regs` (UIO) or touches the FPGA manager. It checks before **every** register
+  access that the PL is `operating` and `SIGNATURE` reads `0x5A5A1234` (a GP0 read
+  with no PL behind it hangs the SoC). A **PL reload** (`load`) holds a write lock,
+  so no access can happen mid-reconfiguration. Started by `S96fpgad`, after
+  `S95fpga` has loaded the PL at boot.
+- **`fpga-web`** ([`linux/fpga-web/`](../linux/fpga-web/)) is the web UI on port 80
+  (civetweb). It never maps the hardware; every request is an `fpgad` request.
+  Started by `S97fpga-web`.
+- **`fpgactl`** is the shell client; **`libfpgad-client.a` + `fpgad_client.h`**
+  are in Buildroot's staging dir for new client processes.
 
-On the board:
+### `fpgad` protocol (UNIX socket, one text line per request)
+
+| request | reply |
+|---|---|
+| `ping` | `ok pong` |
+| `status` | `ok {"ok":true,"pl":"operating","msg":"ready","sim":false}` |
+| `read <off>` | `ok 0x5a5a1234` |
+| `write <off> <value>` | `ok` |
+| `load <file>` | `ok operating` — reprogram the PL from `/lib/firmware/<file>` |
+| `stream <hz> <batch_hz> <off>...` | `ok streaming`, then `data {"t":[µs…],"v":[[…],…]}` per batch and `status {…}` on PL state changes, until the client disconnects |
+
+Errors are `err <message>`. Numbers are `0x…` or decimal; `<off>` is a byte offset
+into the `axi_regs` window (`0x0`–`0xFFC`, 4-byte aligned).
+
+### Web UI and HTTP API
+
+`http://<board-ip>/` shows a **register table** (all 8 `axi_regs` registers, refreshed
+twice a second, with write fields for the R/W ones), a raw read/write row for any
+offset, and the live `HEARTBEAT` charts (PL clock derived from it ≈ 100 MHz).
+
+```bash
+curl http://<ip>/api/status
+curl http://<ip>/api/regs                               # all registers, named
+curl "http://<ip>/api/reg?addr=0x1c"                    # read
+curl -X POST -d 'addr=0x00&value=0x12340000' http://<ip>/api/reg   # write
+curl -N http://<ip>/events                              # Server-Sent Events stream
+```
+
+Errors come back as `{"ok":false,"error":"..."}` with HTTP 400 (bad request) or 503
+(`fpgad` not running / PL not ready). Writes are logged to syslog with the client's
+address. **There is no authentication**: anyone on the LAN can write registers.
+Fine on a bench network; put it behind something if the board goes anywhere else.
+
+### On the board
 
 ```sh
-/etc/init.d/S97fpga-webstream restart     # start/stop/restart
-logread | grep fpga-webstream             # its log (syslog)
-ls /sys/class/uio/                        # uio0 -> name "axi_regs"
-curl http://127.0.0.1/api/status
+fpgactl status
+fpgactl regs                            # all registers, named
+fpgactl read 0x1c
+fpgactl write 0x00 0x12340000
+fpgactl load arm_fpga_zynq_mini.bit.bin # safe PL reload (blocks all access meanwhile)
+fpgactl stream 200 20 0x10              # Ctrl-C to stop
+/etc/init.d/S96fpgad restart            # fpga-web reconnects on its own
+grep -E 'fpgad|fpga-web' /var/log/messages
 ```
 
-Try it on a PC without the board (fakes a 100 MHz counter): build
-`main.c page.S` against civetweb's `src/civetweb.c` (`-DNO_SSL`), then
-`FPGA_WEBSTREAM_SIM=1 ./fpga-webstream -p 8088 -f` and open
-`http://localhost:8088/`.
+**Never reprogram the PL behind `fpgad`'s back** (`fpgautil`, writing
+`fpga_manager/firmware` by hand) while it runs: it could be reading at that moment.
+Use `fpgactl load`, which `update-board.sh bit` does too.
+
+### Writing another FPGA process
+
+```c
+#include <fpgad_client.h>          /* link: -lfpgad-client */
+struct fpgad_conn *c = fpgad_open(NULL);           /* $FPGAD_SOCKET or /var/run/fpgad.sock */
+uint32_t v;
+if (fpgad_read(c, 0x1C, &v) == 0) printf("SIGNATURE %08x\n", v);
+fpgad_write(c, 0x00, 0x12340000);
+fpgad_close(c);
+```
+
+As a Buildroot package: `FOO_DEPENDENCIES = fpgad` (copy
+`linux/br2-external/package/fpga-web/` as a template) and add it to
+`linux/br2-external/Config.in`. Scripts can just speak the text protocol
+(`socat - UNIX-CONNECT:/var/run/fpgad.sock`) or call `fpgactl`.
+
+### Try it on a PC
+
+`FPGAD_SIM=1 fpgad -f -s /tmp/fpgad.sock` simulates `axi_regs` exactly as the VHDL
+behaves (SUM, STATUS bits, CONTROL bit 1 holding HEARTBEAT at 0, 100 MHz counter).
+Then `FPGAD_SOCKET=/tmp/fpgad.sock fpga-web -p 8088 -f` (built natively against
+civetweb's `src/civetweb.c` with `-DNO_SSL`) and open `http://localhost:8088/`.
+
+Verified on the board (2026-10-06): writes, PL-computed `SUM`, `STATUS` bits,
+`CONTROL` bit 1 freezing `HEARTBEAT`, error replies, and a `fpgactl load` during
+a live browser stream (stream showed `ready → loading → ready`, reload 0.07 s,
+no hang).
 
 ---
 
@@ -550,7 +603,7 @@ For day-to-day changes, push only what changed to a board that's up on the netwo
 
 ```bash
 ./linux/update-board.sh <board-ip>              # kernel + dtb + bitstream + web server
-./linux/update-board.sh <board-ip> bit web      # just some parts: kernel dtb bit web all
+./linux/update-board.sh <board-ip> bit web      # just some parts: kernel dtb bit fpgad web all
 ./linux/update-board.sh --no-reboot <board-ip>  # new kernel/dtb wait for the next boot
 ./linux/update-board.sh --new-hostkey <ip>      # after reflashing (dropbear made a new host key)
 ```
@@ -559,15 +612,16 @@ For day-to-day changes, push only what changed to a board that's up on the netwo
 |---|---|---|---|
 | `kernel` | `output/images/uImage` | SD p1 `/uImage` | reboot |
 | `dtb` | `output/images/zynq-zynqmini.dtb` | SD p1 `/system.dtb` | reboot |
-| `bit` | `output/arm_fpga_zynq_mini.bit` → `bit2bin.py` | `/lib/firmware/*.bit.bin` | web server stopped, PL reloaded, restarted |
-| `web` | `fpga-webstream` | `/usr/bin/` | service restarted |
+| `bit` | `output/arm_fpga_zynq_mini.bit` → `bit2bin.py` | `/lib/firmware/*.bit.bin` | `fpgactl load` (fpgad reprograms the PL safely) |
+| `fpgad` | `fpgad`, `fpgactl` | `/usr/sbin/`, `/usr/bin/` | `fpgad` restarted (clients reconnect) |
+| `web` | `fpga-web` | `/usr/bin/` | service restarted |
 
 - Unchanged files (same md5 on the board) are skipped; the board reboots only if
   the kernel or dtb actually changed.
 - Copies go through `ssh … 'cat > file.new'`, are md5-checked, then renamed into
   place: atomic, and safe for a running binary. No `scp`: recent OpenSSH `scp`
   uses SFTP, which dropbear doesn't provide.
-- The PL is never reprogrammed while `fpga-webstream` is reading it over GP0.
+- The PL is only ever reprogrammed by `fpgad` (`fpgactl load`), which blocks all register access meanwhile.
 - Uses the key `build-linux.sh` baked in; host keys go to
   `$LINUX_BUILD_DIR/known_hosts`, not `~/.ssh`.
 - Refuses kernel/dtb updates on a JTAG/initramfs boot (there's no SD root).

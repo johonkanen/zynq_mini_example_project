@@ -1,0 +1,10 @@
+config BR2_PACKAGE_FPGA_WEB
+	bool "fpga-web"
+	depends on BR2_TOOLCHAIN_HAS_THREADS
+	depends on BR2_USE_MMU
+	select BR2_PACKAGE_FPGAD
+	select BR2_PACKAGE_CIVETWEB
+	select BR2_PACKAGE_CIVETWEB_LIB
+	help
+	  Web UI on port 80: register read/write and a live HEARTBEAT
+	  stream. Talks only to fpgad; never maps the FPGA itself.

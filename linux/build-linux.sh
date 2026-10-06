@@ -8,7 +8,7 @@
 #   3. Buildroot checkout       (pinned, shallow clone)
 #   4. rootfs overlay           (S95fpga -> fpgautil loads the PL at boot,
 #                                root's SSH authorized_keys)
-#      + BR2_EXTERNAL linux/br2-external: fpga-webstream (live PL data web page)
+#      + BR2_EXTERNAL linux/br2-external: fpgad (owns the FPGA) + fpga-web (web UI)
 #   5. configs/zynqmini_defconfig  (zynq_zed_defconfig + board-specific deltas)
 #   6. make                     (clean PATH so Buildroot tolerates WSL)
 #
@@ -171,7 +171,10 @@ if [ -f "$BIT" ]; then
 else
 	echo "post-build: WARNING $BIT missing - PL will not auto-load" >&2
 fi
-# bind the generic-uio axi_regs node to /dev/uioN (fpga-webstream needs it)
+# fpga-webstream was replaced by fpgad + fpga-web: drop its leftovers from an
+# existing target tree (Buildroot never removes files of a dropped package)
+rm -f "\$1/usr/bin/fpga-webstream" "\$1/etc/init.d/S97fpga-webstream"
+# bind the generic-uio axi_regs node to /dev/uioN (fpgad needs it)
 EXT="\$BINARIES_DIR/extlinux.conf"
 if [ -f "\$EXT" ] && ! grep -q 'uio_pdrv_genirq.of_id' "\$EXT"; then
 	sed -i '/^ *append / s/\$/ uio_pdrv_genirq.of_id=generic-uio/' "\$EXT"
@@ -199,7 +202,8 @@ BR2_ROOTFS_OVERLAY="$OV/rootfs"
 BR2_SYSTEM_DHCP="eth0"
 BR2_PACKAGE_DROPBEAR=y
 BR2_PACKAGE_DROPBEAR_DISABLE_REVERSEDNS=y
-BR2_PACKAGE_FPGA_WEBSTREAM=y
+BR2_PACKAGE_FPGAD=y
+BR2_PACKAGE_FPGA_WEB=y
 EOS
 
 #--- 6. build (clean PATH: Buildroot rejects the WSL Windows PATH) ------
@@ -209,14 +213,15 @@ env -i HOME="$HOME" PATH="$CLEAN_PATH" TERM="${TERM:-xterm}" \
              { [ ! -d output/build/ifupdown-scripts ] || make ifupdown-scripts-reinstall; } && \
              { [ ! -f output/images/zynq-zynqmini.dtb ] || [ ! '$DTS' -nt output/images/zynq-zynqmini.dtb ] \
                || make linux-rebuild; } && \
-             { [ ! -d output/build/fpga-webstream-1.0 ] || make fpga-webstream-rebuild; } && \
+             { [ ! -d output/build/fpgad-1.0 ] || make fpgad-rebuild; } && \
+             { [ ! -d output/build/fpga-web-1.0 ] || make fpga-web-rebuild; } && \
              make -j$JOBS"
 # Incremental-build traps handled above (Buildroot never redoes a built package):
 #  - ifupdown-scripts writes /etc/network/interfaces from BR2_SYSTEM_DHCP only at
 #    install time -> reinstall it
 #  - the custom DTS is copied into the kernel tree only during the linux build
 #    -> linux-rebuild when the repo DTS is newer than the built .dtb
-#  - fpga-webstream is a local-source package -> rebuild to pick up source edits
+#  - fpgad / fpga-web are local-source packages -> rebuild to pick up source edits
 
 #--- done ------------------------------------------------------------
 IMG="$BR/output/images"
@@ -229,6 +234,7 @@ cat <<EOS
              boot switch = SD
   console :  115200 8N1 on UART1 (MIO 48/49),  login: root  (no password)
   network :  eth0 via DHCP;  ssh root@<board-ip>  (key auth only)
-  web     :  http://<board-ip>/   live PL data (fpga-webstream)
+  web     :  http://<board-ip>/   FPGA registers + live data (fpga-web -> fpgad)
+  shell   :  fpgactl regs | read <off> | write <off> <val> | status
   JTAG    :  see doc/linux_build.md section 9
 EOS

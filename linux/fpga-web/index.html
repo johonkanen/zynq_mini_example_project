@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zynq Mini · FPGA</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --text:#e6e6e6; --dim:#8b93a1; --line:#2a2f3a;
+          --a:#5ab0ff; --b:#ffb454; --ok:#4cc38a; --bad:#ff6b6b; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font:14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display:flex; flex-wrap:wrap; gap:.5rem 1.5rem; align-items:baseline;
+           padding:1rem 1.25rem; border-bottom:1px solid var(--line); }
+  h1 { font-size:1.1rem; margin:0; font-weight:600; }
+  .pill { padding:.15rem .6rem; border-radius:999px; background:var(--panel);
+          border:1px solid var(--line); font-size:.85rem; }
+  .pill.ok { color:var(--ok); border-color:var(--ok); }
+  .pill.bad { color:var(--bad); border-color:var(--bad); }
+  main { padding:1rem 1.25rem; display:grid; gap:1rem; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:.75rem 1rem; }
+  .card h2 { font-size:.9rem; font-weight:600; margin:0 0 .5rem; color:var(--dim); }
+  .big { font-size:1.6rem; font-variant-numeric:tabular-nums; }
+  .stats { display:flex; flex-wrap:wrap; gap:1.5rem; }
+  canvas { width:100%; height:180px; display:block; }
+  small, .dim { color:var(--dim); }
+  .mono { font-family:ui-monospace, "Cascadia Mono", Consolas, monospace; font-variant-numeric:tabular-nums; }
+  .table-wrap { overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; }
+  th, td { text-align:left; padding:.3rem .6rem; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th { color:var(--dim); font-weight:500; font-size:.8rem; }
+  td.desc { white-space:normal; color:var(--dim); font-size:.85rem; }
+  input { background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:4px;
+          padding:.25rem .4rem; width:9.5rem; font:inherit; }
+  input:focus { outline:1px solid var(--a); }
+  button { background:#22324a; color:var(--text); border:1px solid #2f4a70; border-radius:4px;
+           padding:.25rem .7rem; font:inherit; cursor:pointer; }
+  button:hover { background:#2a3f5e; }
+  .flash { animation:flash .8s; }
+  @keyframes flash { from { background:#2a4a35; } to { background:transparent; } }
+  #log { min-height:1.2em; }
+  #log.err { color:var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Zynq Mini · FPGA</h1>
+  <span id="conn" class="pill">connecting…</span>
+  <span id="pl" class="pill">PL: ?</span>
+  <small id="msg"></small>
+</header>
+<main>
+  <section class="card">
+    <h2>Registers — axi_regs @ 0x4000_0000 (via fpgad)</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>offset</th><th>name</th><th></th><th>value</th><th>write</th><th>meaning</th></tr></thead>
+        <tbody id="regs"></tbody>
+      </table>
+    </div>
+    <p class="mono" style="margin:.75rem 0 .25rem">
+      raw: offset <input id="raddr" value="0x1c"> value <input id="rval" placeholder="0x…">
+      <button id="rread">read</button> <button id="rwrite">write</button>
+    </p>
+    <div id="log" class="mono dim"></div>
+  </section>
+  <section class="card stats">
+    <div><h2>PL clock (from HEARTBEAT)</h2><div class="big" id="mhz">–</div></div>
+    <div><h2>HEARTBEAT</h2><div class="big mono" id="hb">–</div></div>
+    <div><h2>samples received</h2><div class="big" id="rate">–</div></div>
+  </section>
+  <section class="card"><h2>HEARTBEAT counter (0x10) — last 10 s</h2><canvas id="c1"></canvas></section>
+  <section class="card"><h2>PL clock, MHz = ΔHEARTBEAT / Δt — last 10 s</h2><canvas id="c2"></canvas></section>
+</main>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const hex = v => "0x" + (v >>> 0).toString(16).padStart(8, "0");
+function pill(el, text, cls) { el.textContent = text; el.className = "pill " + (cls || ""); }
+function log(text, isErr) { const l = $("log"); l.textContent = text; l.className = "mono " + (isErr ? "err" : "dim"); }
+
+/* ---------- registers ---------- */
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  let j; try { j = await r.json(); } catch (e) { j = { ok:false, error: r.status + " " + r.statusText }; }
+  if (!j.ok) throw new Error(j.error || "request failed");
+  return j;
+}
+async function writeReg(addr, value) {
+  const body = new URLSearchParams({ addr, value });
+  const j = await api("/api/reg", { method:"POST", body });
+  log(`wrote ${j.value} -> ${j.addr}`);
+  refreshRegs();
+}
+let built = false, prev = {};
+function buildTable(regs) {
+  const tb = $("regs"); tb.innerHTML = "";
+  for (const r of regs) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td class="mono">${r.addr}</td><td>${r.name}</td><td class="dim">${r.access}</td>` +
+      `<td class="mono" id="v${r.addr}"></td>` +
+      `<td>${r.access === "rw" ? `<input id="w${r.addr}" placeholder="0x…"> <button data-a="${r.addr}">write</button>` : ""}</td>` +
+      `<td class="desc">${r.desc}</td>`;
+    tb.appendChild(tr);
+  }
+  tb.querySelectorAll("button[data-a]").forEach(b => b.onclick = () => {
+    const a = b.dataset.a, v = $("w" + a).value.trim();
+    if (!v) { log("enter a value first", true); return; }
+    writeReg(a, v).catch(e => log(e.message, true));
+  });
+  tb.querySelectorAll("input").forEach(i => i.onkeydown = e => {
+    if (e.key === "Enter") i.nextElementSibling.click();
+  });
+  built = true;
+}
+async function refreshRegs() {
+  try {
+    const j = await api("/api/regs");
+    if (!built) buildTable(j.regs);
+    for (const r of j.regs) {
+      const td = $("v" + r.addr);
+      if (prev[r.addr] !== undefined && prev[r.addr] !== r.value && r.name !== "HEARTBEAT" && r.name !== "STATUS") {
+        td.classList.remove("flash"); void td.offsetWidth; td.classList.add("flash");
+      }
+      td.textContent = r.value; prev[r.addr] = r.value;
+    }
+  } catch (e) { /* PL down / fpgad gone: status pill says why */ }
+}
+$("rread").onclick = () => api("/api/reg?addr=" + encodeURIComponent($("raddr").value.trim()))
+  .then(j => log(`read ${j.addr} = ${j.value}`)).catch(e => log(e.message, true));
+$("rwrite").onclick = () => {
+  const v = $("rval").value.trim();
+  if (!v) { log("enter a value first", true); return; }
+  writeReg($("raddr").value.trim(), v).catch(e => log(e.message, true));
+};
+refreshRegs(); setInterval(refreshRegs, 500);
+
+/* ---------- live HEARTBEAT stream ---------- */
+const WINDOW_US = 10e6;
+const t = [], hb = [], mhz = [];
+let received = 0, rxWindowStart = performance.now(), rxRate = 0;
+function onBatch(d) {
+  const v = d.v[0];
+  for (let i = 0; i < d.t.length; i++) {
+    const n = t.length;
+    if (n) {
+      const dt = d.t[i] - t[n - 1], dc = (v[i] - hb[n - 1]) >>> 0;
+      mhz.push(dt > 0 ? dc / dt : NaN);
+    } else mhz.push(NaN);
+    t.push(d.t[i]); hb.push(v[i]);
+  }
+  received += d.t.length;
+  const cut = t[t.length - 1] - WINDOW_US;
+  let k = 0; while (k < t.length && t[k] < cut) k++;
+  if (k) { t.splice(0, k); hb.splice(0, k); mhz.splice(0, k); }
+}
+function connect() {
+  const es = new EventSource("/events");
+  es.onopen = () => pill($("conn"), "live", "ok");
+  es.onerror = () => pill($("conn"), "reconnecting…", "bad");
+  es.onmessage = e => onBatch(JSON.parse(e.data));
+  es.addEventListener("status", e => {
+    const s = JSON.parse(e.data);
+    pill($("pl"), "PL: " + s.pl + (s.sim ? " (sim)" : ""), s.ok ? "ok" : "bad");
+    $("msg").textContent = s.msg;
+    if (!s.ok) { t.length = hb.length = mhz.length = 0; }
+  });
+}
+function plot(canvas, xs, ys, color, fixedMin, fixedMax) {
+  const dpr = window.devicePixelRatio || 1, w = canvas.clientWidth, h = canvas.clientHeight;
+  if (canvas.width !== w * dpr || canvas.height !== h * dpr) { canvas.width = w * dpr; canvas.height = h * dpr; }
+  const g = canvas.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
+  const padL = 70, padB = 18, pw = w - padL - 8, ph = h - padB - 8;
+  let lo = fixedMin, hi = fixedMax;
+  if (lo === undefined) {
+    lo = Infinity; hi = -Infinity;
+    for (const v of ys) if (Number.isFinite(v)) { if (v < lo) lo = v; if (v > hi) hi = v; }
+    if (!Number.isFinite(lo)) { lo = 0; hi = 1; }
+    const m = (hi - lo) * 0.1 || Math.abs(hi) * 0.001 || 1; lo -= m; hi += m;
+  }
+  const x1 = xs.length ? xs[xs.length - 1] : 0, x0 = x1 - WINDOW_US;
+  const X = v => padL + (v - x0) / WINDOW_US * pw, Y = v => 8 + (1 - (v - lo) / (hi - lo)) * ph;
+  g.strokeStyle = "#2a2f3a"; g.fillStyle = "#8b93a1"; g.font = "11px system-ui"; g.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const v = lo + (hi - lo) * i / 4, y = Y(v);
+    g.beginPath(); g.moveTo(padL, y); g.lineTo(padL + pw, y); g.stroke();
+    g.fillText(Math.abs(hi) >= 1e6 ? v.toExponential(2) : v.toFixed(3), 4, y + 4);
+  }
+  for (let s = 0; s <= 10; s += 2) g.fillText("-" + (10 - s) + "s", X(x0 + s * 1e6) - 10, h - 4);
+  g.strokeStyle = color; g.lineWidth = 1.5; g.beginPath();
+  let pen = false;
+  for (let i = 0; i < xs.length; i++) {
+    const v = ys[i];
+    if (!Number.isFinite(v)) { pen = false; continue; }
+    const x = X(xs[i]), y = Y(v);
+    if (pen) g.lineTo(x, y); else { g.moveTo(x, y); pen = true; }
+  }
+  g.stroke();
+}
+function frame(now) {
+  if (now - rxWindowStart >= 1000) { rxRate = received * 1000 / (now - rxWindowStart); received = 0; rxWindowStart = now; }
+  const n = t.length;
+  if (n) {
+    let s = 0, c = 0;
+    for (let i = Math.max(1, n - 50); i < n; i++) if (Number.isFinite(mhz[i])) { s += mhz[i]; c++; }
+    $("mhz").textContent = c ? (s / c).toFixed(3) + " MHz" : "–";
+    $("hb").textContent = hex(hb[n - 1]);
+  }
+  $("rate").textContent = rxRate.toFixed(0) + " /s";
+  plot($("c1"), t, hb, "#5ab0ff", 0, 4294967296);
+  plot($("c2"), t, mhz, "#ffb454");
+  requestAnimationFrame(frame);
+}
+connect();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

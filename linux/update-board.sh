@@ -9,7 +9,8 @@
 #   kernel   output/images/uImage            -> SD boot partition  /uImage
 #   dtb      output/images/zynq-zynqmini.dtb -> SD boot partition  /system.dtb
 #   bit      output/arm_fpga_zynq_mini.bit   -> /lib/firmware/*.bit.bin (via bit2bin.py), PL reloaded now
-#   web      fpga-webstream binary           -> /usr/bin, service restarted
+#   fpgad    fpgad + fpgactl                 -> /usr/sbin, /usr/bin; fpgad restarted
+#   web      fpga-web                        -> /usr/bin, service restarted
 #   all      all of the above
 #
 # Unchanged files (same md5 as on the board) are skipped. The board reboots
@@ -48,12 +49,12 @@ while [ $# -gt 0 ]; do
         *)             break ;;
     esac
 done
-[ $# -ge 1 ] || die "usage: $0 [--no-reboot] [--new-hostkey] <board-ip> [kernel|dtb|bit|web|all]..."
+[ $# -ge 1 ] || die "usage: $0 [--no-reboot] [--new-hostkey] <board-ip> [kernel|dtb|bit|fpgad|web|all]..."
 BOARD=$1; shift
 parts=("${@:-all}")
 want() { local p; for p in "${parts[@]}"; do [ "$p" = all ] || [ "$p" = "$1" ] && return 0; done; return 1; }
 for p in "${parts[@]}"; do
-    case "$p" in kernel|dtb|bit|web|all) ;; *) die "unknown part '$p' (kernel dtb bit web all)" ;; esac
+    case "$p" in kernel|dtb|bit|fpgad|web|all) ;; *) die "unknown part '$p' (kernel dtb bit fpgad web all)" ;; esac
 done
 
 mkdir -p "$LINUX_BUILD_DIR"
@@ -117,15 +118,29 @@ if want bit; then
     BINTMP=$(mktemp); trap 'rm -f "$BINTMP"; cleanup' EXIT
     python3 "$REPO/linux/bit2bin.py" "$REPO/output/arm_fpga_zynq_mini.bit" "$BINTMP"
     if push "$BINTMP" /lib/firmware/arm_fpga_zynq_mini.bit.bin; then
-        # never reprogram the PL while fpga-webstream is reading its registers over GP0
-        rsh "/etc/init.d/S97fpga-webstream stop >/dev/null 2>&1; /etc/init.d/S95fpga start; /etc/init.d/S97fpga-webstream start"
+        # fpgad owns the PL: it blocks all register access while it reprograms.
+        # (Images from before fpgad: fall back to the init scripts.)
+        rsh 'if command -v fpgactl >/dev/null && fpgactl status >/dev/null 2>&1; then
+                 printf "PL: fpgactl load ... "; fpgactl load arm_fpga_zynq_mini.bit.bin
+             else
+                 /etc/init.d/S97fpga-webstream stop >/dev/null 2>&1; /etc/init.d/S95fpga start
+                 /etc/init.d/S97fpga-webstream start >/dev/null 2>&1; true
+             fi'
+    fi
+fi
+
+if want fpgad; then
+    log "fpgad + fpgactl"
+    push "$BR/target/usr/bin/fpgactl" /usr/bin/fpgactl 755 || true
+    if push "$BR/target/usr/sbin/fpgad" /usr/sbin/fpgad 755; then
+        rsh "/etc/init.d/S96fpgad restart"    # clients (fpga-web) reconnect on their own
     fi
 fi
 
 if want web; then
-    log "fpga-webstream"
-    if push "$BR/target/usr/bin/fpga-webstream" /usr/bin/fpga-webstream 755; then
-        rsh "/etc/init.d/S97fpga-webstream restart"
+    log "fpga-web"
+    if push "$BR/target/usr/bin/fpga-web" /usr/bin/fpga-web 755; then
+        rsh "/etc/init.d/S97fpga-web restart"
     fi
 fi
 
