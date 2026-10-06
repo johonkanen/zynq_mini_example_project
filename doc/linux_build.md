@@ -527,6 +527,38 @@ Try it on a PC without the board (fakes a 100 MHz counter): build
 
 ---
 
+## 13. Update a running board over SSH (no reflash)
+
+For day-to-day changes, push only what changed to a board that's up on the network:
+
+```bash
+./linux/update-board.sh <board-ip>              # kernel + dtb + bitstream + web server
+./linux/update-board.sh <board-ip> bit web      # just some parts: kernel dtb bit web all
+./linux/update-board.sh --no-reboot <board-ip>  # new kernel/dtb wait for the next boot
+./linux/update-board.sh --new-hostkey <ip>      # after reflashing (dropbear made a new host key)
+```
+
+| part | from | to | then |
+|---|---|---|---|
+| `kernel` | `output/images/uImage` | SD p1 `/uImage` | reboot |
+| `dtb` | `output/images/zynq-zynqmini.dtb` | SD p1 `/system.dtb` | reboot |
+| `bit` | `output/arm_fpga_zynq_mini.bit` | `/lib/firmware/` | web server stopped, PL reloaded, restarted |
+| `web` | `fpga-webstream` | `/usr/bin/` | service restarted |
+
+- Unchanged files (same md5 on the board) are skipped; the board reboots only if
+  the kernel or dtb actually changed.
+- Copies go through `ssh … 'cat > file.new'`, are md5-checked, then renamed into
+  place: atomic, and safe for a running binary. No `scp`: recent OpenSSH `scp`
+  uses SFTP, which dropbear doesn't provide.
+- The PL is never reprogrammed while `fpga-webstream` is reading it over GP0.
+- Uses the key `build-linux.sh` baked in; host keys go to
+  `$LINUX_BUILD_DIR/known_hosts`, not `~/.ssh`.
+- Refuses kernel/dtb updates on a JTAG/initramfs boot (there's no SD root).
+
+New packages or changes elsewhere in the rootfs still need a full reflash (§11).
+
+---
+
 ## Version matrix
 
 | Component | Version | Config |
