@@ -362,7 +362,7 @@ A rootfs overlay stages the bitstream and a BusyBox init script loads it:
 
 ```
 <build dir>/overlay/
-├─ rootfs/etc/init.d/S95fpga  # fpgautil -b /lib/firmware/arm_fpga_zynq_mini.bit.bin
+├─ rootfs/etc/init.d/S95fpga  # echo arm_fpga_zynq_mini.bit.bin > /sys/class/fpga_manager/fpga0/firmware
 └─ copy-bitstream.sh          # POST_BUILD hook: output/*.bit -> linux/bit2bin.py -> /lib/firmware/*.bit.bin
 ```
 
@@ -375,9 +375,16 @@ byte-identical to `bootgen -arch zynq -process_bitstream bin`, so the build
 doesn't need Vitis. `build-linux.sh` writes both scripts; `S95fpga`:
 
 ```sh
-BIT=/lib/firmware/arm_fpga_zynq_mini.bit.bin
-fpgautil -b "$BIT" && [ "$(cat /sys/class/fpga_manager/fpga0/state)" = operating ]  # -> "ok" / "FAILED (<state>)"
+echo 0 > /sys/class/fpga_manager/fpga0/flags                         # full bitstream
+echo arm_fpga_zynq_mini.bit.bin > /sys/class/fpga_manager/fpga0/firmware
+[ "$(cat /sys/class/fpga_manager/fpga0/state)" = operating ]        # -> "ok" / "FAILED (<state>)"
 ```
+
+**Not `fpgautil`:** `fpgautil -b <file>` copies the file into `/lib/firmware`,
+loads it, then runs `rm /lib/firmware/<name>`. With our file already in
+`/lib/firmware`, that deletes the only copy, so the PL loaded on the first boot
+only (found on hardware). Writing the name to the manager's sysfs `firmware`
+attribute loads the same file and leaves it in place.
 
 defconfig:
 ```make
@@ -531,19 +538,21 @@ For day-to-day changes, push only what changed to a board that's up on the netwo
 ```bash
 ./linux/update-board.sh <board-ip>              # kernel + dtb + bitstream + web server
 ./linux/update-board.sh <board-ip> bit web      # just some parts: kernel dtb bit web all
-./linux/update-board.sh --no-reboot <board-ip>  # new kernel/dtb wait for the next boot
+./linux/update-board.sh --reboot <board-ip>     # soft-reboot after a kernel/dtb change (see below)
 ./linux/update-board.sh --new-hostkey <ip>      # after reflashing (dropbear made a new host key)
 ```
 
 | part | from | to | then |
 |---|---|---|---|
-| `kernel` | `output/images/uImage` | SD p1 `/uImage` | reboot |
-| `dtb` | `output/images/zynq-zynqmini.dtb` | SD p1 `/system.dtb` | reboot |
+| `kernel` | `output/images/uImage` | SD p1 `/uImage` | power-cycle |
+| `dtb` | `output/images/zynq-zynqmini.dtb` | SD p1 `/system.dtb` | power-cycle |
 | `bit` | `output/arm_fpga_zynq_mini.bit` → `bit2bin.py` | `/lib/firmware/*.bit.bin` | web server stopped, PL reloaded, restarted |
 | `web` | `fpga-webstream` | `/usr/bin/` | service restarted |
 
-- Unchanged files (same md5 on the board) are skipped; the board reboots only if
-  the kernel or dtb actually changed.
+- Unchanged files (same md5 on the board) are skipped. A new kernel/dtb takes
+  effect on the next boot; the script **doesn't reboot by default** and tells you
+  to **power-cycle** instead, because a soft reboot doesn't come back on this
+  board (see *Known issues*).
 - Copies go through `ssh … 'cat > file.new'`, are md5-checked, then renamed into
   place: atomic, and safe for a running binary. No `scp`: recent OpenSSH `scp`
   uses SFTP, which dropbear doesn't provide.
@@ -553,6 +562,23 @@ For day-to-day changes, push only what changed to a board that's up on the netwo
 - Refuses kernel/dtb updates on a JTAG/initramfs boot (there's no SD root).
 
 New packages or changes elsewhere in the rootfs still need a full reflash (§11).
+
+---
+
+## Known issues (found on hardware, 2026-10-06)
+
+- **Soft reboot doesn't boot from SD.** After a Linux `reboot`, a JTAG
+  `rst -system` or a U-Boot `reset`, the BootROM stops with `REBOOT_STATUS`
+  error `0x200A` and the console stays silent; a **power cycle** boots fine. The
+  schematic rules out the SD switch (TXS02612 `SEL` is tied to GND, so TF1 is
+  always selected) and there's no SD power switch: the card stays powered
+  across a soft reset. The likely cause is card state left by U-Boot/Linux
+  that the BootROM can't recover from. Not yet confirmed or fixed.
+  `update-board.sh` therefore doesn't reboot by default.
+- **SD1 is a second microSD slot (TF2), not an eMMC.** The schematic labels TF1
+  (on SD0, via the TXS02612) as the only bootable slot and TF2 (SD1) as
+  "doesn't support booting". The DTS still describes `sdhci1` as a
+  non-removable eMMC, so a card in TF2 is only seen if present at boot.
 
 ---
 

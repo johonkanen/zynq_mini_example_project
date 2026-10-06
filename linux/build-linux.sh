@@ -99,17 +99,18 @@ cat > "$OV/rootfs/etc/init.d/S95fpga" <<'EOS'
 # Configure the PL via the Zynq FPGA manager so axi_regs (0x40000000) is live.
 # The manager wants a .bin (header stripped, 32-bit words byte-swapped - made
 # by linux/bit2bin.py at build time); it rejects a raw Vivado .bit (-EINVAL).
-BIT=/lib/firmware/arm_fpga_zynq_mini.bit.bin
+# Loaded through sysfs directly, not fpgautil: fpgautil deletes
+# /lib/firmware/<name> after loading, i.e. our only copy.
+FW=arm_fpga_zynq_mini.bit.bin
+MGR=/sys/class/fpga_manager/fpga0
 case "$1" in
 	start)
-		[ -f "$BIT" ] || { echo "PL: no $BIT, skipping"; exit 0; }
-		printf 'PL: loading %s ... ' "$(basename "$BIT")"
-		if fpgautil -b "$BIT" >/dev/null 2>&1 &&
-		   [ "$(cat /sys/class/fpga_manager/fpga0/state)" = operating ]; then
-			echo ok
-		else
-			echo "FAILED ($(cat /sys/class/fpga_manager/fpga0/state))"
-		fi ;;
+		[ -f "/lib/firmware/$FW" ] || { echo "PL: no /lib/firmware/$FW, skipping"; exit 0; }
+		printf 'PL: loading %s ... ' "$FW"
+		echo 0 > "$MGR/flags"                   # full bitstream
+		echo "$FW" > "$MGR/firmware" 2>/dev/null
+		state=$(cat "$MGR/state")
+		[ "$state" = operating ] && echo ok || echo "FAILED ($state)" ;;
 	stop|restart|reload) ;;
 	*) echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
 esac
