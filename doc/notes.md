@@ -16,7 +16,7 @@ Zynq-7000 series covering this exact board and its close QMTech sibling.
 | Ethernet | Gigabit **RTL8211E-class, RGMII**, on **PS GEM0 / MIO 16–27**, MDIO on MIO 52–53, **PHY address 0** |
 | USB | Host on USB-C, ULPI PHY (USB3320-class) |
 | HDMI | direct from PL GPIO, no companion/ESD chip (bit-banged TMDS: H16 H17 D19 D20 C20 B20 B19 A20 H18) |
-| OLED | 128×64 SSD1306, bit-banged 4-wire from PL (this repo's sibling example uses AXI-GPIO → E19 E18 F16 F17) |
+| OLED | 128×64 SSD1306, 4-wire SPI on PL pins E18 (SCLK) E19 (SDIN) F16 (D/C#) F17 (RES#); driven by `src/hdl/ssd1306_text.vhd` |
 | clock | external 50 MHz oscillator to PL |
 | storage | microSD (SDIO0) + on-board eMMC (SDIO1) |
 | misc | I²C EEPROM 2 Kbit (PL), 5 LEDs (4 PL / 1 PS), 3 buttons (2 PL / 1 PS), 34 PL GPIO |

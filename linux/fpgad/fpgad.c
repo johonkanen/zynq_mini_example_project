@@ -15,6 +15,9 @@
  *   read <off>                    -> ok 0x0000abcd
  *   write <off> <value>           -> ok
  *   load <firmware-file>          -> ok operating      (file in /lib/firmware)
+ *   oled <row> <text>             -> ok                (OLED row 0..7, 16 chars;
+ *                                     the rest of the line, spaces kept)
+ *   oled clear                    -> ok
  *   stream <hz> <batch_hz> <off>... -> ok streaming, then until disconnect:
  *        data {"t":[us,...],"v":[[r0,...],[r1,...]]}   one line per batch
  *        status {...}                                   when the PL state changes
@@ -52,6 +55,11 @@
 #define REG_HEARTBEAT   0x10
 #define REG_SIGNATURE   0x1C
 #define SIGNATURE_VALUE 0x5A5A1234u
+#define REG_OLED_CTRL   0x20
+#define REG_OLED_STAT   0x24
+#define REG_OLED_TEXT   0x80            /* 128 chars, 4 per word, little-endian */
+#define OLED_COLS       16
+#define OLED_ROWS       8
 #define MAX_CLIENTS     32
 #define MAX_STREAM_REGS 8
 
@@ -154,6 +162,8 @@ static unsigned get_status(char *out, size_t n)
 
 static uint32_t sim_regs[4];            /* SCRATCH0..2, CONTROL */
 static uint64_t sim_hb_zero_ns;         /* when HEARTBEAT was last 0 */
+static uint32_t sim_oled_ctrl = 0x00007F01;
+static uint32_t sim_oled_text[32];      /* reset text set up in main() */
 
 static uint32_t sim_heartbeat(void)
 {
@@ -166,8 +176,10 @@ static uint32_t sim_heartbeat(void)
 
 static uint32_t sim_read(uint32_t off)
 {
-    unsigned idx = (off >> 2) & 7;
+    unsigned idx = (off >> 2) & 63;     /* the map repeats every 256 bytes */
     uint32_t hb = sim_heartbeat();
+    if (idx >= REG_OLED_TEXT / 4)
+        return sim_oled_text[idx - REG_OLED_TEXT / 4];
     switch (idx) {
     case 0: case 1: case 2: case 3: return sim_regs[idx];
     case 4: return hb;
@@ -178,17 +190,33 @@ static uint32_t sim_read(uint32_t off)
                  | ((sim_regs[3] & 1) << 3)
                  | ((uint32_t)__builtin_popcount(sim_regs[2]) << 8)
                  | ((hb & 0xFFFF) << 16);
-    default: return SIGNATURE_VALUE;
+    case 7: return SIGNATURE_VALUE;
+    case REG_OLED_CTRL / 4: return sim_oled_ctrl;
+    case REG_OLED_STAT / 4: return ((uint32_t)((now_ns() - t0_ns) / 33333333u) << 16) | 1;
+    default: return 0;
+    }
+}
+
+static void sim_oled_set_row(int row, const char *s)
+{
+    for (int i = 0; i < OLED_COLS; i++) {
+        unsigned n = (unsigned)(row * OLED_COLS + i);
+        uint32_t c = (uint8_t)(*s ? *s++ : ' ');
+        sim_oled_text[n / 4] = (sim_oled_text[n / 4] & ~(0xFFu << (8 * (n % 4)))) | c << (8 * (n % 4));
     }
 }
 
 static void sim_write(uint32_t off, uint32_t v)
 {
-    unsigned idx = (off >> 2) & 7;
+    unsigned idx = (off >> 2) & 63;
     if (idx < 4) {
         if (idx == 3 && (sim_regs[3] & 2) && !(v & 2))
             sim_hb_zero_ns = now_ns();  /* released from clear: count from 0 */
         sim_regs[idx] = v;
+    } else if (idx == REG_OLED_CTRL / 4) {
+        sim_oled_ctrl = v;
+    } else if (idx >= REG_OLED_TEXT / 4) {
+        sim_oled_text[idx - REG_OLED_TEXT / 4] = v;
     }
 }
 
@@ -382,6 +410,57 @@ static int pl_load(const char *name, char *err, size_t n)
     return rc;
 }
 
+/* ---- OLED text ----------------------------------------------------------- */
+
+/* write one 16-character row of the OLED text buffer (padded with spaces,
+ * non-printable -> '?'), or blank the whole display for row < 0 */
+static int oled_text(int row, const char *s, char *err, size_t n)
+{
+    int first = row < 0 ? 0 : row, last = row < 0 ? OLED_ROWS - 1 : row;
+    for (int r = first; r <= last; r++) {
+        const char *p = row < 0 ? "" : s;
+        for (int w = 0; w < OLED_COLS / 4; w++) {
+            uint32_t v = 0;
+            for (int b = 0; b < 4; b++) {
+                uint8_t c = *p ? (uint8_t)*p++ : ' ';
+                v |= (uint32_t)(c >= 0x20 && c < 0x7F ? c : '?') << (8 * b);
+            }
+            uint32_t off = REG_OLED_TEXT + (uint32_t)(r * OLED_COLS + w * 4);
+            if (reg_access(1, off, &v, err, n))
+                return -1;
+        }
+    }
+    return 0;
+}
+
+static void do_oled(int fd, char *args)
+{
+    char err[320], *end;
+    while (*args == ' ' || *args == '\t')
+        args++;
+    args[strcspn(args, "\r")] = 0;
+    if (!strcmp(args, "clear")) {
+        if (oled_text(-1, NULL, err, sizeof err))
+            sendf(fd, "err %s\n", err);
+        else
+            sendf(fd, "ok\n");
+        return;
+    }
+    long row = strtol(args, &end, 10);
+    if (end == args || row < 0 || row >= OLED_ROWS || (*end && *end != ' ' && *end != '\t')) {
+        sendf(fd, "err usage: oled <row 0..%d> <text> | oled clear\n", OLED_ROWS - 1);
+        return;
+    }
+    if (*end)
+        end++;                                  /* one separator; the rest is the text */
+    if (strlen(end) > OLED_COLS)
+        logmsg(LOG_INFO, "oled: row %ld text truncated to %d chars", row, OLED_COLS);
+    if (oled_text((int)row, end, err, sizeof err))
+        sendf(fd, "err %s\n", err);
+    else
+        sendf(fd, "ok\n");
+}
+
 /* ---- streaming ----------------------------------------------------------- */
 
 static void do_stream(int fd, char **argv, int argc)
@@ -467,6 +546,10 @@ out:
 
 static void handle_line(int fd, char *line)
 {
+    if (!strncmp(line, "oled", 4) && (line[4] == ' ' || line[4] == '\t' || !line[4])) {
+        do_oled(fd, line + 4);                  /* before strtok: the text keeps its spaces */
+        return;
+    }
     char *argv[16];
     int argc = 0;
     for (char *tok = strtok(line, " \t\r"); tok && argc < 16; tok = strtok(NULL, " \t\r"))
@@ -506,7 +589,8 @@ static void handle_line(int fd, char *line)
     } else if (!strcmp(argv[0], "stream")) {
         do_stream(fd, argv, argc);
     } else {
-        sendf(fd, "err unknown command '%s' (ping status read write load stream)\n", argv[0]);
+        sendf(fd, "err unknown command '%s' (ping status read write load stream oled)\n",
+              argv[0]);
     }
 }
 
@@ -567,6 +651,11 @@ int main(int argc, char **argv)
     sim = getenv("FPGAD_SIM") != NULL;
     openlog("fpgad", LOG_PID | (foreground ? LOG_PERROR : 0), LOG_DAEMON);
     t0_ns = sim_hb_zero_ns = now_ns();
+    static const char *const sim_text[OLED_ROWS] = {   /* OLED_TEXT_RESET in axi_regs.vhd */
+        "Hello, Zynq Mini", "", "SSD1306 driven", "from the PL", "", "", "", "fpgactl oled ...",
+    };
+    for (int r = 0; r < OLED_ROWS; r++)
+        sim_oled_set_row(r, sim_text[r]);
 
     struct sigaction sa = { .sa_handler = on_signal };
     sigaction(SIGINT, &sa, NULL);

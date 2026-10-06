@@ -25,12 +25,16 @@ set OUTPUT_DIR      "$REPO_ROOT/output"
 # Hand-written VHDL, added to the project after the block design is generated.
 #   axi_pkg.vhd          - AXI bus direction records (axi_mosi_t / axi_miso_t)
 #   axi_regs.vhd         - VHDL AXI slave (records on the port)
+#   font8x8_pkg.vhd      - 8x8 font ROM for the OLED
+#   ssd1306_text.vhd     - SSD1306 OLED text-mode driver
 #   zynq_ps_wrapper.vhd  - wraps the block design; M_AXI_GP0 -> records
 #   zynq_mini_top.vhd    - synthesis top; just u_ps + u_axi_regs + user logic
 # All VHDL-2008, listed in dependency order.
 set TOP_SOURCES [list \
     "$HDL_DIR/axi_pkg.vhd" \
     "$HDL_DIR/axi_regs.vhd" \
+    "$HDL_DIR/font8x8_pkg.vhd" \
+    "$HDL_DIR/ssd1306_text.vhd" \
     "$HDL_DIR/zynq_ps_wrapper.vhd" \
     "$HDL_DIR/zynq_mini_top.vhd" \
 ]

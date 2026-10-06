@@ -8,11 +8,11 @@
 --   zynq_mini_top
 --     +-- u_ps  : zynq_ps_wrapper   (block design + M_AXI_GP0 -> records)
 --     +-- u_axi_regs : axi_regs     (AXI slave, VHDL)
+--     +-- u_oled : ssd1306_text     (128x64 OLED, text from axi_regs OLED_TEXT)
 --     +-- placeholder PL user logic
 --
--- Entity ports = the physical device pins only (DDR_* + FIXED_IO_*), which the
--- PS7 IP constrains automatically. Add a port here + a line in
--- src/constrs/zynq_mini.xdc for any real PL I/O.
+-- Entity ports = the physical device pins: DDR_* + FIXED_IO_* (constrained
+-- automatically by the PS7 IP) and the OLED pins (src/constrs/zynq_mini.xdc).
 -------------------------------------------------------------------------------
 
 library ieee;
@@ -43,7 +43,13 @@ entity zynq_mini_top is
         FIXED_IO_mio      : inout std_logic_vector(53 downto 0);
         FIXED_IO_ps_clk   : inout std_logic;
         FIXED_IO_ps_porb  : inout std_logic;
-        FIXED_IO_ps_srstb : inout std_logic
+        FIXED_IO_ps_srstb : inout std_logic;
+
+        -- 0.96" SSD1306 OLED, 4-wire SPI (J4)
+        oled_sclk         : out std_logic;
+        oled_sdin         : out std_logic;
+        oled_dc           : out std_logic;
+        oled_res_n        : out std_logic
     );
 end entity zynq_mini_top;
 
@@ -59,6 +65,14 @@ architecture rtl of zynq_mini_top is
     -- register view from the AXI slave
     signal reg_ps2pl : std_logic_vector(127 downto 0);
     signal pl_active : std_logic;
+
+    -- OLED driver <-> axi_regs
+    signal oled_ctrl      : std_logic_vector(31 downto 0);
+    signal oled_stat      : std_logic_vector(31 downto 0);
+    signal oled_char_addr : std_logic_vector(6 downto 0);
+    signal oled_char      : std_logic_vector(7 downto 0);
+    signal oled_ready     : std_logic;
+    signal oled_frames    : std_logic_vector(15 downto 0);
 
     -- ===== placeholder PL user logic ====================================
     signal heartbeat  : unsigned(27 downto 0) := (others => '0');
@@ -107,11 +121,39 @@ begin
         port map (
             reg_ps2pl_o   => reg_ps2pl,
             pl_active_o   => pl_active,
+            oled_ctrl_o      => oled_ctrl,
+            oled_stat_i      => oled_stat,
+            oled_char_addr_i => oled_char_addr,
+            oled_char_o      => oled_char,
             s_axi_aclk    => clk,
             s_axi_aresetn => resetn,
             s_axi_i       => ps_axi_o,
             s_axi_o       => ps_axi_i
         );
+
+    ---------------------------------------------------------------------------
+    -- SSD1306 OLED: shows the axi_regs text buffer ("Hello, Zynq Mini" at reset)
+    ---------------------------------------------------------------------------
+    u_oled : entity work.ssd1306_text
+        generic map (CLK_HZ => 100_000_000)        -- FCLK_CLK0 (scripts/config.tcl)
+        port map (
+            clk         => clk,
+            resetn      => resetn,
+            display_on  => oled_ctrl(0),
+            invert      => oled_ctrl(1),
+            flip        => oled_ctrl(2),
+            contrast    => oled_ctrl(15 downto 8),
+            char_addr_o => oled_char_addr,
+            char_i      => oled_char,
+            ready_o     => oled_ready,
+            frames_o    => oled_frames,
+            oled_sclk   => oled_sclk,
+            oled_sdin   => oled_sdin,
+            oled_dc     => oled_dc,
+            oled_res_n  => oled_res_n
+        );
+
+    oled_stat <= oled_frames & x"000" & "000" & oled_ready;
 
     ---------------------------------------------------------------------------
     -- placeholder PL user logic - replace it

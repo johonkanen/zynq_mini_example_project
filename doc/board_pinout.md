@@ -17,17 +17,19 @@ All PL I/O below is **`LVCMOS33`**. PS MIO peripherals are in
 | User LEDs `led[0..3]` | `W13` `V12` `U12` `T12` | `fpga_01_pl_led_stream` |
 | 4-pin header group (PWM / UART / EMIO-I²C) | `P15` `U15` `V15` `W15` | `arm_fpga_03` PWM = `ch1_n`/`ch1_p`/`ch2`/`ch3`; `fpga_08_uart` `rxd`=`P15` `txd`=`U15` |
 
-## OLED (0.96" SSD1306, bit-banged 4-wire)
+## OLED (0.96" SSD1306, 4-wire SPI)
 
-| Signal | Pin |
-|---|---|
-| `gpio_rtl_1` | `E19` |
-| `gpio_rtl_2` | `E18` |
-| `gpio_rtl_3` | `F16` |
-| `gpio_rtl_4` | `F17` |
+| Schematic net | SSD1306 pin | Function | Pin | top-level port |
+|---|---|---|---|---|
+| `OLED_D0`  | D0   | SCLK     | `E18` | `oled_sclk` |
+| `OLED_D1`  | D1   | SDIN     | `E19` | `oled_sdin` |
+| `OLED_DC`  | D/C# | 0 = command, 1 = data | `F16` | `oled_dc` |
+| `OLED_RST` | RES# | reset, active low | `F17` | `oled_res_n` |
 
-From `arm_fpga_08_pl_oled` (4× AXI-GPIO → DC / RES / SCLK / SDIN — confirm order
-against the board silk). `E18` is shared with HDMI_HPD below.
+From the schematic (page 12, J4 `OLED12864`): CS#, BS0, BS1, BS2, E/RD# and R/W#
+are tied to GND, so the panel is always selected and in 4-wire SPI mode. VBAT is
+3.3 V, so it needs the internal charge pump (`8D 14`). Driven by
+`src/hdl/ssd1306_text.vhd`. `E18` is also wired to HDMI_HPD below.
 
 ## HDMI out (TMDS straight from PL — no level-shifter/buffer chip)
 

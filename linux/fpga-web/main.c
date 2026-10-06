@@ -41,6 +41,8 @@ static const struct { uint32_t off; const char *name, *acc, *desc; } REGS[] = {
     { 0x14, "SUM",       "ro", "SCRATCH0 + SCRATCH1, added in the PL" },
     { 0x18, "STATUS",    "ro", "reductions / popcount / HEARTBEAT[15:0]" },
     { 0x1C, "SIGNATURE", "ro", "constant 0x5A5A1234" },
+    { 0x20, "OLED_CTRL", "rw", "bit0 on, bit1 invert, bit2 flip, [15:8] contrast" },
+    { 0x24, "OLED_STAT", "ro", "bit0 ready, [31:16] frames sent" },
 };
 #define NREGS (sizeof REGS / sizeof REGS[0])
 

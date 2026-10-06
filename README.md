@@ -25,10 +25,10 @@ AXI slave written in VHDL.
    |     +-- m_axi_i : axi_miso_t  /  the axi_pkg direction records
    |            v
    +-- u_axi_regs : axi_regs   <- AXI slave, 100% VHDL (src/hdl/axi_regs.vhd)
-   |            |
-   |     reg_ps2pl[127:0] / pl_active
-   |            v
-   +-- placeholder PL user logic  (counter on FCLK_CLK0 + the register bus)
+   |            |                    incl. OLED_CTRL + 128-char OLED_TEXT buffer
+   |     reg_ps2pl[127:0] / pl_active      |
+   |            v                          v
+   +-- placeholder PL user logic    +-- u_oled : ssd1306_text  -> SPI -> 0.96" OLED
 ```
 
 ## The board
@@ -45,7 +45,7 @@ mirror: [pvsm.ru/fpga/383315](https://www.pvsm.ru/fpga/383315)).
 | Ethernet | **two** gigabit RTL8211E PHYs: one on **PS GEM0 / MIO 16–27** (MDIO 52–53, PHY addr 0), one wired to the **PL fabric** (RGMII) |
 | USB | host on USB-C, ULPI PHY |
 | storage | microSD (SDIO0) + on-board eMMC (SDIO1) |
-| video / display | HDMI direct from PL GPIO (no companion chip); 128×64 OLED bit-banged from PL |
+| video / display | HDMI direct from PL GPIO (no companion chip); 128×64 SSD1306 OLED on PL pins (4-wire SPI) — driven by `ssd1306_text` |
 | clocks | PS 33.333 MHz + external 50 MHz oscillator to PL |
 | misc | I²C EEPROM, 5 LEDs, 3 buttons, 34 PL GPIO, on-board JTAG programmer, 3-way boot switch (JTAG / QSPI / SD) |
 
@@ -72,9 +72,12 @@ and its QMTech sibling, **including building Linux** — see [`doc/notes.md`](do
 | `src/hdl/axi_pkg.vhd`         | AXI bus **direction records** — `axi_mosi_t` (master→slave), `axi_miso_t` (slave→master), nested per channel |
 | `src/hdl/axi_regs.vhd`        | **VHDL AXI slave** for the raw M_AXI_GP0 (AXI3); port is `s_axi_i : axi_mosi_t` / `s_axi_o : axi_miso_t` |
 | `src/hdl/zynq_ps_wrapper.vhd` | wraps the block design; packs the flat `M_AXI_GP0_*` pins into `m_axi_o`/`m_axi_i` records |
-| `src/hdl/zynq_mini_top.vhd`   | **synthesis top** — just `u_ps` + `u_axi_regs` + user logic, PS↔PL bus is 2 record signals |
-| `src/constrs/zynq_mini.xdc`   | (empty — no external PL I/O in this design) |
+| `src/hdl/zynq_mini_top.vhd`   | **synthesis top** — `u_ps` + `u_axi_regs` + `u_oled` + user logic, PS↔PL bus is 2 record signals |
+| `src/hdl/ssd1306_text.vhd`    | **OLED driver** — SSD1306 reset/init + 16×8 text mode refreshed over SPI from the `axi_regs` text buffer |
+| `src/hdl/font8x8_pkg.vhd`     | 8×8 ASCII font ROM in SSD1306 column order (public-domain font8x8) |
+| `src/constrs/zynq_mini.xdc`   | OLED pins; every other PL pin of the board listed, commented out |
 | `sim/tb_axi_regs.vhd`         | VUnit testbench: AXI3 master BFM driving `axi_regs` |
+| `sim/tb_ssd1306_text.vhd`     | VUnit testbench: SPI panel model checking init, frame commands and rendered text |
 | `sim/run.py`                  | VUnit run script (NVC backend) |
 | `sw/`                         | **bare-metal bring-up test** — PS UART1 + PS↔PL AXI, JTAG only (`sw/README.md`) |
 | `linux/build-linux.sh`        | one-shot Buildroot Linux image build (`doc/linux_build.md`) |
@@ -115,12 +118,13 @@ Outputs in `output/`: `arm_fpga_zynq_mini.bit`, `arm_fpga_zynq_mini.xsa` (fixed
 platform, bitstream included — hand to Vitis; the `.xsa` records the M_AXI_GP0
 window at `0x4000_0000`–`0x7FFF_FFFF`), plus utilization / timing reports.
 
-## Simulate the AXI communication (VUnit + NVC)
+## Simulate the AXI communication and the OLED driver (VUnit + NVC)
 
 `sim/tb_axi_regs.vhd` contains a compact **AXI3 master bus-functional model**
 that drives `axi_regs` exactly as the Zynq `M_AXI_GP0` port would — address
 phase, data phase, write response, read data, transaction IDs and INCR/FIXED
-bursts — and self-checks the results.
+bursts — and self-checks the results. `sim/tb_ssd1306_text.vhd` puts a model of
+the SSD1306's SPI input on `ssd1306_text` and checks every byte it sends.
 
 ```
 pip install -r sim/requirements.txt      # vunit_hdl
@@ -135,7 +139,9 @@ python sim/run.py "*burst*"       # subset
 
 Cases: `signature`, `single_write_read`, `id_reflection` (BID/RID reflect
 AW/AR ID), `incr_burst_write_then_read`, `fixed_burst_write`, `pl_computes_sum`,
-`status_word`, `control_and_heartbeat`.
+`status_word`, `control_and_heartbeat`, `oled_ctrl_and_status`, `oled_text_buffer`;
+OLED driver: `init_sequence`, `first_frame_renders_text` (all 1024 display bytes
+vs. the text buffer through the font), `controls_apply_next_frame`, `reset_restarts`.
 
 ## Test the board — no SD card
 
@@ -156,8 +162,8 @@ on hardware — both `PASS`. Details in [`sw/README.md`](sw/README.md).
 
 ## Register map (`axi_regs`)
 
-The slave decodes AXI address bits `[4:2]` → 8 words, at the base of the
-`M_AXI_GP0` window (**`0x4000_0000`**). Anything on GP0 lands here; from
+The slave decodes AXI address bits `[7:2]` → 64 words (the map repeats every
+256 bytes), at the base of the `M_AXI_GP0` window (**`0x4000_0000`**). Anything on GP0 lands here; from
 bare-metal just use `0x40000000` (there is no `xparameters.h` entry because the
 slave is not a BD IP).
 
@@ -171,10 +177,40 @@ slave is not a BD IP).
 | `0x14` | SUM       | RO  | PL → PS | `SCRATCH0 + SCRATCH1`, added in the PL |
 | `0x18` | STATUS    | RO  | PL → PS | reductions/popcount of the scratch regs |
 | `0x1C` | SIGNATURE | RO  | PL → PS | constant `0x5A5A_1234` |
+| `0x20` | OLED_CTRL | R/W | PS → PL | bit0 display on, bit1 invert, bit2 flip 180°, bits[15:8] contrast; reset `0x0000_7F01` |
+| `0x24` | OLED_STAT | RO  | PL → PS | bit0 ready (init done), bits[31:16] frames sent |
+| `0x80`–`0xFC` | OLED_TEXT | R/W | PS → PL | 16×8 characters, 4 per word, little-endian |
+
+Other offsets read 0.
 
 `STATUS`: bit0 = `or SCRATCH0`, bit1 = `and SCRATCH1`, bit2 = `SCRATCH0 =
 SCRATCH1`, bit3 = `CONTROL(0)`, bits[15:8] = popcount(SCRATCH2), bits[31:16] =
 HEARTBEAT[15:0].
+
+## OLED (`ssd1306_text`)
+
+The board's 0.96" 128×64 SSD1306 OLED (J4) is driven **entirely from the PL**: no
+Linux driver, no GPIO bit-banging from software. The panel is strapped for 4-wire
+SPI with CS# tied low (schematic p.12), so the PL drives four pins — SCLK `E18`,
+SDIN `E19`, D/C# `F16`, RES# `F17`.
+
+After the bitstream loads, `ssd1306_text` pulses RES#, sends the init sequence
+(internal charge pump: VBAT is 3.3 V) and then redraws the whole display 30× a
+second at 5 MHz SCLK. Each frame renders the `OLED_TEXT` buffer through an 8×8 font:
+row *r* of text is display page *r*, so each glyph column is one SSD1306 data byte.
+The buffer resets to **"Hello, Zynq Mini"**, so the display says hello as soon as
+the PL is configured, with no software involved.
+
+Character *n* (row `n/16`, column `n%16`) is byte `n%4` of word `n/4`
+at `0x80`, so a string copied there reads left to right. From Linux, go
+through `fpgad` (it owns the PL):
+
+```sh
+fpgactl oled 0 "Hello, world"      # row 0..7, 16 characters, padded with spaces
+fpgactl oled clear
+fpgactl write 0x20 0x00FF0003      # on + inverted, full contrast
+fpgactl write 0x20 0x00007F05      # upright text if the panel is mounted upside down
+```
 
 Bare-metal smoke test:
 

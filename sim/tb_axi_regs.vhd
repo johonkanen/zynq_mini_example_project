@@ -36,6 +36,10 @@ architecture sim of tb_axi_regs is
     signal reg_ps2pl : std_logic_vector(127 downto 0);
     signal pl_active : std_logic;
 
+    signal oled_ctrl      : std_logic_vector(31 downto 0);
+    signal oled_char_addr : std_logic_vector(6 downto 0) := (others => '0');
+    signal oled_char      : std_logic_vector(7 downto 0);
+
     type slv32_array is array (natural range <>) of std_logic_vector(31 downto 0);
 
 begin
@@ -52,6 +56,8 @@ begin
     dut : entity work.axi_regs
         port map (
             reg_ps2pl_o => reg_ps2pl, pl_active_o => pl_active,
+            oled_ctrl_o => oled_ctrl, oled_stat_i => x"00070001",
+            oled_char_addr_i => oled_char_addr, oled_char_o => oled_char,
             s_axi_aclk => aclk, s_axi_aresetn => aresetn,
             s_axi_i => m2s, s_axi_o => s2m);
 
@@ -221,6 +227,42 @@ begin
                 axi_write(16#0C#, x"00000000");
                 axi_read(16#10#, r);
                 check(unsigned(r) < 40, "HEARTBEAT cleared by CONTROL(1)");
+
+            elsif run("oled_ctrl_and_status") then
+                axi_read(16#20#, r);
+                check_equal(r, std_logic_vector'(x"00007F01"), "OLED_CTRL reset: on, contrast 0x7F");
+                check_equal(oled_ctrl, std_logic_vector'(x"00007F01"), "oled_ctrl_o");
+                axi_write(16#20#, x"00001006");
+                tick(1);
+                check_equal(oled_ctrl, std_logic_vector'(x"00001006"), "oled_ctrl_o after write");
+                axi_read(16#24#, r);
+                check_equal(r, std_logic_vector'(x"00070001"), "OLED_STAT from oled_stat_i");
+                axi_write(16#24#, x"FFFFFFFF");                 -- read-only
+                axi_read(16#24#, r);
+                check_equal(r, std_logic_vector'(x"00070001"), "OLED_STAT ignores writes");
+
+            elsif run("oled_text_buffer") then
+                -- reset text: "Hello, Zynq Mini" in row 0, little-endian per word
+                axi_read(16#80#, r);
+                check_equal(r, std_logic_vector'(x"6C6C6548"), "OLED_TEXT word 0 = 'Hell'");
+                oled_char_addr <= std_logic_vector(to_unsigned(4, 7));
+                tick(1);
+                check_equal(oled_char, std_logic_vector'(x"6F"), "char 4 = 'o'");
+                -- burst write row 7 (chars 112..127 = words 28..31 = 0xF0..0xFC)
+                v4 := (x"64636261", x"68676665", x"6C6B6A69", x"706F6E6D");   -- "abcd...p"
+                axi_write_burst(16#F0#, v4);
+                oled_char_addr <= std_logic_vector(to_unsigned(127, 7));
+                tick(1);
+                check_equal(oled_char, std_logic_vector'(x"70"), "char 127 = 'p'");
+                axi_read_burst(16#F0#, 4, v4);
+                check_equal(v4(3), std_logic_vector'(x"706F6E6D"), "OLED_TEXT read back");
+                axi_write(16#80#, x"21216948");                 -- "Hi!!"
+                axi_read(16#80#, r);
+                check_equal(r, std_logic_vector'(x"21216948"), "OLED_TEXT word 0 rewritten");
+                axi_read(16#1C#, r);
+                check_equal(r, std_logic_vector'(x"5A5A1234"), "SIGNATURE unaffected");
+                axi_read(16#3C#, r);
+                check_equal(r, std_logic_vector'(x"00000000"), "unmapped word reads 0");
             end if;
         end loop;
 

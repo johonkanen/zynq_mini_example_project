@@ -22,10 +22,19 @@
 --   0x14  SUM        RO    PL -> PS   SCRATCH0 + SCRATCH1 (added in the PL)
 --   0x18  STATUS     RO    PL -> PS   reductions / popcount (see below)
 --   0x1C  SIGNATURE  RO    PL -> PS   constant 0x5A5A_1234
+--   0x20  OLED_CTRL  R/W   PS -> PL   SSD1306 controls (reset 0x0000_7F01)
+--   0x24  OLED_STAT  RO    PL -> PS   SSD1306 driver status
+--   0x80..0xFC OLED_TEXT R/W          16x8 character buffer, 4 chars per word
+--   anything else in 0x00..0xFF reads 0; the map repeats every 256 bytes
 --
 --   STATUS: bit0=or SCRATCH0, bit1=and SCRATCH1, bit2=(SCRATCH0=SCRATCH1),
 --           bit3=CONTROL(0), bits[15:8]=popcount(SCRATCH2),
 --           bits[31:16]=HEARTBEAT[15:0]
+--   OLED_CTRL: bit0=display on, bit1=invert, bit2=flip 180, bits[15:8]=contrast
+--   OLED_STAT: bit0=ready (init done), bits[31:16]=frames sent
+--   OLED_TEXT: char n (row n/16, column n mod 16) is byte n mod 4 of word
+--              n/4, little-endian - so a string memcpy'd to 0x80 reads left to
+--              right. Reset text: OLED_TEXT_RESET below ("Hello, Zynq Mini").
 -------------------------------------------------------------------------------
 
 library ieee;
@@ -40,6 +49,12 @@ entity axi_regs is
         reg_ps2pl_o   : out std_logic_vector(4*AXI_DATA_WIDTH-1 downto 0);
         pl_active_o   : out std_logic;
 
+        -- SSD1306 text display (ssd1306_text)
+        oled_ctrl_o      : out std_logic_vector(AXI_DATA_WIDTH-1 downto 0);
+        oled_stat_i      : in  std_logic_vector(AXI_DATA_WIDTH-1 downto 0);
+        oled_char_addr_i : in  std_logic_vector(6 downto 0);
+        oled_char_o      : out std_logic_vector(7 downto 0);
+
         -- AXI3 slave interface (connect straight to M_AXI_GP0)
         s_axi_aclk    : in  std_logic;
         s_axi_aresetn : in  std_logic;
@@ -52,12 +67,36 @@ architecture rtl of axi_regs is
 
     constant DW      : integer := AXI_DATA_WIDTH;
     constant REG_LSB : integer := 2;                       -- 32-bit word addressing
-    constant N_REGS  : integer := 8;
+    constant N_REGS  : integer := 64;                      -- 0x00..0xFF
+    constant IDX_OLED_CTRL : integer := 8;                 -- 0x20
+    constant IDX_OLED_STAT : integer := 9;                 -- 0x24
+    constant IDX_TEXT      : integer := 32;                -- 0x80..0xFC
 
     subtype word_t is std_logic_vector(DW-1 downto 0);
     type    word_array_t is array (natural range <>) of word_t;
 
-    signal regs : word_array_t(0 to 3) := (others => (others => '0'));   -- writable
+    constant OLED_CTRL_RESET : word_t := x"00007F01";      -- on, contrast 0x7F
+
+    -- 16 characters per row, packed little-endian into 4 words
+    function text_row(s : string) return word_array_t is
+        variable r : word_array_t(0 to 3) := (others => x"20202020");
+    begin
+        for i in 0 to s'length-1 loop
+            r(i/4)(8*(i mod 4)+7 downto 8*(i mod 4)) :=
+                std_logic_vector(to_unsigned(character'pos(s(s'low+i)), 8));
+        end loop;
+        return r;
+    end function;
+
+    constant OLED_TEXT_RESET : word_array_t(0 to 31) :=
+        text_row("Hello, Zynq Mini") & text_row("") &
+        text_row("SSD1306 driven") & text_row("from the PL") &
+        text_row("") & text_row("") &
+        text_row("") & text_row("fpgactl oled ...");
+
+    signal regs      : word_array_t(0 to 3) := (others => (others => '0'));   -- writable
+    signal oled_ctrl : word_t := OLED_CTRL_RESET;
+    signal text      : word_array_t(0 to 31) := OLED_TEXT_RESET;
 
     -- PL-side status sources
     signal heartbeat : unsigned(DW-1 downto 0) := (others => '0');
@@ -88,7 +127,7 @@ architecture rtl of axi_regs is
     -- helpers ---------------------------------------------------------------
     function reg_index(a : unsigned) return integer is
     begin
-        return to_integer(a(REG_LSB+2 downto REG_LSB));    -- 3 bits -> 0..7
+        return to_integer(a(REG_LSB+5 downto REG_LSB));    -- 6 bits -> 0..63
     end function;
 
     function next_addr(a : unsigned; size : std_logic_vector; burst : std_logic_vector)
@@ -117,6 +156,14 @@ begin
     ---------------------------------------------------------------------------
     reg_ps2pl_o <= regs(3) & regs(2) & regs(1) & regs(0);
     pl_active_o <= regs(3)(0);
+    oled_ctrl_o <= oled_ctrl;
+
+    oled_char_proc : process (all)
+        variable n : integer range 0 to 127;
+    begin
+        n := to_integer(unsigned(oled_char_addr_i));
+        oled_char_o <= text(n / 4)(8*(n mod 4)+7 downto 8*(n mod 4));
+    end process;
 
     sum_w <= std_logic_vector(unsigned(regs(0)) + unsigned(regs(1)));
 
@@ -162,16 +209,22 @@ begin
     s_axi_o.r.last  <= rlast_r;
     s_axi_o.r.valid <= rvalid_r;
 
-    with reg_index(rd_addr) select rd_word <=
-        regs(0)                        when 0,
-        regs(1)                        when 1,
-        regs(2)                        when 2,
-        regs(3)                        when 3,
-        std_logic_vector(heartbeat)    when 4,
-        sum_w                          when 5,
-        status_w                       when 6,
-        x"5A5A1234"                    when 7,
-        (others => '0')                when others;
+    rd_mux : process (all)
+        variable idx : integer range 0 to N_REGS-1;
+    begin
+        idx := reg_index(rd_addr);
+        case idx is
+            when 0 to 3        => rd_word <= regs(idx);
+            when 4             => rd_word <= std_logic_vector(heartbeat);
+            when 5             => rd_word <= sum_w;
+            when 6             => rd_word <= status_w;
+            when 7             => rd_word <= x"5A5A1234";
+            when IDX_OLED_CTRL => rd_word <= oled_ctrl;
+            when IDX_OLED_STAT => rd_word <= oled_stat_i;
+            when IDX_TEXT to N_REGS-1 => rd_word <= text(idx - IDX_TEXT);
+            when others        => rd_word <= (others => '0');
+        end case;
+    end process;
 
     ---------------------------------------------------------------------------
     -- AXI write channel
@@ -186,6 +239,8 @@ begin
                 wready_r  <= '0';
                 bvalid_r  <= '0';
                 regs      <= (others => (others => '0'));
+                oled_ctrl <= OLED_CTRL_RESET;
+                text      <= OLED_TEXT_RESET;
             else
                 case wr_state is
 
@@ -206,13 +261,17 @@ begin
                     when W_DATA =>
                         if s_axi_i.w.valid = '1' and wready_r = '1' then
                             idx := reg_index(wr_addr);
-                            if idx <= 3 then
-                                for b in s_axi_i.w.strb'range loop
-                                    if s_axi_i.w.strb(b) = '1' then
+                            for b in s_axi_i.w.strb'range loop
+                                if s_axi_i.w.strb(b) = '1' then
+                                    if idx <= 3 then
                                         regs(idx)(8*b+7 downto 8*b) <= s_axi_i.w.data(8*b+7 downto 8*b);
+                                    elsif idx = IDX_OLED_CTRL then
+                                        oled_ctrl(8*b+7 downto 8*b) <= s_axi_i.w.data(8*b+7 downto 8*b);
+                                    elsif idx >= IDX_TEXT then
+                                        text(idx - IDX_TEXT)(8*b+7 downto 8*b) <= s_axi_i.w.data(8*b+7 downto 8*b);
                                     end if;
-                                end loop;
-                            end if;
+                                end if;
+                            end loop;
                             wr_addr <= next_addr(wr_addr, wr_size, wr_burst);
                             if wr_beats = 1 or s_axi_i.w.last = '1' then
                                 wready_r <= '0';

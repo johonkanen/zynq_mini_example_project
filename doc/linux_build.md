@@ -526,6 +526,8 @@ your next process ───────────┘   (line protocol)        
 | `read <off>` | `ok 0x5a5a1234` |
 | `write <off> <value>` | `ok` |
 | `load <file>` | `ok operating` — reprogram the PL from `/lib/firmware/<file>` |
+| `oled <row> <text>` | `ok` — put up to 16 characters on OLED row 0–7 (rest of the line, spaces kept, padded) |
+| `oled clear` | `ok` — blank all 8 rows |
 | `stream <hz> <batch_hz> <off>...` | `ok streaming`, then `data {"t":[µs…],"v":[[…],…]}` per batch and `status {…}` on PL state changes, until the client disconnects |
 
 Errors are `err <message>`. Numbers are `0x…` or decimal; `<off>` is a byte offset
@@ -533,7 +535,7 @@ into the `axi_regs` window (`0x0`–`0xFFC`, 4-byte aligned).
 
 ### Web UI and HTTP API
 
-`http://<board-ip>/` shows a **register table** (all 8 `axi_regs` registers, refreshed
+`http://<board-ip>/` shows a **register table** (the named `axi_regs` registers, refreshed
 twice a second, with write fields for the R/W ones), a raw read/write row for any
 offset, and the live `HEARTBEAT` charts (PL clock derived from it ≈ 100 MHz).
 
@@ -559,6 +561,7 @@ fpgactl read 0x1c
 fpgactl write 0x00 0x12340000
 fpgactl load arm_fpga_zynq_mini.bit.bin # safe PL reload (blocks all access meanwhile)
 fpgactl stream 200 20 0x10              # Ctrl-C to stop
+fpgactl oled 3 "Hello from Linux"       # OLED text row 0..7 (the PL draws it)
 /etc/init.d/S96fpgad restart            # fpga-web reconnects on its own
 grep -E 'fpgad|fpga-web' /var/log/messages
 ```
@@ -586,7 +589,8 @@ As a Buildroot package: `FOO_DEPENDENCIES = fpgad` (copy
 ### Try it on a PC
 
 `FPGAD_SIM=1 fpgad -f -s /tmp/fpgad.sock` simulates `axi_regs` exactly as the VHDL
-behaves (SUM, STATUS bits, CONTROL bit 1 holding HEARTBEAT at 0, 100 MHz counter).
+behaves (SUM, STATUS bits, CONTROL bit 1 holding HEARTBEAT at 0, 100 MHz counter,
+OLED_CTRL / OLED_TEXT with the reset text).
 Then `FPGAD_SOCKET=/tmp/fpgad.sock fpga-web -p 8088 -f` (built natively against
 civetweb's `src/civetweb.c` with `-DNO_SSL`) and open `http://localhost:8088/`.
 

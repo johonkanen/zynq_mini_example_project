@@ -7,6 +7,7 @@
  *   fpgactl write 0x00 0x12340000
  *   fpgactl load arm_fpga_zynq_mini.bit.bin
  *   fpgactl stream 200 20 0x10         prints data/status lines until Ctrl-C
+ *   fpgactl oled 0 "Hello, world"      text on OLED row 0..7 (16 chars) / oled clear
  *   fpgactl raw "<request line>"
  *
  * -s <socket> or $FPGAD_SOCKET selects the socket (default /var/run/fpgad.sock).
@@ -24,6 +25,7 @@ static const struct { uint32_t off; const char *name, *acc; } REGS[] = {
     { 0x08, "SCRATCH2", "rw" }, { 0x0C, "CONTROL", "rw" },
     { 0x10, "HEARTBEAT", "ro" }, { 0x14, "SUM", "ro" },
     { 0x18, "STATUS", "ro" },   { 0x1C, "SIGNATURE", "ro" },
+    { 0x20, "OLED_CTRL", "rw" }, { 0x24, "OLED_STAT", "ro" },
 };
 
 static int usage(void)
@@ -31,7 +33,8 @@ static int usage(void)
     fprintf(stderr,
             "usage: fpgactl [-s socket] <command>\n"
             "  status | regs | read <off> | write <off> <val> | load <fw>\n"
-            "  stream <hz> <batch_hz> <off>... | raw \"<line>\"\n");
+            "  stream <hz> <batch_hz> <off>... | oled <row> <text> | oled clear\n"
+            "  raw \"<line>\"\n");
     return 2;
 }
 

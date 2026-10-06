@@ -3,7 +3,8 @@
 VUnit run script - simulation model of the PS <-> PL AXI communication.
 
 Compiles the hand-written VHDL AXI slave (src/hdl/axi_regs.vhd) plus its
-AXI3-master testbench and runs them with NVC.
+AXI3-master testbench, and the SSD1306 OLED driver (src/hdl/ssd1306_text.vhd)
+plus its SPI-panel testbench, and runs them with NVC.
 
     python sim/run.py                 # run all cases
     python sim/run.py -v              # verbose (per-check log)
@@ -31,7 +32,10 @@ lib = vu.add_library("lib")
 # block design and is not part of the unit sim.
 lib.add_source_files(ROOT / "src" / "hdl" / "axi_pkg.vhd")
 lib.add_source_files(ROOT / "src" / "hdl" / "axi_regs.vhd")
+lib.add_source_files(ROOT / "src" / "hdl" / "font8x8_pkg.vhd")
+lib.add_source_files(ROOT / "src" / "hdl" / "ssd1306_text.vhd")
 lib.add_source_files(ROOT / "sim" / "tb_axi_regs.vhd")
+lib.add_source_files(ROOT / "sim" / "tb_ssd1306_text.vhd")
 
 vu.set_sim_option("nvc.sim_flags", ["--ieee-warnings=off"])
 
