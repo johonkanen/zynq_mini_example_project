@@ -8,7 +8,7 @@
 # parts (default: all):
 #   kernel   output/images/uImage            -> SD boot partition  /uImage
 #   dtb      output/images/zynq-zynqmini.dtb -> SD boot partition  /system.dtb
-#   bit      output/arm_fpga_zynq_mini.bit   -> /lib/firmware, PL reloaded now
+#   bit      output/arm_fpga_zynq_mini.bit   -> /lib/firmware/*.bit.bin (via bit2bin.py), PL reloaded now
 #   web      fpga-webstream binary           -> /usr/bin, service restarted
 #   all      all of the above
 #
@@ -111,7 +111,10 @@ fi
 
 if want bit; then
     log "FPGA bitstream"
-    if push "$REPO/output/arm_fpga_zynq_mini.bit" /lib/firmware/arm_fpga_zynq_mini.bit; then
+    [ -f "$REPO/output/arm_fpga_zynq_mini.bit" ] || die "missing output/arm_fpga_zynq_mini.bit - run ./build.sh"
+    BINTMP=$(mktemp); trap 'rm -f "$BINTMP"; cleanup' EXIT
+    python3 "$REPO/linux/bit2bin.py" "$REPO/output/arm_fpga_zynq_mini.bit" "$BINTMP"
+    if push "$BINTMP" /lib/firmware/arm_fpga_zynq_mini.bit.bin; then
         # never reprogram the PL while fpga-webstream is reading its registers over GP0
         rsh "/etc/init.d/S97fpga-webstream stop >/dev/null 2>&1; /etc/init.d/S95fpga start; /etc/init.d/S97fpga-webstream start"
     fi

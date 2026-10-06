@@ -97,12 +97,19 @@ mkdir -p "$OV/rootfs/etc/init.d"
 cat > "$OV/rootfs/etc/init.d/S95fpga" <<'EOS'
 #!/bin/sh
 # Configure the PL via the Zynq FPGA manager so axi_regs (0x40000000) is live.
-BIT=/lib/firmware/arm_fpga_zynq_mini.bit
+# The manager wants a .bin (header stripped, 32-bit words byte-swapped - made
+# by linux/bit2bin.py at build time); it rejects a raw Vivado .bit (-EINVAL).
+BIT=/lib/firmware/arm_fpga_zynq_mini.bit.bin
 case "$1" in
 	start)
 		[ -f "$BIT" ] || { echo "PL: no $BIT, skipping"; exit 0; }
 		printf 'PL: loading %s ... ' "$(basename "$BIT")"
-		fpgautil -b "$BIT" >/dev/null 2>&1 && echo ok || echo FAILED ;;
+		if fpgautil -b "$BIT" >/dev/null 2>&1 &&
+		   [ "$(cat /sys/class/fpga_manager/fpga0/state)" = operating ]; then
+			echo ok
+		else
+			echo "FAILED ($(cat /sys/class/fpga_manager/fpga0/state))"
+		fi ;;
 	stop|restart|reload) ;;
 	*) echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
 esac
@@ -125,11 +132,14 @@ fi
 
 cat > "$OV/copy-bitstream.sh" <<EOS
 #!/bin/sh
-# Buildroot POST_BUILD hook (\$1 = TARGET_DIR): stage the bitstream into the rootfs.
+# Buildroot POST_BUILD hook (\$1 = TARGET_DIR): stage the bitstream into the
+# rootfs as the .bin the Zynq FPGA manager wants (see linux/bit2bin.py).
 set -e
+rm -f "\$1/lib/firmware/arm_fpga_zynq_mini.bit"
 if [ -f "$BIT" ]; then
-	install -D -m 0644 "$BIT" "\$1/lib/firmware/arm_fpga_zynq_mini.bit"
-	echo "post-build: staged \$(basename "$BIT") -> /lib/firmware"
+	mkdir -p "\$1/lib/firmware"
+	python3 "$REPO/linux/bit2bin.py" "$BIT" "\$1/lib/firmware/arm_fpga_zynq_mini.bit.bin"
+	echo "post-build: staged \$(basename "$BIT") -> /lib/firmware/arm_fpga_zynq_mini.bit.bin"
 else
 	echo "post-build: WARNING $BIT missing - PL will not auto-load" >&2
 fi

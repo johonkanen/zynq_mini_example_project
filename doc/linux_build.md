@@ -361,41 +361,38 @@ brings the PS↔PL AXI ports up), and `fpgautil` is in the rootfs
 A rootfs overlay stages the bitstream and a BusyBox init script loads it:
 
 ```
-board/zynqmini/overlay/
-├─ rootfs/etc/init.d/S95fpga        # fpgautil -b /lib/firmware/arm_fpga_zynq_mini.bit
-└─ copy-bitstream.sh                # POST_BUILD hook: output/*.bit -> target /lib/firmware
+<build dir>/overlay/
+├─ rootfs/etc/init.d/S95fpga  # fpgautil -b /lib/firmware/arm_fpga_zynq_mini.bit.bin
+└─ copy-bitstream.sh          # POST_BUILD hook: output/*.bit -> linux/bit2bin.py -> /lib/firmware/*.bit.bin
 ```
 
-`S95fpga`:
-```sh
-#!/bin/sh
-BIT=/lib/firmware/arm_fpga_zynq_mini.bit
-[ "$1" = start ] || exit 0
-[ -f "$BIT" ] || exit 0
-printf 'PL: loading %s ... ' "$(basename "$BIT")"
-fpgautil -b "$BIT" >/dev/null 2>&1 && echo ok || echo FAILED
-```
+**The FPGA manager needs a `.bin`, not the `.bit`.** Fed the raw Vivado `.bit`,
+the Zynq FPGA manager fails with `write init error: 0xffffffea` (`-EINVAL`) and
+the PL stays unconfigured (found on hardware). It wants the configuration data
+with the `.bit` header stripped and every 32-bit word byte-swapped.
+[`linux/bit2bin.py`](../linux/bit2bin.py) does that in pure Python, with output
+byte-identical to `bootgen -arch zynq -process_bitstream bin`, so the build
+doesn't need Vitis. `build-linux.sh` writes both scripts; `S95fpga`:
 
-`copy-bitstream.sh` (Buildroot passes `$1` = `TARGET_DIR`):
 ```sh
-#!/bin/sh
-install -D -m0644 /path/to/output/arm_fpga_zynq_mini.bit "$1/lib/firmware/arm_fpga_zynq_mini.bit"
+BIT=/lib/firmware/arm_fpga_zynq_mini.bit.bin
+fpgautil -b "$BIT" && [ "$(cat /sys/class/fpga_manager/fpga0/state)" = operating ]  # -> "ok" / "FAILED (<state>)"
 ```
 
 defconfig:
 ```make
-BR2_ROOTFS_OVERLAY="<abs>/board/zynqmini/overlay/rootfs"
-BR2_ROOTFS_POST_BUILD_SCRIPT="board/zynq/post-build.sh <abs>/board/zynqmini/overlay/copy-bitstream.sh"
+BR2_ROOTFS_OVERLAY="<build dir>/overlay/rootfs"
+BR2_ROOTFS_POST_BUILD_SCRIPT="board/zynq/post-build.sh <build dir>/overlay/copy-bitstream.sh"
 ```
 
-`fpgautil -b` takes the **raw Vivado `.bit`** on Zynq-7000 — the `zynq-fpga`
-driver skips the header and byte-swaps as needed. (Prefer a headerless `.bin`?
-Add `set_property STEPS.WRITE_BITSTREAM.ARGS.BIN_FILE true [get_runs impl_1]` to
-`scripts/build.tcl` and point the script at the `.bin`.)
+The `.bin` lands in **both** `rootfs.ext4` (SD) and `rootfs.cpio.uboot` (JTAG), so
+the PL comes up ~2 s into userspace either way. Check it with
+`cat /sys/class/fpga_manager/fpga0/state` → `operating`.
 
-The bitstream lands in **both** `rootfs.ext4` (SD) and `rootfs.cpio.uboot`
-(JTAG), so the PL comes up ~2 s into userspace either way. Boot log:
-`PL: loading arm_fpga_zynq_mini.bit ... ok`.
+> **Never read `0x4000_0000` while the PL isn't `operating`.** With no design
+> behind `M_AXI_GP0` the read never completes and the whole SoC hangs (this
+> happened during bring-up; only a JTAG `rst -system` or a power cycle recovers).
+> `fpga-webstream` checks the state and `SIGNATURE` before it touches anything.
 
 ### Load it earlier, from U-Boot (optional)
 
@@ -542,7 +539,7 @@ For day-to-day changes, push only what changed to a board that's up on the netwo
 |---|---|---|---|
 | `kernel` | `output/images/uImage` | SD p1 `/uImage` | reboot |
 | `dtb` | `output/images/zynq-zynqmini.dtb` | SD p1 `/system.dtb` | reboot |
-| `bit` | `output/arm_fpga_zynq_mini.bit` | `/lib/firmware/` | web server stopped, PL reloaded, restarted |
+| `bit` | `output/arm_fpga_zynq_mini.bit` → `bit2bin.py` | `/lib/firmware/*.bit.bin` | web server stopped, PL reloaded, restarted |
 | `web` | `fpga-webstream` | `/usr/bin/` | service restarted |
 
 - Unchanged files (same md5 on the board) are skipped; the board reboots only if
