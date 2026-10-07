@@ -8,6 +8,7 @@
  *   fpgactl load arm_fpga_zynq_mini.bit.bin
  *   fpgactl stream 200 20 0x10         prints data/status lines until Ctrl-C
  *   fpgactl oled 0 "Hello, world"      text on OLED row 0..7 (16 chars) / oled clear
+ *   fpgactl sensors                    XADC die temperature + supply rails
  *   fpgactl raw "<request line>"
  *
  * -s <socket> or $FPGAD_SOCKET selects the socket (default /var/run/fpgad.sock).
@@ -33,7 +34,7 @@ static int usage(void)
     fprintf(stderr,
             "usage: fpgactl [-s socket] <command>\n"
             "  status | regs | read <off> | write <off> <val> | load <fw>\n"
-            "  stream <hz> <batch_hz> <off>... | oled <row> <text> | oled clear\n"
+            "  stream <hz> <batch_hz> <off>... | oled <row> <text> | oled clear | sensors\n"
             "  raw \"<line>\"\n");
     return 2;
 }

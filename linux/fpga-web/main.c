@@ -5,6 +5,7 @@
  *   GET  /                    the page (index.html, compiled into the binary)
  *   GET  /uPlot.iife.min.js, /uPlot.min.css   vendored uPlot (vendor/, MIT)
  *   GET  /api/status          fpgad status JSON
+ *   GET  /api/sensors         XADC die temperature + supply rails: {"temp":45.1,"vccint":1.0,...}
  *   GET  /api/regs            all axi_regs registers: {"ok":true,"regs":[{...}]}
  *   GET  /api/reg?addr=0x1c   one register: {"ok":true,"addr":"0x1c","value":"0x5a5a1234"}
  *   POST /api/reg             addr=0x00&value=0x1234 (form body or query) -> {"ok":true}
@@ -168,6 +169,20 @@ static int status_handler(struct mg_connection *c, void *cb)
     return reply(c, 200, "%s", msg);
 }
 
+static int sensors_handler(struct mg_connection *c, void *cb)
+{
+    (void)cb;
+    struct fpgad_conn *f = open_fpgad(c);
+    if (!f)
+        return 503;
+    char msg[1024];
+    int rc = fpgad_request(f, "sensors", msg, sizeof msg);
+    fpgad_close(f);
+    if (rc != 0)
+        return reply_err(c, 503, rc < 0 ? "fpgad connection failed" : msg);
+    return reply(c, 200, "%s", msg);
+}
+
 static int regs_handler(struct mg_connection *c, void *cb)
 {
     (void)cb;
@@ -285,9 +300,11 @@ static int events_handler(struct mg_connection *c, void *cb)
  *                           "scope run <auto|normal|single> [key=value...]"   oscilloscope;
  *                               keys as fpgad's "capture" (src div trig edge level pre)
  *                           "scope stop"
+ *                           "sensors <hz>"   XADC readings rate, 0..50 (default 10, 0 = off)
  * server -> browser, text:  {"type":"stream","hz":200,"regs":[16,28]}  (re)started
  *                           {"type":"status",...}   fpgad status (same fields as /api/status)
  *                           {"type":"scope","state":"running|waiting|stopped"}
+ *                           {"type":"sensors","t":<unix ms>,"temp":45.1,"vccint":1.0,...}
  *                           {"type":"error","error":"..."}
  * server -> browser, binary, little-endian:
  *   register batch, one per ~40 ms:
@@ -324,6 +341,7 @@ struct ws_client {
     unsigned hz;                            /* 0 = stopped */
     int nregs;
     uint32_t regs[WS_MAX_REGS];
+    unsigned sensors_hz;                    /* XADC push rate, guarded by lock */
     int scope_mode;                         /* SCOPE_*, guarded by lock */
     unsigned scope_gen;                     /* bumped on every scope command */
     char scope_args[SCOPE_ARGS];            /* key=value... for fpgad "capture" */
@@ -393,6 +411,7 @@ static void *ws_thread(void *arg)
 {
     struct ws_client *w = arg;
     struct fpgad_conn *f = NULL;
+    struct fpgad_conn *fs = NULL;           /* separate connection for "sensors" */
     char *line = malloc(WS_LINE_MAX);
     double *t = malloc(sizeof(double) * WS_MAX_N);
     uint32_t *v = malloc(sizeof(uint32_t) * WS_MAX_N * WS_MAX_REGS);
@@ -403,7 +422,33 @@ static void *ws_thread(void *arg)
     if (!line || !t || !v || !bin)
         goto out;
 
+    uint64_t next_sensors = 0;
     while (!w->closing && !stopping) {
+        /* XADC readings, sensors_hz times a second (between stream batches) */
+        pthread_mutex_lock(&w->lock);
+        unsigned shz = w->sensors_hz;
+        pthread_mutex_unlock(&w->lock);
+        struct timespec now_ts;
+        clock_gettime(CLOCK_REALTIME, &now_ts);
+        uint64_t now_ms = (uint64_t)now_ts.tv_sec * 1000 + (uint64_t)now_ts.tv_nsec / 1000000;
+        if (shz && now_ms >= next_sensors) {
+            /* fixed schedule, so loop latency doesn't lower the rate; resync after a gap */
+            next_sensors = now_ms - next_sensors < 1000 / shz ? next_sensors + 1000 / shz
+                                                              : now_ms + 1000 / shz;
+            char msg[1024];
+            if (!fs)
+                fs = fpgad_open(fpgad_sock);
+            int rc = fs ? fpgad_request(fs, "sensors", msg, sizeof msg) : -1;
+            if (rc < 0) {
+                fpgad_close(fs);
+                fs = NULL;
+                next_sensors = now_ms + 1000;
+            } else if (rc == 0 && msg[0] == '{') {
+                if (ws_text(w, "{\"type\":\"sensors\",\"t\":%" PRIu64 ",%s", now_ms, msg + 1) < 0)
+                    break;
+            }
+        }
+
         pthread_mutex_lock(&w->lock);
         int changed = w->changed;
         if (changed) {
@@ -419,7 +464,7 @@ static void *ws_thread(void *arg)
             retry = 0;
         }
         if (!hz) {                          /* stopped */
-            usleep(100000);
+            usleep(20000);
             continue;
         }
         if (!f) {
@@ -448,7 +493,7 @@ static void *ws_thread(void *arg)
             if (ws_text(w, "{\"type\":\"stream\",\"hz\":%u,\"regs\":[%s]}", hz, list) < 0)
                 break;
         }
-        int n = fpgad_readline(f, line, WS_LINE_MAX, 100);
+        int n = fpgad_readline(f, line, WS_LINE_MAX, 20);
         if (n == 0)
             continue;
         if (n < 0) {                        /* fpgad restarted / died */
@@ -480,6 +525,7 @@ static void *ws_thread(void *arg)
     }
 out:
     fpgad_close(f);
+    fpgad_close(fs);
     free(line);
     free(t);
     free(v);
@@ -652,6 +698,7 @@ static void ws_ready(struct mg_connection *c, void *cb)
     if (!w)
         return;
     w->conn = c;
+    w->sensors_hz = 10;
     pthread_mutex_init(&w->lock, NULL);
     mg_set_user_connection_data(c, w);
     w->th_started = pthread_create(&w->th, NULL, ws_thread, w) == 0;
@@ -675,6 +722,17 @@ static int ws_data(struct mg_connection *c, int bits, char *data, size_t len, vo
     buf[len] = 0;
     if (!strncmp(buf, "scope ", 6)) {
         ws_scope_cmd(w, buf);
+        return 1;
+    }
+    if (!strncmp(buf, "sensors ", 8)) {
+        uint32_t shz;
+        if (parse_u32(buf + 8, &shz) || shz > 50) {
+            ws_error(w, "usage: sensors <hz 0..50>");
+        } else {
+            pthread_mutex_lock(&w->lock);
+            w->sensors_hz = shz;
+            pthread_mutex_unlock(&w->lock);
+        }
         return 1;
     }
     for (char *tok = strtok(buf, " \t\r\n"); tok && argc < (int)(sizeof argv / sizeof argv[0]);
@@ -772,6 +830,7 @@ int main(int argc, char **argv)
     mg_set_request_handler(ctx, "/events", events_handler, NULL);
     mg_set_request_handler(ctx, "/api/status", status_handler, NULL);
     mg_set_request_handler(ctx, "/api/regs", regs_handler, NULL);
+    mg_set_request_handler(ctx, "/api/sensors", sensors_handler, NULL);
     mg_set_request_handler(ctx, "/api/reg$", reg_handler, NULL);
     mg_set_request_handler(ctx, "/$", asset_handler, (void *)&ASSET_INDEX);
     mg_set_request_handler(ctx, "/index.html$", asset_handler, (void *)&ASSET_INDEX);

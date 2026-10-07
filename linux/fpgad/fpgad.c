@@ -27,6 +27,9 @@
  *          auto=0|1     force a trigger after the timeout (1) or reply "ok timeout" (0)
  *        Data: int16 little-endian, channel-major [ch][n], in time order; the
  *        trigger sample is number "pre".
+ *   sensors                       -> ok {"temp":45.12,"vccint":1.001,...}
+ *        Zynq XADC via the kernel's IIO driver (xilinx-xadc, PS-XADC interface):
+ *        die temperature in degC and the supply rails in V. Works without the PL.
  *   stream <hz> <batch_hz> <off>... -> ok streaming, then until disconnect:
  *        data {"t":[us,...],"v":[[r0,...],[r1,...]]}   one line per batch
  *        status {...}                                   when the PL state changes
@@ -681,6 +684,99 @@ out:
     pthread_mutex_unlock(&scope_lock);
 }
 
+/* ---- XADC sensors (kernel IIO driver) ------------------------------------- */
+
+/* IIO channels of xilinx-xadc-core.c worth showing; the VP/VN and VAUX inputs
+ * are unconnected on this board. value = (raw + offset) * scale / 1000 */
+static const struct { const char *key, *file; } SENSORS[] = {
+    { "temp",    "in_temp0" },              /* degC */
+    { "vccint",  "in_voltage0_vccint" },    /* V, PL core 1.0 */
+    { "vccaux",  "in_voltage1_vccaux" },    /* PL aux 1.8 */
+    { "vccbram", "in_voltage2_vccbram" },   /* BRAM 1.0 */
+    { "vccpint", "in_voltage3_vccpint" },   /* PS core 1.0 */
+    { "vccpaux", "in_voltage4_vccpaux" },   /* PS aux 1.8 */
+    { "vccoddr", "in_voltage5_vccoddr" },   /* DDR I/O 1.5 */
+};
+#define NSENSORS (sizeof SENSORS / sizeof SENSORS[0])
+
+static pthread_mutex_t xadc_lock = PTHREAD_MUTEX_INITIALIZER;
+static char xadc_dir[64];                   /* /sys/bus/iio/devices/iio:deviceN, "" = not found */
+static double xadc_scale[NSENSORS], xadc_offset[NSENSORS];
+
+static int read_double(const char *path, double *v)
+{
+    char buf[64];
+    if (read_sysfs(path, buf, sizeof buf) < 0 || !buf[0])
+        return -1;
+    *v = strtod(buf, NULL);
+    return 0;
+}
+
+/* find the xadc IIO device once and cache the (constant) scales and offsets */
+static int xadc_find(void)
+{
+    if (xadc_dir[0])
+        return 0;
+    glob_t gl;
+    char name[64], path[160];
+    if (glob("/sys/bus/iio/devices/iio:device*/name", 0, NULL, &gl) != 0)
+        return -1;
+    for (size_t i = 0; i < gl.gl_pathc && !xadc_dir[0]; i++)
+        if (read_sysfs(gl.gl_pathv[i], name, sizeof name) == 0 && strstr(name, "xadc")) {
+            size_t n = strlen(gl.gl_pathv[i]) - strlen("/name");
+            snprintf(xadc_dir, sizeof xadc_dir, "%.*s", (int)n, gl.gl_pathv[i]);
+        }
+    globfree(&gl);
+    if (!xadc_dir[0])
+        return -1;
+    for (size_t k = 0; k < NSENSORS; k++) {
+        snprintf(path, sizeof path, "%s/%s_scale", xadc_dir, SENSORS[k].file);
+        if (read_double(path, &xadc_scale[k]) < 0)
+            xadc_scale[k] = 0;                  /* channel missing: reported as null */
+        snprintf(path, sizeof path, "%s/%s_offset", xadc_dir, SENSORS[k].file);
+        if (read_double(path, &xadc_offset[k]) < 0)
+            xadc_offset[k] = 0;
+    }
+    logmsg(LOG_INFO, "XADC sensors at %s", xadc_dir);
+    return 0;
+}
+
+static void do_sensors(int fd)
+{
+    char out[512];
+    size_t o = (size_t)snprintf(out, sizeof out, "ok {");
+    pthread_mutex_lock(&xadc_lock);
+    if (sim) {
+        double t = (now_ns() - t0_ns) * 1e-9, nz = (rand() / (double)RAND_MAX - 0.5);
+        const double nominal[NSENSORS] = { 0, 1.0, 1.8, 1.0, 1.0, 1.8, 1.5 };
+        for (size_t k = 0; k < NSENSORS; k++) {
+            double v = k == 0 ? 44.0 + 2.5 * sin(t / 30.0) + 0.25 * nz
+                              : nominal[k] * (1.0 + 0.002 * nz);
+            o += (size_t)snprintf(out + o, sizeof out - o, "%s\"%s\":%.3f", k ? "," : "",
+                                  SENSORS[k].key, v);
+        }
+    } else if (xadc_find() < 0) {
+        pthread_mutex_unlock(&xadc_lock);
+        sendf(fd, "err no XADC IIO device (kernel CONFIG_XILINX_XADC, DT adc@f8007100)\n");
+        return;
+    } else {
+        for (size_t k = 0; k < NSENSORS; k++) {
+            char path[160];
+            double raw;
+            snprintf(path, sizeof path, "%s/%s_raw", xadc_dir, SENSORS[k].file);
+            if (!xadc_scale[k] || read_double(path, &raw) < 0)
+                o += (size_t)snprintf(out + o, sizeof out - o, "%s\"%s\":null", k ? "," : "",
+                                      SENSORS[k].key);
+            else
+                o += (size_t)snprintf(out + o, sizeof out - o, "%s\"%s\":%.3f", k ? "," : "",
+                                      SENSORS[k].key, (raw + xadc_offset[k]) * xadc_scale[k] / 1000.0);
+        }
+    }
+    pthread_mutex_unlock(&xadc_lock);
+    snprintf(out + o, sizeof out - o, "}\n");
+    sendf(fd, "%s", out);
+}
+
 /* ---- OLED text ----------------------------------------------------------- */
 
 /* write one 16-character row of the OLED text buffer (padded with spaces,
@@ -861,8 +957,10 @@ static void handle_line(int fd, char *line)
         do_stream(fd, argv, argc);
     } else if (!strcmp(argv[0], "capture")) {
         do_capture(fd, argv, argc);
+    } else if (!strcmp(argv[0], "sensors")) {
+        do_sensors(fd);
     } else {
-        sendf(fd, "err unknown command '%s' (ping status read write load stream oled capture)\n",
+        sendf(fd, "err unknown command '%s' (ping status read write load stream oled capture sensors)\n",
               argv[0]);
     }
 }

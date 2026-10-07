@@ -528,6 +528,7 @@ your next process ───────────┘   (line protocol)        
 | `load <file>` | `ok operating` — reprogram the PL from `/lib/firmware/<file>` |
 | `oled <row> <text>` | `ok` — put up to 16 characters on OLED row 0–7 (rest of the line, spaces kept, padded) |
 | `oled clear` | `ok` — blank all 8 rows |
+| `sensors` | `ok {"temp":45.12,"vccint":1.001,"vccaux":1.799,"vccbram":1.0,"vccpint":1.0,"vccpaux":1.8,"vccoddr":1.5}` — Zynq **XADC** read through the kernel's IIO driver (`xilinx-xadc`, the PS-XADC interface, `adc@f8007100` in the DT): die temperature in °C, supply rails in V. Doesn't need the PL. |
 | `capture [key=value…]` | one oscilloscope acquisition: `ok capture {"n":4096,"ch":4,"pre":…,"div":…,"fs":…,"triggered":…,"bytes":32768}` followed by **32768 raw bytes**: int16 little-endian, channel-major, in time order, trigger at sample `pre`. Keys (others keep their register value): `src=a,b,c,d` (0–15) `div=1..100000` `trig=0..3` `edge=rise\|fall` `level=-32768..32767` `pre=0..4095` `timeout=0..5000` (ms to wait for a trigger) `auto=0\|1` (force a trigger after the timeout, or reply `ok timeout`). One capture at a time; a client that hangs up aborts its capture. |
 | `stream <hz> <batch_hz> <off>...` | `ok streaming`, then `data {"t":[µs…],"v":[[…],…]}` per batch and `status {…}` on PL state changes, until the client disconnects |
 
@@ -541,7 +542,14 @@ into the `axi_regs` window (`0x0`–`0xFFFC`, 4-byte aligned; registers below
 
 `http://<board-ip>/` shows a **register table** (the named `axi_regs` registers, refreshed
 twice a second, with write fields for the R/W ones), a raw read/write row for any
-offset, an **oscilloscope**, and a **live plot**.
+offset, the **die temperature**, an **oscilloscope**, and a **live plot**.
+
+The **die temperature** section plots the XADC temperature against wall-clock time
+(1–60 min window, 1–20 readings/s), with current, min and max values and the six
+supply rails next to their nominal voltages. The readings come over the same
+WebSocket as `{"type":"sensors",…}` text messages (`sensors <hz>` sets the rate,
+0 turns them off; default 10). The chart uses the browser's clock: the board has no
+RTC or NTP, so its own time (the message's `t`) starts at 1970 on every boot.
 
 The **oscilloscope** shows the PL capture (README, "Oscilloscope"): 4 channels on a
 10 × 8 division screen with per-channel source, counts/div and offset; time/div
@@ -568,6 +576,8 @@ one fpgad `stream` per connection and repacks fpgad's text batches:
 | board → browser | text | `{"type":"stream","hz":…,"regs":[…]}` when a stream (re)starts, `{"type":"status",…}` (as `/api/status`), `{"type":"error","error":"…"}` |
 | board → browser | binary | one per batch (~25/s), little-endian: `u8 type=1, u8 nregs, u16 0, u32 n` · `f64 t[n]` (µs) · `u32 v[nregs][n]`, so the browser maps them straight onto a `Float64Array` and `Uint32Array`s |
 | browser → board | text | `scope run <auto\|normal\|single> [key=value…]` (keys as fpgad `capture`: `src div trig edge level pre`), `scope stop` |
+| browser → board | text | `sensors <hz>` — XADC rate, 0–50 (default 10, 0 = off) |
+| board → browser | text | `{"type":"sensors","t":<unix ms>,"temp":…,"vccint":…,…}` |
 | board → browser | text | `{"type":"scope","state":"running\|waiting\|stopped"}` |
 | board → browser | binary | one per capture (≤ 30/s): `u8 type=2, u8 nch, u16 flags (bit0 triggered), u32 n, u32 pre, u32 div, f64 fs` (24 bytes) · `i16 v[nch][n]` in time order |
 
@@ -580,6 +590,7 @@ civetweb, and `update-board.sh web` pushes `libcivetweb` along with `fpga-web`.
 
 ```bash
 curl http://<ip>/api/status
+curl http://<ip>/api/sensors                            # XADC temperature + rails
 curl http://<ip>/api/regs                               # all registers, named
 curl "http://<ip>/api/reg?addr=0x1c"                    # read
 curl -X POST -d 'addr=0x00&value=0x12340000' http://<ip>/api/reg   # write
@@ -601,6 +612,7 @@ fpgactl write 0x00 0x12340000
 fpgactl load arm_fpga_zynq_mini.bit.bin # safe PL reload (blocks all access meanwhile)
 fpgactl stream 200 20 0x10              # Ctrl-C to stop
 fpgactl oled 3 "Hello from Linux"       # OLED text row 0..7 (the PL draws it)
+fpgactl sensors                         # XADC die temperature + supply rails
 /etc/init.d/S96fpgad restart            # fpga-web reconnects on its own
 grep -E 'fpgad|fpga-web' /var/log/messages
 ```
