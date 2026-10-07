@@ -9,7 +9,7 @@
 #   kernel   output/images/uImage            -> SD boot partition  /uImage
 #   dtb      output/images/zynq-zynqmini.dtb -> SD boot partition  /system.dtb
 #   bit      output/arm_fpga_zynq_mini.bit   -> /lib/firmware/*.bit.bin (via bit2bin.py), PL reloaded now
-#   fpgad    fpgad + fpgactl                 -> /usr/sbin, /usr/bin; fpgad restarted
+#   fpgad    fpgad + fpgactl + oled-status   -> /usr/sbin, /usr/bin, /etc/init.d; restarted
 #   web      fpga-web + libcivetweb          -> /usr/bin, /usr/lib; service restarted
 #   all      all of the above
 #
@@ -135,6 +135,11 @@ if want fpgad; then
     if push "$BR/target/usr/sbin/fpgad" /usr/sbin/fpgad 755; then
         rsh "/etc/init.d/S96fpgad restart"    # clients (fpga-web) reconnect on their own
     fi
+    # IP + temperature on the OLED (an fpgad client)
+    st=0
+    push "$BR/target/usr/bin/oled-status" /usr/bin/oled-status 755 && st=1
+    push "$BR/target/etc/init.d/S98oled-status" /etc/init.d/S98oled-status 755 && st=1
+    [ "$st" = 0 ] || rsh "/etc/init.d/S98oled-status restart"
 fi
 
 if want web; then

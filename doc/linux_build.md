@@ -514,6 +514,11 @@ your next process ───────────┘   (line protocol)        
 - **`fpga-web`** ([`linux/fpga-web/`](../linux/fpga-web/)) is the web UI on port 80
   (civetweb). It never maps the hardware; every request is an `fpgad` request.
   Started by `S97fpga-web`.
+- **`oled-status`** (`S98oled-status`) is a busybox shell loop on `fpgactl`: every
+  2 s it writes the board's IP address to OLED row 6 and the XADC die temperature
+  to row 7 (`no network` until DHCP is done). Rewriting each time also restores the
+  rows after a PL reload or fpgad restart. Interval: `/etc/default/oled-status`
+  (`INTERVAL=`).
 - **`fpgactl`** is the shell client; **`libfpgad-client.a` + `fpgad_client.h`**
   are in Buildroot's staging dir for new client processes.
 
@@ -613,6 +618,7 @@ fpgactl load arm_fpga_zynq_mini.bit.bin # safe PL reload (blocks all access mean
 fpgactl stream 200 20 0x10              # Ctrl-C to stop
 fpgactl oled 3 "Hello from Linux"       # OLED text row 0..7 (the PL draws it)
 fpgactl sensors                         # XADC die temperature + supply rails
+/etc/init.d/S98oled-status stop         # OLED rows 6/7 (IP, temperature) stop updating
 /etc/init.d/S96fpgad restart            # fpga-web reconnects on its own
 grep -E 'fpgad|fpga-web' /var/log/messages
 ```

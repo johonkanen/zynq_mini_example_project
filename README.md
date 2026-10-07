@@ -235,6 +235,11 @@ fpgactl write 0x20 0x00FF0003      # on + inverted, full contrast
 fpgactl write 0x20 0x00007F05      # upright text if the panel is mounted upside down
 ```
 
+On the Linux image, `oled-status` (init script `S98oled-status`, an fpgad client)
+keeps **row 6 = the board's IP address** and **row 7 = the XADC die temperature**
+up to date every 2 s, so you can read the address off the board after a reboot.
+Stop it with `/etc/init.d/S98oled-status stop` to use those rows yourself.
+
 ## Oscilloscope (`scope_capture`)
 
 Four 16-bit channels, 4096 samples each, captured in the PL and shown in the web

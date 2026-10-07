@@ -1,0 +1,24 @@
+#!/bin/sh
+#
+# oled-status - the board's IP address and the XADC die temperature on the OLED,
+# rows 6 and 7, refreshed every few seconds. An fpgad client like any other: it
+# only talks to fpgad through fpgactl. Rewriting every time also restores the
+# rows after a PL reload or an fpgad restart (both reset the OLED text).
+#
+#   oled-status [interval_s]        default 2
+#
+INTERVAL=${1:-2}
+
+# sleep in the background and wait for it: a signal interrupts "wait" at once,
+# while a foreground sleep would delay it until the sleep ends
+trap 'kill $! 2>/dev/null; exit 0' TERM INT
+
+while :; do
+	ip=$(ip -4 -o addr show dev eth0 2>/dev/null | sed -n 's/.* inet \([0-9.]*\)\/.*/\1/p' | head -n 1)
+	t=$(fpgactl sensors 2>/dev/null | sed -n 's/.*"temp":\([-0-9.]*\).*/\1/p')
+	[ -n "$t" ] && t=$(awk -v t="$t" 'BEGIN { printf "%.1f", t }')
+	fpgactl oled 6 "${ip:-no network}" >/dev/null 2>&1
+	fpgactl oled 7 "die temp ${t:-?} C" >/dev/null 2>&1
+	sleep "$INTERVAL" &
+	wait $!
+done

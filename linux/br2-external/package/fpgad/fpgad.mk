@@ -22,10 +22,12 @@ endef
 define FPGAD_INSTALL_TARGET_CMDS
 	$(INSTALL) -D -m 0755 $(@D)/fpgad $(TARGET_DIR)/usr/sbin/fpgad
 	$(INSTALL) -D -m 0755 $(@D)/fpgactl $(TARGET_DIR)/usr/bin/fpgactl
+	$(INSTALL) -D -m 0755 $(@D)/oled-status $(TARGET_DIR)/usr/bin/oled-status
 endef
 
 define FPGAD_INSTALL_INIT_SYSV
 	$(INSTALL) -D -m 0755 $(FPGAD_PKGDIR)/S96fpgad $(TARGET_DIR)/etc/init.d/S96fpgad
+	$(INSTALL) -D -m 0755 $(FPGAD_PKGDIR)/S98oled-status $(TARGET_DIR)/etc/init.d/S98oled-status
 endef
 
 $(eval $(generic-package))
