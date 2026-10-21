@@ -6,15 +6,19 @@
 #   1. FPGA .xsa/.bit           (scripts/build.tcl, only if missing)
 #   2. ps7_init_gpl.{c,h}       (unzip from the .xsa + patch K&R prototypes)
 #   3. Buildroot checkout       (pinned, shallow clone)
-#   4. rootfs overlay           (S95fpga -> fpgautil loads the PL at boot,
-#                                root's SSH authorized_keys)
-#      + BR2_EXTERNAL linux/br2-external: fpgad (owns the FPGA) + fpga-web (web UI)
+#   4. rootfs overlay           (RAUC config + keyring, the first FPGA design
+#                                in /data/pl/good, root's SSH authorized_keys)
+#      + BR2_EXTERNAL linux/br2-external: fpgad (owns the FPGA, loads designs
+#        through device-tree overlays) + fpga-web (web UI)
+#      + RAUC signing keys, created once in <build dir>/rauc-keys (not in the repo)
 #   5. configs/zynqmini_defconfig  (zynq_zed_defconfig + board-specific deltas)
 #   6. make                     (clean PATH so Buildroot tolerates WSL)
 #
 # Outputs: <build dir>/buildroot/output/images/
 #   sdcard.img            - dd to a card, boot switch = SD
 #   u-boot uImage zynq-zynqmini.dtb rootfs.cpio.uboot - JTAG path (step 9)
+# FPGA updates afterwards: linux/make-pl-bundle.sh + update-board.sh pl
+#   (doc/network_update.md)
 #
 # Overridable via env:
 #   LINUX_BUILD_DIR   where Buildroot lives   (default: <repo>/../zynqmini-linux)
@@ -51,7 +55,7 @@ die()  { printf '\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 
 #--- 0. host prerequisites --------------------------------------------------
 missing=
-for t in git make gcc g++ wget cpio unzip rsync bc flex bison perl file which; do
+for t in git make gcc g++ wget cpio unzip rsync bc flex bison perl file which openssl python3; do
     command -v "$t" >/dev/null 2>&1 || missing="$missing $t"
 done
 [ -z "$missing" ] || die "missing host tools:$missing"
@@ -94,28 +98,51 @@ fi
 #--- 4. rootfs overlay: load the PL bitstream at boot -------------------
 log "Writing rootfs overlay ($OV)"
 mkdir -p "$OV/rootfs/etc/init.d"
-cat > "$OV/rootfs/etc/init.d/S95fpga" <<'EOS'
+# The PL is loaded by fpgad now (device-tree overlay + bitstream from /data/pl/good,
+# doc/network_update.md); the old fpga_manager-sysfs loader is gone.
+rm -f "$OV/rootfs/etc/init.d/S95fpga"
+
+# RAUC: config, post-install handler, keyring (the CA certificate only), and the
+# directories it expects to exist. /data is a directory on the rootfs for now;
+# phase 3 makes it a partition.
+KEYS="$LINUX_BUILD_DIR/rauc-keys"
+if [ ! -f "$KEYS/signing.key.pem" ]; then
+    log "Creating development RAUC signing keys in $KEYS (keep them off the repo)"
+    mkdir -p "$KEYS" && chmod 700 "$KEYS"
+    ( cd "$KEYS"
+      openssl req -x509 -newkey rsa:4096 -nodes -days 3650 -keyout ca.key.pem -out ca.cert.pem \
+          -subj "/O=zynq-mini/CN=zynq-mini development CA" \
+          -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" 2>/dev/null
+      openssl req -newkey rsa:4096 -nodes -keyout signing.key.pem -out signing.csr.pem \
+          -subj "/O=zynq-mini/CN=zynq-mini development signing" 2>/dev/null
+      printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=critical,codeSigning\n' > leaf.ext
+      openssl x509 -req -in signing.csr.pem -CA ca.cert.pem -CAkey ca.key.pem -CAcreateserial \
+          -days 3650 -extfile leaf.ext -out signing.cert.pem 2>/dev/null
+      rm -f signing.csr.pem leaf.ext
+      chmod 600 ca.key.pem signing.key.pem )
+fi
+mkdir -p "$OV/rootfs/etc/rauc" "$OV/rootfs/usr/lib/rauc" "$OV/rootfs/data/rauc/pl" "$OV/rootfs/data/pl"
+cp "$REPO/linux/rauc/system.conf" "$OV/rootfs/etc/rauc/system.conf"
+cp "$KEYS/ca.cert.pem" "$OV/rootfs/etc/rauc/keyring.pem"
+install -m 0755 "$REPO/linux/rauc/post-install.sh" "$OV/rootfs/usr/lib/rauc/post-install.sh"
+
+# Fixed MAC for eth0, set before networking starts. U-Boot invents a random
+# ethaddr on every boot (and patches it into the DT), so the DHCP address kept
+# changing - awkward for SSH and for updates. 02:... = locally administered.
+# A second board needs its own: put ETHADDR=02:.. in /etc/default/ethaddr.
+cat > "$OV/rootfs/etc/init.d/S38ethaddr" <<'EOS'
 #!/bin/sh
-# Configure the PL via the Zynq FPGA manager so axi_regs (0x40000000) is live.
-# The manager wants a .bin (header stripped, 32-bit words byte-swapped - made
-# by linux/bit2bin.py at build time); it rejects a raw Vivado .bit (-EINVAL).
-# Loaded through sysfs directly, not fpgautil: fpgautil deletes
-# /lib/firmware/<name> after loading, i.e. our only copy.
-FW=arm_fpga_zynq_mini.bit.bin
-MGR=/sys/class/fpga_manager/fpga0
+ETHADDR=02:5a:4d:00:00:01
+[ -r /etc/default/ethaddr ] && . /etc/default/ethaddr
 case "$1" in
 	start)
-		[ -f "/lib/firmware/$FW" ] || { echo "PL: no /lib/firmware/$FW, skipping"; exit 0; }
-		printf 'PL: loading %s ... ' "$FW"
-		echo 0 > "$MGR/flags"                   # full bitstream
-		echo "$FW" > "$MGR/firmware" 2>/dev/null
-		state=$(cat "$MGR/state")
-		[ "$state" = operating ] && echo ok || echo "FAILED ($state)" ;;
+		ip link set dev eth0 down 2>/dev/null
+		ip link set dev eth0 address "$ETHADDR" && echo "eth0: MAC $ETHADDR" ;;
 	stop|restart|reload) ;;
 	*) echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
 esac
 EOS
-chmod +x "$OV/rootfs/etc/init.d/S95fpga"
+chmod +x "$OV/rootfs/etc/init.d/S38ethaddr"
 
 # Zero devcfg.MULTIBOOT_ADDR at boot so a soft reboot always finds BOOT.BIN
 # (see the script's header and doc/linux_build.md 'Soft reboot').
@@ -160,16 +187,17 @@ fi
 
 cat > "$OV/copy-bitstream.sh" <<EOS
 #!/bin/sh
-# Buildroot POST_BUILD hook (\$1 = TARGET_DIR): stage the bitstream into the
-# rootfs as the .bin the Zynq FPGA manager wants (see linux/bit2bin.py).
+# Buildroot POST_BUILD hook (\$1 = TARGET_DIR): stage the FPGA design as the
+# first "good" design fpgad loads at boot (bitstream + overlay + manifest,
+# the same tree a PL bundle installs - linux/make-pl-bundle.sh).
 set -e
-rm -f "\$1/lib/firmware/arm_fpga_zynq_mini.bit"
+rm -f "\$1/lib/firmware/arm_fpga_zynq_mini.bit" "\$1/lib/firmware/arm_fpga_zynq_mini.bit.bin"
+rm -f "\$1/etc/init.d/S95fpga"      # replaced by fpgad's own boot-time load
+rm -rf "\$1/data/pl/good"
 if [ -f "$BIT" ]; then
-	mkdir -p "\$1/lib/firmware"
-	python3 "$REPO/linux/bit2bin.py" "$BIT" "\$1/lib/firmware/arm_fpga_zynq_mini.bit.bin"
-	echo "post-build: staged \$(basename "$BIT") -> /lib/firmware/arm_fpga_zynq_mini.bit.bin"
+	LINUX_BUILD_DIR="$LINUX_BUILD_DIR" "$REPO/linux/make-pl-bundle.sh" --tree "\$1/data/pl/good"
 else
-	echo "post-build: WARNING $BIT missing - PL will not auto-load" >&2
+	echo "post-build: WARNING $BIT missing - no FPGA design in the image" >&2
 fi
 # fpga-webstream was replaced by fpgad + fpga-web: drop its leftovers from an
 # existing target tree (Buildroot never removes files of a dropped package)
@@ -204,6 +232,9 @@ BR2_PACKAGE_DROPBEAR=y
 BR2_PACKAGE_DROPBEAR_DISABLE_REVERSEDNS=y
 BR2_PACKAGE_FPGAD=y
 BR2_PACKAGE_FPGA_WEB=y
+BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="$REPO/linux/kernel-rauc.config"
+BR2_PACKAGE_RAUC=y
+BR2_PACKAGE_HOST_RAUC=y
 EOS
 
 #--- 6. build (clean PATH: Buildroot rejects the WSL Windows PATH) ------
@@ -213,6 +244,9 @@ env -i HOME="$HOME" PATH="$CLEAN_PATH" TERM="${TERM:-xterm}" \
              { [ ! -d output/build/ifupdown-scripts ] || make ifupdown-scripts-reinstall; } && \
              { [ ! -f output/images/zynq-zynqmini.dtb ] || [ ! '$DTS' -nt output/images/zynq-zynqmini.dtb ] \
                || make linux-rebuild; } && \
+             { ! ls output/build/linux-custom/.config >/dev/null 2>&1 || \
+               [ ! '$REPO/linux/kernel-rauc.config' -nt output/build/linux-custom/.config ] \
+               || make linux-reconfigure; } && \
              { ! ls output/target/usr/lib/libcivetweb.so.1.* >/dev/null 2>&1 || \
                grep -aq 258EAFA5 output/target/usr/lib/libcivetweb.so.1.* || make civetweb-dirclean; } && \
              { [ ! -d output/build/fpgad-1.0 ] || make fpgad-rebuild; } && \
@@ -224,6 +258,8 @@ env -i HOME="$HOME" PATH="$CLEAN_PATH" TERM="${TERM:-xterm}" \
 #  - the custom DTS is copied into the kernel tree only during the linux build
 #    -> linux-rebuild when the repo DTS is newer than the built .dtb
 #  - fpgad / fpga-web are local-source packages -> rebuild to pick up source edits
+#  - the kernel config fragment is merged only at configure time -> linux-reconfigure
+#    when linux/kernel-rauc.config is newer than the kernel's .config
 #  - civetweb built before fpga-web.mk turned on WITH_WEBSOCKET lacks the
 #    WebSocket handshake (its RFC 6455 GUID 258EAFA5-...) -> dirclean, rebuilt
 

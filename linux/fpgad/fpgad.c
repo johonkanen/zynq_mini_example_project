@@ -1,20 +1,33 @@
 /*
  * fpgad - the one process that touches the FPGA.
  *
- * Owns the axi_regs window (M_AXI_GP0 @ 0x4000_0000, via UIO) and the FPGA
- * manager. Everything else - the web server (fpga-web), fpgactl, future
- * processes - talks to fpgad over a UNIX socket and never maps the PL itself.
- * That keeps the safety rules in one place:
- *   - registers are accessed only while the PL is "operating" and SIGNATURE
- *     reads 0x5A5A1234 (a GP0 read with no PL design behind it hangs the SoC)
- *   - "load" reprograms the PL with every other access blocked meanwhile
+ * Owns the PL: loads FPGA designs (bitstream + device-tree overlay, see
+ * doc/network_update.md) and owns the axi_regs window they bring (M_AXI_GP0 @
+ * 0x4000_0000, via UIO). Everything else - the web server (fpga-web), fpgactl,
+ * future processes - talks to fpgad over a UNIX socket and never maps the PL
+ * itself. That keeps the safety rules in one place:
+ *   - registers are accessed only while the loaded design passed its checks
+ *     (SIGNATURE 0x5A5A1234, BUILD_ID as in its manifest, a known REGMAP); a
+ *     GP0 read with no working design behind it hangs the SoC
+ *   - loading a design blocks every other access meanwhile
+ *   - a new design is loaded as a trial and kept only if it passes; otherwise
+ *     the last good design (/data/pl/good) is loaded again. A reset during a
+ *     trial (the design hung the bus -> hardware watchdog) also ends up on the
+ *     good design at the next start.
+ *   - the hardware watchdog (/dev/watchdog) is kicked only after a register
+ *     read returned, so a bus hang resets the board instead of needing JTAG
  *
  * Protocol (one request line in, one response line out; text, '\n'-ended):
  *   ping                          -> ok pong
  *   status                        -> ok {"ok":true,"pl":"operating",...}
  *   read <off>                    -> ok 0x0000abcd
  *   write <off> <value>           -> ok
- *   load <firmware-file>          -> ok operating      (file in /lib/firmware)
+ *   activate [<dir>]              -> ok {design...}    trial-load a design tree
+ *        (default /data/rauc/pl/design, where RAUC installs PL bundles):
+ *        zynq-mini-pl.bit.bin + zynq-mini-pl.dtbo + manifest.json. Kept as the
+ *        good design if it passes, else the good one is reloaded (err ...).
+ *   load <dir>                    -> same as activate
+ *   pl                            -> ok {"loaded":true,"version":...,"build_id":...}
  *   oled <row> <text>             -> ok                (OLED row 0..7, 16 chars;
  *                                     the rest of the line, spaces kept)
  *   oled clear                    -> ok
@@ -44,6 +57,7 @@
 #include <fcntl.h>
 #include <glob.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <math.h>
 #include <poll.h>
 #include <pthread.h>
@@ -53,7 +67,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <linux/watchdog.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -66,6 +83,8 @@
 #define FIRMWARE_DIR    "/lib/firmware"
 #define UIO_NAME        "axi_regs"
 #define REG_HEARTBEAT   0x10
+#define REG_BUILD_ID    0x28
+#define REG_REGMAP      0x2C
 #define REG_SIGNATURE   0x1C
 #define SIGNATURE_VALUE 0x5A5A1234u
 #define REG_OLED_CTRL   0x20
@@ -92,7 +111,7 @@
 #define MAX_STREAM_REGS 8
 
 static volatile sig_atomic_t stopping;
-static int sim, foreground;
+static int sim, foreground, no_watchdog;
 static volatile uint32_t *regs;
 static size_t map_size = 0x1000;
 static uint64_t t0_ns;
@@ -162,6 +181,18 @@ static int parse_u32(const char *s, uint32_t *out)
     return 0;
 }
 
+/* number at the start of s (stops at the first non-digit) */
+static int parse_u32_prefix(const char *s, uint32_t *out)
+{
+    char *end;
+    errno = 0;
+    unsigned long long v = strtoull(s, &end, 0);
+    if (errno || end == s || v > 0xFFFFFFFFull)
+        return -1;
+    *out = (uint32_t)v;
+    return 0;
+}
+
 static void set_status(int ok, const char *pl, const char *msg)
 {
     pthread_mutex_lock(&st_lock);
@@ -189,6 +220,7 @@ static unsigned get_status(char *out, size_t n)
 /* ---- simulated axi_regs (mirrors src/hdl/axi_regs.vhd) -------------------- */
 
 static uint32_t sim_regs[4];            /* SCRATCH0..2, CONTROL */
+static uint32_t sim_build_id;           /* BUILD_ID of the "loaded" sim design */
 static uint64_t sim_hb_zero_ns;         /* when HEARTBEAT was last 0 */
 static uint32_t sim_oled_ctrl = 0x00007F01;
 static uint32_t sim_oled_text[32];      /* reset text set up in main() */
@@ -227,6 +259,8 @@ static uint32_t sim_read(uint32_t off)
     case REG_OLED_CTRL / 4: return sim_oled_ctrl;
     case REG_OLED_STAT / 4: return ((uint32_t)((now_ns() - t0_ns) / 33333333u) << 16) | 1;
     case REG_SCOPE_INFO / 4: return SCOPE_INFO_VAL;
+    case REG_BUILD_ID / 4: return sim_build_id;
+    case REG_REGMAP / 4: return 1;
     case REG_SCOPE_STAT / 4: return 4;  /* done; sim captures happen in sim_capture() */
     default: return 0;
     }
@@ -331,44 +365,18 @@ static inline void raw_write(uint32_t off, uint32_t v)
         regs[off / 4] = v;
 }
 
-/* (re)validate the PL; caller holds pl_lock for writing */
-static void check_pl_locked(void)
-{
-    char state[64], msg[160];
-    if (!pl_operating(state, sizeof state)) {
-        pl_ok = 0;
-        snprintf(msg, sizeof msg, "PL not configured (fpga_manager: %s)", state);
-        set_status(0, "not configured", msg);
-        return;
-    }
-    if (!sim && !regs && map_uio() < 0) {
-        pl_ok = 0;
-        set_status(0, "operating",
-                   "no UIO device " UIO_NAME " (kernel arg uio_pdrv_genirq.of_id=generic-uio?)");
-        return;
-    }
-    uint32_t sig = raw_read(REG_SIGNATURE);
-    if (sig != SIGNATURE_VALUE) {
-        pl_ok = 0;
-        snprintf(msg, sizeof msg, "unexpected SIGNATURE 0x%08" PRIx32 " (want 0x%08x)", sig,
-                 SIGNATURE_VALUE);
-        set_status(0, "operating", msg);
-        return;
-    }
-    pl_ok = 1;
-    set_status(1, "operating", "ready");
-}
-
-/* re-check once a second: catches the PL going away / coming up */
+/* the PL went away behind our back (only fpgad loads designs, so this should
+ * not happen); never re-enable on our own - only a load checks a design */
 static void *monitor(void *arg)
 {
     (void)arg;
     while (!stopping) {
-        char state[64];
-        int op = pl_operating(state, sizeof state);
-        if (op != pl_ok) {
+        char state[64], msg[160];
+        if (pl_ok && !pl_operating(state, sizeof state)) {
             pthread_rwlock_wrlock(&pl_lock);
-            check_pl_locked();
+            pl_ok = 0;
+            snprintf(msg, sizeof msg, "PL not configured any more (fpga_manager: %s)", state);
+            set_status(0, "not configured", msg);
             pthread_rwlock_unlock(&pl_lock);
         }
         sleep(1);
@@ -400,52 +408,436 @@ static int reg_access(int write, uint32_t off, uint32_t *val, char *err, size_t 
     return 0;
 }
 
-/* reprogram the PL; everything else waits on the write lock meanwhile */
-static int pl_load(const char *name, char *err, size_t n)
+/* ---- FPGA designs: overlay + bitstream, trial and rollback ---------------- */
+
+#define PL_FW_NAME      "zynq-mini-pl.bit.bin"
+#define PL_DTBO_NAME    "zynq-mini-pl.dtbo"
+#define PL_MANIFEST     "manifest.json"
+#define PL_CANDIDATE    "/data/rauc/pl/design"      /* RAUC artifact link */
+#define OVERLAY_DIR     "/sys/kernel/config/device-tree/overlays/pl"
+
+/* register maps this fpgad understands (axi_regs.vhd REGMAP_VERSION) */
+static const uint32_t REGMAPS[] = { 1 };
+
+static char pl_dir[128] = "/data/pl";               /* good/ + trial marker; FPGAD_PL_DIR */
+
+struct design {
+    char version[64], git[32], date[32];
+    uint32_t build_id, regmap;
+};
+static struct design pl_cur;                        /* loaded design (valid while pl_ok) */
+static char pl_note[200];                           /* e.g. a trial that did not survive */
+
+static int json_str(const char *j, const char *key, char *out, size_t n)
 {
-    char path[256];
-    if (!*name || strchr(name, '/') || strstr(name, "..")) {
-        snprintf(err, n, "firmware must be a plain file name in " FIRMWARE_DIR);
+    char k[48];
+    snprintf(k, sizeof k, "\"%s\":\"", key);
+    const char *p = strstr(j, k);
+    if (!p)
+        return -1;
+    p += strlen(k);
+    size_t len = strcspn(p, "\"");
+    snprintf(out, n, "%.*s", (int)(len < n ? len : n - 1), p);
+    return 0;
+}
+
+static int json_u32(const char *j, const char *key, uint32_t *out)
+{
+    char k[48];
+    snprintf(k, sizeof k, "\"%s\":", key);
+    const char *p = strstr(j, k);
+    if (!p)
+        return -1;
+    return parse_u32_prefix(p + strlen(k), out);
+}
+
+static int read_file(const char *path, char *buf, size_t n, size_t *len)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    ssize_t r = read(fd, buf, n - 1);
+    close(fd);
+    if (r < 0)
+        return -1;
+    buf[r] = 0;
+    if (len)
+        *len = (size_t)r;
+    return 0;
+}
+
+static int read_manifest(const char *dir, struct design *d, char *err, size_t n)
+{
+    char path[256], j[1024];
+    snprintf(path, sizeof path, "%s/" PL_MANIFEST, dir);
+    memset(d, 0, sizeof *d);
+    if (read_file(path, j, sizeof j, NULL) < 0) {
+        snprintf(err, n, "no %.250s", path);
         return -1;
     }
-    snprintf(path, sizeof path, FIRMWARE_DIR "/%s", name);
-    if (!sim && access(path, R_OK) != 0) {
-        snprintf(err, n, "no %s", path);
+    if (json_u32(j, "build_id", &d->build_id) || json_u32(j, "regmap", &d->regmap) ||
+        json_str(j, "version", d->version, sizeof d->version)) {
+        snprintf(err, n, "%s: no build_id / regmap / version", path);
         return -1;
     }
-    pthread_rwlock_wrlock(&pl_lock);
+    json_str(j, "git", d->git, sizeof d->git);
+    json_str(j, "date", d->date, sizeof d->date);
+    return 0;
+}
+
+static int regmap_supported(uint32_t v)
+{
+    for (size_t i = 0; i < sizeof REGMAPS / sizeof REGMAPS[0]; i++)
+        if (REGMAPS[i] == v)
+            return 1;
+    return 0;
+}
+
+static void unmap_uio(void)
+{
+    if (regs)
+        munmap((void *)regs, map_size);
+    regs = NULL;
+}
+
+static int write_all_file(const char *path, const void *data, size_t len)
+{
+    int fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    const char *p = data;
+    while (len) {
+        ssize_t w = write(fd, p, len);
+        if (w <= 0) {
+            close(fd);
+            return -1;
+        }
+        p += w;
+        len -= (size_t)w;
+    }
+    return close(fd);
+}
+
+/* the read-back checks every design has to pass; caller holds pl_lock (write) */
+static int check_design(const struct design *want, char *err, size_t n)
+{
+    uint32_t sig = raw_read(REG_SIGNATURE);
+    if (sig != SIGNATURE_VALUE) {
+        snprintf(err, n, "SIGNATURE 0x%08" PRIx32 " (want 0x%08x)", sig, SIGNATURE_VALUE);
+        return -1;
+    }
+    uint32_t bid = raw_read(REG_BUILD_ID), rm = raw_read(REG_REGMAP);
+    if (bid != want->build_id) {
+        snprintf(err, n, "BUILD_ID %" PRIu32 " but the manifest says %" PRIu32 " - not this "
+                 "bundle's bitstream", bid, want->build_id);
+        return -1;
+    }
+    if (rm != want->regmap || !regmap_supported(rm)) {
+        snprintf(err, n, "REGMAP %" PRIu32 " (manifest %" PRIu32 ") not supported by this fpgad",
+                 rm, want->regmap);
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * Load the design in dir: remove the old overlay (unbinds its UIO node), point
+ * /lib/firmware/zynq-mini-pl.bit.bin at the new bitstream, apply the new
+ * overlay (the kernel programs the PL, then creates the nodes), map the new
+ * UIO node and run the checks. Caller holds pl_lock for writing.
+ */
+static int load_design_locked(const char *dir, char *err, size_t n)
+{
+    struct design d;
+    char real[PATH_MAX], path[PATH_MAX + 32], buf[64];
+    if (read_manifest(dir, &d, err, n) < 0)
+        return -1;
+    if (!realpath(dir, real)) {
+        snprintf(err, n, "%.200s: %s", dir, strerror(errno));
+        return -1;
+    }
     pl_ok = 0;
-    set_status(0, "loading", name);
-    logmsg(LOG_INFO, "loading PL from %s", path);
-    int rc = 0;
-    if (!sim) {
-        FILE *f = fopen(FPGA_MGR "/flags", "w");
-        if (f) {
-            fputs("0", f);                      /* full bitstream */
-            fclose(f);
+    set_status(0, "loading", d.version);
+    logmsg(LOG_INFO, "loading design %s (build_id %" PRIu32 ") from %s", d.version, d.build_id, real);
+
+    if (sim) {
+        /* test hook: a design dir with a "sim-bad" file reads back the wrong BUILD_ID */
+        snprintf(path, sizeof path, "%s/sim-bad", real);
+        sim_build_id = access(path, F_OK) == 0 ? d.build_id ^ 1 : d.build_id;
+    } else {
+        unmap_uio();
+        if (access(OVERLAY_DIR, F_OK) == 0 && rmdir(OVERLAY_DIR) < 0) {
+            snprintf(err, n, "removing the old overlay: %s", strerror(errno));
+            goto fail;
         }
-        /* the load happens on this write; a bad bitstream fails at fclose (flush) */
-        f = fopen(FPGA_MGR "/firmware", "w");
-        int bad = !f;
-        if (f) {
-            bad = fputs(name, f) < 0;
-            if (fclose(f) != 0)
-                bad = 1;
+        /* the overlay's firmware-name refers to this link */
+        mkdir(FIRMWARE_DIR, 0755);
+        snprintf(path, sizeof path, "%s/" PL_FW_NAME, real);
+        if (access(path, R_OK) < 0) {
+            snprintf(err, n, "no %.250s", path);
+            goto fail;
         }
-        if (bad) {
-            snprintf(err, n, "writing " FPGA_MGR "/firmware failed: %s", strerror(errno));
-            rc = -1;
+        unlink(FIRMWARE_DIR "/." PL_FW_NAME ".new");
+        if (symlink(path, FIRMWARE_DIR "/." PL_FW_NAME ".new") < 0 ||
+            rename(FIRMWARE_DIR "/." PL_FW_NAME ".new", FIRMWARE_DIR "/" PL_FW_NAME) < 0) {
+            snprintf(err, n, "firmware link: %s", strerror(errno));
+            goto fail;
+        }
+        static char dtbo[65536];
+        size_t len;
+        snprintf(path, sizeof path, "%s/" PL_DTBO_NAME, real);
+        if (read_file(path, dtbo, sizeof dtbo, &len) < 0 || len == 0) {
+            snprintf(err, n, "no %.250s", path);
+            goto fail;
+        }
+        if (mkdir(OVERLAY_DIR, 0755) < 0) {
+            snprintf(err, n, "creating " OVERLAY_DIR ": %s (CONFIG_OF_CONFIGFS? configfs mounted?)",
+                     strerror(errno));
+            goto fail;
+        }
+        /* writing the overlay applies it: bitstream first, then the nodes */
+        int wr = write_all_file(OVERLAY_DIR "/dtbo", dtbo, len);
+        if (read_sysfs(OVERLAY_DIR "/status", buf, sizeof buf) < 0 || strcmp(buf, "applied")) {
+            snprintf(err, n, "overlay not applied (%s%s%s) - bad bitstream or dtbo?", buf,
+                     wr < 0 ? ", " : "", wr < 0 ? strerror(errno) : "");
+            rmdir(OVERLAY_DIR);
+            goto fail;
+        }
+        if (!pl_operating(buf, sizeof buf)) {
+            snprintf(err, n, "fpga_manager state %s after the load", buf);
+            rmdir(OVERLAY_DIR);
+            goto fail;
+        }
+        int tries = 0;
+        while (map_uio() < 0 && ++tries < 30)
+            usleep(100000);             /* udev-less: the node appears right away, but wait a bit */
+        if (!regs) {
+            snprintf(err, n, "no UIO device " UIO_NAME " after the overlay "
+                     "(kernel arg uio_pdrv_genirq.of_id=generic-uio?)");
+            goto fail;
         }
     }
-    check_pl_locked();
-    if (rc == 0 && !pl_ok) {
-        char st[sizeof status_json];
-        get_status(st, sizeof st);
-        snprintf(err, n, "PL not usable after load %s", st);
+    if (check_design(&d, err, n) < 0)
+        goto fail;
+    pl_cur = d;
+    pl_ok = 1;
+    char m[96];
+    snprintf(m, sizeof m, "ready: design %s", d.version);
+    set_status(1, "operating", m);
+    logmsg(LOG_INFO, "design %s is up", d.version);
+    return 0;
+fail:
+    pl_ok = 0;
+    set_status(0, "failed", err);
+    logmsg(LOG_ERR, "design %s: %s", d.version, err);
+    return -1;
+}
+
+static int copy_file(const char *src, const char *dst)
+{
+    int in = open(src, O_RDONLY | O_CLOEXEC);
+    if (in < 0)
+        return -1;
+    int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (out < 0) {
+        close(in);
+        return -1;
+    }
+    char buf[65536];
+    ssize_t r;
+    int rc = 0;
+    while ((r = read(in, buf, sizeof buf)) > 0)
+        if (write(out, buf, (size_t)r) != r) {
+            rc = -1;
+            break;
+        }
+    if (r < 0 || fsync(out) < 0)
+        rc = -1;
+    close(in);
+    if (close(out) < 0)
+        rc = -1;
+    return rc;
+}
+
+static void remove_design_dir(const char *dir)
+{
+    char p[256];
+    const char *files[] = { PL_FW_NAME, PL_DTBO_NAME, PL_MANIFEST };
+    for (size_t i = 0; i < 3; i++) {
+        snprintf(p, sizeof p, "%s/%s", dir, files[i]);
+        unlink(p);
+    }
+    rmdir(dir);
+}
+
+/* copy dir's design to pl_dir/good: good.new, then swap it in with renames */
+static int keep_as_good(const char *dir, char *err, size_t n)
+{
+    char good[160], gnew[160], gold[160], a[256], b[256];
+    snprintf(good, sizeof good, "%s/good", pl_dir);
+    snprintf(gnew, sizeof gnew, "%s/good.new", pl_dir);
+    snprintf(gold, sizeof gold, "%s/good.old", pl_dir);
+    char r1[PATH_MAX], r2[PATH_MAX];
+    if (realpath(dir, r1) && realpath(good, r2) && !strcmp(r1, r2))
+        return 0;                       /* it is the good design already */
+    remove_design_dir(gnew);
+    if (mkdir(gnew, 0755) < 0) {
+        snprintf(err, n, "%.150s: %s", gnew, strerror(errno));
+        return -1;
+    }
+    const char *files[] = { PL_FW_NAME, PL_DTBO_NAME, PL_MANIFEST };
+    for (size_t i = 0; i < 3; i++) {
+        snprintf(a, sizeof a, "%s/%s", dir, files[i]);
+        snprintf(b, sizeof b, "%s/%s", gnew, files[i]);
+        if (copy_file(a, b) < 0) {
+            snprintf(err, n, "copying %.200s: %s", a, strerror(errno));
+            remove_design_dir(gnew);
+            return -1;
+        }
+    }
+    remove_design_dir(gold);
+    if ((access(good, F_OK) == 0 && rename(good, gold) < 0) || rename(gnew, good) < 0) {
+        snprintf(err, n, "installing %.150s: %s", good, strerror(errno));
+        return -1;
+    }
+    remove_design_dir(gold);
+    sync();
+    return 0;
+}
+
+static void trial_mark(const char *version)
+{
+    char path[160];
+    snprintf(path, sizeof path, "%s/trial", pl_dir);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd >= 0) {
+        if (write(fd, version, strlen(version)) < 0)
+            logmsg(LOG_WARNING, "writing %s: %s", path, strerror(errno));
+        fsync(fd);
+        close(fd);
+    }
+    sync();
+}
+
+static void trial_clear(void)
+{
+    char path[160];
+    snprintf(path, sizeof path, "%s/trial", pl_dir);
+    unlink(path);
+    sync();
+}
+
+/* trial-load a new design; keep it if it passes, else reload the good one */
+static int pl_activate(const char *dir, char *err, size_t n)
+{
+    struct design d;
+    char good[160];
+    if (read_manifest(dir, &d, err, n) < 0)
+        return -1;
+    if (!regmap_supported(d.regmap)) {
+        snprintf(err, n, "design %s has REGMAP %" PRIu32 ", which this fpgad does not support - "
+                 "not loaded (update fpgad first)", d.version, d.regmap);
+        return -1;
+    }
+    snprintf(good, sizeof good, "%s/good", pl_dir);
+
+    pthread_rwlock_wrlock(&pl_lock);
+    trial_mark(d.version);              /* a reset from here on means: back to good */
+    int rc = load_design_locked(dir, err, n);
+    if (rc == 0) {
+        rc = keep_as_good(dir, err, n);
+        trial_clear();
+        pl_note[0] = 0;
+    } else {
+        char why[320];
+        snprintf(why, sizeof why, "%s", err);
+        trial_clear();
+        if (access(good, F_OK) == 0 && load_design_locked(good, err, n) == 0)
+            snprintf(err, n, "design %s failed (%.150s); back on the good design %s", d.version, why,
+                     pl_cur.version);
+        else
+            snprintf(err, n, "design %s failed (%.150s), and the good design did not load either",
+                     d.version, why);
+        snprintf(pl_note, sizeof pl_note, "%.199s", err);
         rc = -1;
     }
     pthread_rwlock_unlock(&pl_lock);
     return rc;
+}
+
+/* at start: drop a stale trial, then (re)load or adopt the good design */
+static void pl_boot(void)
+{
+    char good[160], path[160], v[64] = "", err[320];
+    /* overlays live in configfs, which Buildroot's fstab doesn't mount */
+    if (!sim && access("/sys/kernel/config/device-tree", F_OK) < 0) {
+        if (mount("configfs", "/sys/kernel/config", "configfs", 0, NULL) < 0)
+            logmsg(LOG_ERR, "mounting configfs on /sys/kernel/config: %s", strerror(errno));
+        else
+            logmsg(LOG_INFO, "mounted configfs on /sys/kernel/config");
+    }
+    snprintf(good, sizeof good, "%s/good", pl_dir);
+    snprintf(path, sizeof path, "%s/trial", pl_dir);
+    if (read_file(path, v, sizeof v, NULL) == 0) {
+        v[strcspn(v, "\r\n")] = 0;
+        snprintf(pl_note, sizeof pl_note, "the board reset while design %s was on trial - "
+                 "staying on the good design", v);
+        logmsg(LOG_WARNING, "%s", pl_note);
+        trial_clear();
+    }
+    pthread_rwlock_wrlock(&pl_lock);
+    struct design gd;
+    if (read_manifest(good, &gd, err, sizeof err) < 0) {
+        set_status(0, "no design", "no FPGA design installed (/data/pl/good) - install a PL bundle");
+        logmsg(LOG_WARNING, "no good design: %s", err);
+    } else if (!sim && access(OVERLAY_DIR, F_OK) == 0 && map_uio() == 0 &&
+               check_design(&gd, err, sizeof err) == 0) {
+        /* fpgad restarted: our overlay with the good design is still applied */
+        pl_cur = gd;
+        pl_ok = 1;
+        char m[96];
+        snprintf(m, sizeof m, "ready: design %s", gd.version);
+        set_status(1, "operating", m);
+        logmsg(LOG_INFO, "design %s already loaded", gd.version);
+    } else {
+        load_design_locked(good, err, sizeof err);
+    }
+    pthread_rwlock_unlock(&pl_lock);
+}
+
+static void design_json(char *out, size_t n)
+{
+    pthread_rwlock_rdlock(&pl_lock);
+    if (pl_ok)
+        snprintf(out, n, "{\"loaded\":true,\"version\":\"%s\",\"build_id\":%" PRIu32
+                 ",\"regmap\":%" PRIu32 ",\"git\":\"%s\",\"date\":\"%s\",\"note\":\"%s\"}",
+                 pl_cur.version, pl_cur.build_id, pl_cur.regmap, pl_cur.git, pl_cur.date, pl_note);
+    else
+        snprintf(out, n, "{\"loaded\":false,\"note\":\"%s\"}", pl_note);
+    pthread_rwlock_unlock(&pl_lock);
+}
+
+/* ---- hardware watchdog ------------------------------------------------------ */
+
+/* Kick only after a register read came back: a design that hangs the bus
+ * stalls this thread, the watchdog resets the board, and pl_boot() lands on
+ * the good design. A clean stop disarms it ('V', magic close). */
+static void *watchdog_thread(void *arg)
+{
+    int fd = (int)(intptr_t)arg;
+    while (!stopping) {
+        pthread_rwlock_rdlock(&pl_lock);
+        if (pl_ok)
+            (void)raw_read(REG_SIGNATURE);
+        pthread_rwlock_unlock(&pl_lock);
+        ioctl(fd, WDIOC_KEEPALIVE, 0);
+        sleep(1);
+    }
+    if (write(fd, "V", 1) != 1)
+        logmsg(LOG_WARNING, "watchdog: magic close failed - the board will reset");
+    close(fd);
+    logmsg(LOG_INFO, "watchdog disarmed");
+    return NULL;
 }
 
 /* ---- oscilloscope capture ------------------------------------------------- */
@@ -946,13 +1338,20 @@ static void handle_line(int fd, char *line)
             sendf(fd, "err %s\n", err);
         else
             sendf(fd, "ok\n");
-    } else if (!strcmp(argv[0], "load")) {
-        if (argc != 2)
-            sendf(fd, "err usage: load <firmware-file in " FIRMWARE_DIR ">\n");
-        else if (pl_load(argv[1], err, sizeof err))
+    } else if (!strcmp(argv[0], "activate") || !strcmp(argv[0], "load")) {
+        char info[512];
+        if (argc > 2 || (argc == 1 && !strcmp(argv[0], "load")))
+            sendf(fd, "err usage: activate [<design dir>, default " PL_CANDIDATE "] | load <dir>\n");
+        else if (pl_activate(argc == 2 ? argv[1] : PL_CANDIDATE, err, sizeof err))
             sendf(fd, "err %s\n", err);
-        else
-            sendf(fd, "ok operating\n");
+        else {
+            design_json(info, sizeof info);
+            sendf(fd, "ok %s\n", info);
+        }
+    } else if (!strcmp(argv[0], "pl")) {
+        char info[512];
+        design_json(info, sizeof info);
+        sendf(fd, "ok %s\n", info);
     } else if (!strcmp(argv[0], "stream")) {
         do_stream(fd, argv, argc);
     } else if (!strcmp(argv[0], "capture")) {
@@ -960,7 +1359,7 @@ static void handle_line(int fd, char *line)
     } else if (!strcmp(argv[0], "sensors")) {
         do_sensors(fd);
     } else {
-        sendf(fd, "err unknown command '%s' (ping status read write load stream oled capture sensors)\n",
+        sendf(fd, "err unknown command '%s' (ping status read write activate pl stream oled capture sensors)\n",
               argv[0]);
     }
 }
@@ -1007,21 +1406,26 @@ int main(int argc, char **argv)
 {
     const char *sock_path = DEFAULT_SOCK;
     int opt;
-    while ((opt = getopt(argc, argv, "s:fh")) != -1) {
+    while ((opt = getopt(argc, argv, "s:fnh")) != -1) {
         switch (opt) {
         case 's': sock_path = optarg; break;
         case 'f': foreground = 1; break;
+        case 'n': no_watchdog = 1; break;
         default:
-            fprintf(stderr, "usage: %s [-s socket] [-f]\n"
+            fprintf(stderr, "usage: %s [-s socket] [-f] [-n]\n"
                             "  -s  UNIX socket path (default " DEFAULT_SOCK ")\n"
                             "  -f  foreground: also log to stderr\n"
-                            "  env FPGAD_SIM=1 simulates axi_regs\n", argv[0]);
+                            "  -n  don't arm the hardware watchdog\n"
+                            "  env FPGAD_SIM=1 simulates axi_regs; FPGAD_PL_DIR overrides /data/pl\n",
+                    argv[0]);
             return opt == 'h' ? 0 : 2;
         }
     }
     sim = getenv("FPGAD_SIM") != NULL;
     if (sim)
         map_size = 0x10000;             /* like the real UIO window: regs + capture RAM */
+    if (getenv("FPGAD_PL_DIR"))
+        snprintf(pl_dir, sizeof pl_dir, "%s", getenv("FPGAD_PL_DIR"));
     openlog("fpgad", LOG_PID | (foreground ? LOG_PERROR : 0), LOG_DAEMON);
     t0_ns = sim_hb_zero_ns = now_ns();
     static const char *const sim_text[OLED_ROWS] = {   /* OLED_TEXT_RESET in axi_regs.vhd */
@@ -1035,9 +1439,22 @@ int main(int argc, char **argv)
     sigaction(SIGTERM, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
 
-    pthread_rwlock_wrlock(&pl_lock);
-    check_pl_locked();
-    pthread_rwlock_unlock(&pl_lock);
+    /* watchdog first: if loading the good design hangs the bus, it resets us */
+    pthread_t wdt;
+    int wdt_started = 0;
+    if (!sim && !no_watchdog) {
+        int wfd = open("/dev/watchdog", O_WRONLY | O_CLOEXEC);
+        if (wfd < 0)
+            logmsg(LOG_WARNING, "no hardware watchdog (/dev/watchdog: %s)", strerror(errno));
+        else {
+            int timeout = 0;
+            ioctl(wfd, WDIOC_GETTIMEOUT, &timeout);
+            logmsg(LOG_INFO, "hardware watchdog armed, %d s timeout", timeout);
+            wdt_started = pthread_create(&wdt, NULL, watchdog_thread, (void *)(intptr_t)wfd) == 0;
+        }
+    }
+
+    pl_boot();
 
     int ls = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
@@ -1083,6 +1500,8 @@ int main(int argc, char **argv)
         pthread_attr_destroy(&at);
     }
     logmsg(LOG_INFO, "stopping");
+    if (wdt_started)
+        pthread_join(wdt, NULL);        /* disarms it */
     close(ls);
     unlink(sock_path);
     return 0;

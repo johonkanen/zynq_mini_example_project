@@ -62,6 +62,7 @@ begin
     end process;
 
     dut : entity work.axi_regs
+        generic map (BUILD_ID => x"6512ABCD")
         port map (
             reg_ps2pl_o => reg_ps2pl, pl_active_o => pl_active,
             oled_ctrl_o => oled_ctrl, oled_stat_i => x"00070001",
@@ -268,6 +269,15 @@ begin
                 axi_write(16#24#, x"FFFFFFFF");                 -- read-only
                 axi_read(16#24#, r);
                 check_equal(r, std_logic_vector'(x"00070001"), "OLED_STAT ignores writes");
+
+            elsif run("build_id_and_regmap") then
+                axi_read(16#28#, r);
+                check_equal(r, std_logic_vector'(x"6512ABCD"), "BUILD_ID from the generic");
+                axi_read(16#2C#, r);
+                check_equal(r, std_logic_vector'(x"00000001"), "REGMAP version 1");
+                axi_write(16#28#, x"FFFFFFFF");                 -- read-only
+                axi_read(16#28#, r);
+                check_equal(r, std_logic_vector'(x"6512ABCD"), "BUILD_ID ignores writes");
 
             elsif run("scope_registers") then
                 axi_read(16#48#, r); check_equal(r, std_logic_vector'(x"00000000"), "SCOPE_TRIG reset");

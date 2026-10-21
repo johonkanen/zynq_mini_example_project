@@ -8,10 +8,12 @@
 # parts (default: all):
 #   kernel   output/images/uImage            -> SD boot partition  /uImage
 #   dtb      output/images/zynq-zynqmini.dtb -> SD boot partition  /system.dtb
-#   bit      output/arm_fpga_zynq_mini.bit   -> /lib/firmware/*.bit.bin (via bit2bin.py), PL reloaded now
+#   pl       output/pl-latest.raucb (or PL_BUNDLE=<file>) -> `rauc install`: signature
+#            checked, design trial-loaded by fpgad, kept or rolled back. No reboot.
+#            Make the bundle with linux/make-pl-bundle.sh (doc/network_update.md).
 #   fpgad    fpgad + fpgactl + oled-status   -> /usr/sbin, /usr/bin, /etc/init.d; restarted
 #   web      fpga-web + libcivetweb          -> /usr/bin, /usr/lib; service restarted
-#   all      all of the above
+#   all      kernel dtb pl fpgad web
 #
 # Unchanged files (same md5 as on the board) are skipped. The board reboots
 # afterwards only if the kernel or the dtb actually changed. (Soft reboots work
@@ -49,12 +51,16 @@ while [ $# -gt 0 ]; do
         *)             break ;;
     esac
 done
-[ $# -ge 1 ] || die "usage: $0 [--no-reboot] [--new-hostkey] <board-ip> [kernel|dtb|bit|fpgad|web|all]..."
+[ $# -ge 1 ] || die "usage: $0 [--no-reboot] [--new-hostkey] <board-ip> [kernel|dtb|pl|fpgad|web|all]..."
 BOARD=$1; shift
 parts=("${@:-all}")
 want() { local p; for p in "${parts[@]}"; do [ "$p" = all ] || [ "$p" = "$1" ] && return 0; done; return 1; }
 for p in "${parts[@]}"; do
-    case "$p" in kernel|dtb|bit|fpgad|web|all) ;; *) die "unknown part '$p' (kernel dtb bit fpgad web all)" ;; esac
+    case "$p" in
+        kernel|dtb|pl|fpgad|web|all) ;;
+        bit) die "'bit' is gone: FPGA designs go as signed PL bundles - linux/make-pl-bundle.sh, then 'pl'" ;;
+        *) die "unknown part '$p' (kernel dtb pl fpgad web all)" ;;
+    esac
 done
 
 mkdir -p "$LINUX_BUILD_DIR"
@@ -112,21 +118,17 @@ if want kernel || want dtb; then
     want dtb    && push "$BR/images/zynq-zynqmini.dtb" /mnt/boot/system.dtb && need_reboot=1 || true
 fi
 
-if want bit; then
-    log "FPGA bitstream"
-    [ -f "$REPO/output/arm_fpga_zynq_mini.bit" ] || die "missing output/arm_fpga_zynq_mini.bit - run ./build.sh"
-    BINTMP=$(mktemp); trap 'rm -f "$BINTMP"; cleanup' EXIT
-    python3 "$REPO/linux/bit2bin.py" "$REPO/output/arm_fpga_zynq_mini.bit" "$BINTMP"
-    if push "$BINTMP" /lib/firmware/arm_fpga_zynq_mini.bit.bin; then
-        # fpgad owns the PL: it blocks all register access while it reprograms.
-        # (Images from before fpgad: fall back to the init scripts.)
-        rsh 'if command -v fpgactl >/dev/null && fpgactl status >/dev/null 2>&1; then
-                 printf "PL: fpgactl load ... "; fpgactl load arm_fpga_zynq_mini.bit.bin
-             else
-                 /etc/init.d/S97fpga-webstream stop >/dev/null 2>&1; /etc/init.d/S95fpga start
-                 /etc/init.d/S97fpga-webstream start >/dev/null 2>&1; true
-             fi'
-    fi
+if want pl; then
+    log "FPGA design (PL bundle)"
+    bundle=${PL_BUNDLE:-$REPO/output/pl-latest.raucb}
+    [ -f "$bundle" ] || die "no $bundle - run linux/make-pl-bundle.sh"
+    rsh 'command -v rauc >/dev/null' || die "no rauc on the board - it needs the phase-1 image (doc/network_update.md)"
+    echo "   $(basename "$(readlink -f "$bundle")")"
+    rsh "cat > /tmp/pl.raucb" < "$bundle"
+    # RAUC checks the signature, installs into /data/rauc/pl, then its post-install
+    # handler has fpgad trial-load the design (kept if it passes, else rolled back)
+    rsh 'rauc install /tmp/pl.raucb; rc=$?; rm -f /tmp/pl.raucb; fpgactl pl; exit $rc' \
+        || die "PL bundle not installed (see above) - the board stays on its good design"
 fi
 
 if want fpgad; then

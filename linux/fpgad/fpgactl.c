@@ -5,7 +5,8 @@
  *   fpgactl regs                       read all axi_regs registers, named
  *   fpgactl read 0x1c
  *   fpgactl write 0x00 0x12340000
- *   fpgactl load arm_fpga_zynq_mini.bit.bin
+ *   fpgactl pl                         loaded FPGA design: version, build id, regmap
+ *   fpgactl activate [dir]             trial-load a design tree (default: the RAUC-installed one)
  *   fpgactl stream 200 20 0x10         prints data/status lines until Ctrl-C
  *   fpgactl oled 0 "Hello, world"      text on OLED row 0..7 (16 chars) / oled clear
  *   fpgactl sensors                    XADC die temperature + supply rails
@@ -33,7 +34,7 @@ static int usage(void)
 {
     fprintf(stderr,
             "usage: fpgactl [-s socket] <command>\n"
-            "  status | regs | read <off> | write <off> <val> | load <fw>\n"
+            "  status | regs | read <off> | write <off> <val> | pl | activate [dir]\n"
             "  stream <hz> <batch_hz> <off>... | oled <row> <text> | oled clear | sensors\n"
             "  raw \"<line>\"\n");
     return 2;

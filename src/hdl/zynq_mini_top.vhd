@@ -25,6 +25,9 @@ use work.axi_pkg.all;
 use work.scope_pkg.all;
 
 entity zynq_mini_top is
+    generic (
+        BUILD_ID : std_logic_vector(31 downto 0) := x"00000000"   -- scripts/build.tcl: Unix time
+    );
     port (
         DDR_addr          : inout std_logic_vector(14 downto 0);
         DDR_ba            : inout std_logic_vector(2 downto 0);
@@ -131,6 +134,7 @@ begin
     -- VHDL AXI slave, wired straight to the PS master (records)
     ---------------------------------------------------------------------------
     u_axi_regs : entity work.axi_regs
+        generic map (BUILD_ID => BUILD_ID)
         port map (
             reg_ps2pl_o   => reg_ps2pl,
             pl_active_o   => pl_active,

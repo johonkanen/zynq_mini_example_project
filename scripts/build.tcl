@@ -71,6 +71,12 @@ foreach f $TOP_SOURCES {
     set_property file_type "VHDL 2008" [get_files [file tail $f]]
 }
 set_property top $TOP_MODULE [current_fileset]
+
+# BUILD_ID: the build's Unix time, readable at axi_regs 0x28 and recorded next to
+# the bitstream (output/<project>.build_id) for PL bundle manifests.
+set BUILD_ID [clock seconds]
+set_property generic "BUILD_ID=32'h[format %08X $BUILD_ID]" [current_fileset]
+puts "\[build] BUILD_ID = $BUILD_ID ([clock format $BUILD_ID -format {%Y-%m-%d %H:%M:%S} -gmt 1] UTC)"
 update_compile_order -fileset sources_1
 puts "\[build] top module = $TOP_MODULE ([file tail [lindex $TOP_SOURCES end]])"
 
@@ -123,6 +129,9 @@ set bit [file join $OUTPUT_DIR "$PROJECT_NAME.bit"]
 file copy -force \
     [file join $BUILD_DIR "$PROJECT_NAME.runs" impl_1 "${TOP_MODULE}.bit"] $bit
 puts "\[build] bitstream  -> $bit"
+set fh [open [file join $OUTPUT_DIR "$PROJECT_NAME.build_id"] w]
+puts $fh $BUILD_ID
+close $fh
 
 set xsa [file join $OUTPUT_DIR "$PROJECT_NAME.xsa"]
 write_hw_platform -fixed -include_bit -force -file $xsa

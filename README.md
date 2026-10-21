@@ -92,12 +92,18 @@ and its QMTech sibling, **including building Linux** — see [`doc/notes.md`](do
 | `linux/fpgad/`                | `fpgad` (the one process that touches the FPGA), `fpgactl`, client library — `doc/linux_build.md` §12 |
 | `linux/fpga-web/`             | web UI: register read/write, **die temperature** (XADC), **oscilloscope**, live uPlot charts — binary WebSocket (`/ws`), talks only to `fpgad`; `vendor/` = uPlot (MIT) |
 | `linux/br2-external/`         | Buildroot external tree: `fpgad` + `fpga-web` packages and init scripts |
-| `linux/update-board.sh`       | push kernel/dtb/bitstream/web server to a running board over SSH — `doc/linux_build.md` §13 |
+| `linux/update-board.sh`       | push kernel/dtb, PL bundles, fpgad and the web server to a running board over SSH — `doc/linux_build.md` §13 |
+| `linux/make-pl-bundle.sh`     | FPGA build → signed RAUC **PL bundle** (bitstream + DT overlay + manifest) — `doc/network_update.md` |
+| `linux/pl/zynq-mini-pl.dtso`  | the design's device-tree overlay (`axi_regs` UIO node), applied by fpgad with the bitstream |
+| `linux/rauc/`                 | RAUC `system.conf` and post-install handler for the board |
+| `linux/kernel-rauc.config`    | kernel config fragment RAUC needs (squashfs, dm-verity) |
+| `linux/reflash-over-ssh.sh`   | write a new `sdcard.img` to a running board over the network (no JTAG) |
 | `linux/zynq-zynqmini.dts`     | kernel device tree for the board (used by `doc/linux_build.md`) |
 | `doc/mio_map.md`              | full PS MIO map of the board |
 | `doc/board_pinout.md`        | PL pin map (LEDs, OLED, HDMI, 2nd Ethernet, cameras) from the vendor XDCs |
 | `doc/notes.md`                | board details, Linux-boot resources (Habr series), `axi_regs` from Linux |
 | `doc/linux_build.md`          | step-by-step: build a bootable SD-card Linux image with Buildroot |
+| `doc/network_update.md`       | **plan + design for network updates** of FPGA, Linux and software (RAUC, signed, no JTAG) |
 
 `build/` and `output/` are generated and git-ignored. Everything is VHDL-2008.
 
@@ -192,6 +198,8 @@ slave is not a BD IP).
 | `0x1C` | SIGNATURE | RO  | PL → PS | constant `0x5A5A_1234` |
 | `0x20` | OLED_CTRL | R/W | PS → PL | bit0 display on, bit1 invert, bit2 flip 180°, bits[15:8] contrast; reset `0x0000_7F01` |
 | `0x24` | OLED_STAT | RO  | PL → PS | bit0 ready (init done), bits[31:16] frames sent |
+| `0x28` | BUILD_ID  | RO  | PL → PS | build time (Unix seconds), set by `scripts/build.tcl` |
+| `0x2C` | REGMAP    | RO  | PL → PS | register-map version (1); checked by fpgad and PL bundles |
 | `0x40` | SCOPE_CMD  | W   | PS → PL | bit0 arm, bit1 force trigger, bit2 abort (one-clock pulses; reads 0) |
 | `0x44` | SCOPE_STAT | RO  | PL → PS | [1:0] state (idle/pre-fill/armed/post-fill), bit2 done, bit3 triggered by the condition, [27:16] RAM index of the trigger sample |
 | `0x48` | SCOPE_TRIG | R/W | PS → PL | [1:0] channel, bit4 falling, [31:16] level (signed) |

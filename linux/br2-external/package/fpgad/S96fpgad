@@ -1,6 +1,7 @@
 #!/bin/sh
 #
-# fpgad - owns the FPGA; serves /var/run/fpgad.sock (starts after S95fpga loads the PL)
+# fpgad - owns the FPGA: loads the good design (/data/pl/good) at start, arms the
+# hardware watchdog, serves /var/run/fpgad.sock (doc/network_update.md)
 # Logs go to syslog (/var/log/messages). Extra args: /etc/default/fpgad (ARGS=...).
 #
 DAEMON=/usr/sbin/fpgad

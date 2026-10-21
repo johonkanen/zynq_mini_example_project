@@ -358,13 +358,26 @@ brings the PS↔PL AXI ports up), and `fpgautil` is in the rootfs
 
 ### Auto-load at boot (both SD and JTAG)
 
-A rootfs overlay stages the bitstream and a BusyBox init script loads it:
+**fpgad loads the PL** — there is no separate init script any more. An FPGA design
+is a directory with the bitstream, a device-tree overlay and a manifest; the image
+carries the first one as the "good" design, and later ones arrive as signed RAUC
+bundles (**[`network_update.md`](network_update.md)**):
 
 ```
-<build dir>/overlay/
-├─ rootfs/etc/init.d/S95fpga  # echo arm_fpga_zynq_mini.bit.bin > /sys/class/fpga_manager/fpga0/firmware
-└─ copy-bitstream.sh          # POST_BUILD hook: output/*.bit -> linux/bit2bin.py -> /lib/firmware/*.bit.bin
+/data/pl/good/
+├─ zynq-mini-pl.bit.bin   # bitstream for the FPGA manager (linux/bit2bin.py, below)
+├─ zynq-mini-pl.dtbo      # linux/pl/zynq-mini-pl.dtso: axi_regs UIO node for the fpga-region
+└─ manifest.json          # version, build_id, regmap (checked against axi_regs 0x28 / 0x2C)
 ```
+
+At start, fpgad applies the overlay through configfs
+(`/sys/kernel/config/device-tree/overlays/pl`): the kernel programs the PL from
+`/lib/firmware/zynq-mini-pl.bit.bin` (a link fpgad points at the design), then
+creates `/dev/uioN` for `axi_regs` with this design's window. fpgad maps it and
+checks SIGNATURE, BUILD_ID and REGMAP before anything else may touch it. The base
+dtb has no PL nodes, so a design with another register window needs no new dtb.
+`build-linux.sh`'s POST_BUILD hook stages the tree with
+`linux/make-pl-bundle.sh --tree`.
 
 **The FPGA manager needs a `.bin`, not the `.bit`.** Fed the raw Vivado `.bit`,
 the Zynq FPGA manager fails with `write init error: 0xffffffea` (`-EINVAL`) and
@@ -372,13 +385,7 @@ the PL stays unconfigured (found on hardware). It wants the configuration data
 with the `.bit` header stripped and every 32-bit word byte-swapped.
 [`linux/bit2bin.py`](../linux/bit2bin.py) does that in pure Python, with output
 byte-identical to `bootgen -arch zynq -process_bitstream bin`, so the build
-doesn't need Vitis. `build-linux.sh` writes both scripts; `S95fpga`:
-
-```sh
-echo 0 > /sys/class/fpga_manager/fpga0/flags                         # full bitstream
-echo arm_fpga_zynq_mini.bit.bin > /sys/class/fpga_manager/fpga0/firmware
-[ "$(cat /sys/class/fpga_manager/fpga0/state)" = operating ]        # -> "ok" / "FAILED (<state>)"
-```
+doesn't need Vitis.
 
 **Not `fpgautil`:** `fpgautil -b <file>` copies the file into `/lib/firmware`,
 loads it, then runs `rm /lib/firmware/<name>`. With our file already in
@@ -386,20 +393,16 @@ loads it, then runs `rm /lib/firmware/<name>`. With our file already in
 only (found on hardware). Writing the name to the manager's sysfs `firmware`
 attribute loads the same file and leaves it in place.
 
-defconfig:
-```make
-BR2_ROOTFS_OVERLAY="<build dir>/overlay/rootfs"
-BR2_ROOTFS_POST_BUILD_SCRIPT="board/zynq/post-build.sh <build dir>/overlay/copy-bitstream.sh"
-```
-
-The `.bin` lands in **both** `rootfs.ext4` (SD) and `rootfs.cpio.uboot` (JTAG), so
-the PL comes up ~2 s into userspace either way. Check it with
+The design lands in **both** `rootfs.ext4` (SD) and `rootfs.cpio.uboot` (JTAG), so
+the PL comes up ~2 s into userspace either way: `fpgactl pl` shows the design,
 `cat /sys/class/fpga_manager/fpga0/state` → `operating`.
 
 > **Never read `0x4000_0000` while the PL isn't `operating`.** With no design
 > behind `M_AXI_GP0` the read never completes and the whole SoC hangs (this
 > happened during bring-up; only a JTAG `rst -system` or a power cycle recovers).
-> `fpgad` checks the state and `SIGNATURE` before every access (§12).
+> `fpgad` checks the design before any access (§12), and kicks the hardware
+> watchdog only after a register read came back: a design that hangs the bus now
+> ends in a watchdog reset, and fpgad comes back up on the last good design.
 
 ### Load it earlier, from U-Boot (optional)
 
@@ -510,7 +513,7 @@ your next process ───────────┘   (line protocol)        
   access that the PL is `operating` and `SIGNATURE` reads `0x5A5A1234` (a GP0 read
   with no PL behind it hangs the SoC). A **PL reload** (`load`) holds a write lock,
   so no access can happen mid-reconfiguration. Started by `S96fpgad`, after
-  `S95fpga` has loaded the PL at boot.
+  it has loaded the good FPGA design (§10).
 - **`fpga-web`** ([`linux/fpga-web/`](../linux/fpga-web/)) is the web UI on port 80
   (civetweb). It never maps the hardware; every request is an `fpgad` request.
   Started by `S97fpga-web`.
@@ -530,7 +533,8 @@ your next process ───────────┘   (line protocol)        
 | `status` | `ok {"ok":true,"pl":"operating","msg":"ready","sim":false}` |
 | `read <off>` | `ok 0x5a5a1234` |
 | `write <off> <value>` | `ok` |
-| `load <file>` | `ok operating` — reprogram the PL from `/lib/firmware/<file>` |
+| `activate [<dir>]` | `ok {design}` — trial-load a design tree (default `/data/rauc/pl/design`, where RAUC installs PL bundles); kept as the good design if it passes, else the good one is reloaded (`err …`). `load <dir>` is the same |
+| `pl` | `ok {"loaded":true,"version":…,"build_id":…,"regmap":…,"git":…,"date":…,"note":…}` |
 | `oled <row> <text>` | `ok` — put up to 16 characters on OLED row 0–7 (rest of the line, spaces kept, padded) |
 | `oled clear` | `ok` — blank all 8 rows |
 | `sensors` | `ok {"temp":45.12,"vccint":1.001,"vccaux":1.799,"vccbram":1.0,"vccpint":1.0,"vccpaux":1.8,"vccoddr":1.5}` — Zynq **XADC** read through the kernel's IIO driver (`xilinx-xadc`, the PS-XADC interface, `adc@f8007100` in the DT): die temperature in °C, supply rails in V. Doesn't need the PL. |
@@ -614,7 +618,8 @@ fpgactl status
 fpgactl regs                            # all registers, named
 fpgactl read 0x1c
 fpgactl write 0x00 0x12340000
-fpgactl load arm_fpga_zynq_mini.bit.bin # safe PL reload (blocks all access meanwhile)
+fpgactl pl                              # loaded FPGA design
+fpgactl activate /data/pl/good          # reload the good design (blocks all access meanwhile)
 fpgactl stream 200 20 0x10              # Ctrl-C to stop
 fpgactl oled 3 "Hello from Linux"       # OLED text row 0..7 (the PL draws it)
 fpgactl sensors                         # XADC die temperature + supply rails
@@ -625,7 +630,7 @@ grep -E 'fpgad|fpga-web' /var/log/messages
 
 **Never reprogram the PL behind `fpgad`'s back** (`fpgautil`, writing
 `fpga_manager/firmware` by hand) while it runs: it could be reading at that moment.
-Use `fpgactl load`, which `update-board.sh bit` does too.
+FPGA designs go in as signed PL bundles (`update-board.sh pl`, §13).
 
 ### Writing another FPGA process
 
@@ -663,8 +668,8 @@ no hang).
 For day-to-day changes, push only what changed to a board that's up on the network:
 
 ```bash
-./linux/update-board.sh <board-ip>              # kernel + dtb + bitstream + web server
-./linux/update-board.sh <board-ip> bit web      # just some parts: kernel dtb bit fpgad web all
+./linux/update-board.sh <board-ip>              # kernel + dtb + PL bundle + fpgad + web server
+./linux/update-board.sh <board-ip> pl web       # just some parts: kernel dtb pl fpgad web all
 ./linux/update-board.sh --no-reboot <board-ip>  # new kernel/dtb wait for the next boot
 ./linux/update-board.sh --new-hostkey <ip>      # after reflashing (dropbear made a new host key)
 ```
@@ -673,7 +678,7 @@ For day-to-day changes, push only what changed to a board that's up on the netwo
 |---|---|---|---|
 | `kernel` | `output/images/uImage` | SD p1 `/uImage` | reboot |
 | `dtb` | `output/images/zynq-zynqmini.dtb` | SD p1 `/system.dtb` | reboot |
-| `bit` | `output/arm_fpga_zynq_mini.bit` → `bit2bin.py` | `/lib/firmware/*.bit.bin` | `fpgactl load` (fpgad reprograms the PL safely) |
+| `pl` | `output/pl-latest.raucb` (`linux/make-pl-bundle.sh`) | `rauc install` → `/data/rauc/pl` | fpgad trial-loads it: kept, or rolled back to the good design — no reboot |
 | `fpgad` | `fpgad`, `fpgactl` | `/usr/sbin/`, `/usr/bin/` | `fpgad` restarted (clients reconnect) |
 | `web` | `fpga-web` | `/usr/bin/` | service restarted |
 
@@ -682,12 +687,15 @@ For day-to-day changes, push only what changed to a board that's up on the netwo
 - Copies go through `ssh … 'cat > file.new'`, are md5-checked, then renamed into
   place: atomic, and safe for a running binary. No `scp`: recent OpenSSH `scp`
   uses SFTP, which dropbear doesn't provide.
-- The PL is only ever reprogrammed by `fpgad` (`fpgactl load`), which blocks all register access meanwhile.
+- The PL is only ever reprogrammed by `fpgad`, which blocks all register access
+  meanwhile; designs arrive as signed RAUC bundles ([`network_update.md`](network_update.md)).
 - Uses the key `build-linux.sh` baked in; host keys go to
   `$LINUX_BUILD_DIR/known_hosts`, not `~/.ssh`.
 - Refuses kernel/dtb updates on a JTAG/initramfs boot (there's no SD root).
 
-New packages or changes elsewhere in the rootfs still need a full reflash (§11).
+New packages or changes elsewhere in the rootfs still need a full reflash — over the
+network with `linux/reflash-over-ssh.sh <ip>` (no JTAG: it boots the new kernel with
+the ramdisk rootfs once, streams `sdcard.img` onto the card and verifies it), or §11.
 
 ---
 

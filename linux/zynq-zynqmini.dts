@@ -8,7 +8,7 @@
  *   - on-board eMMC on SD1 (sdhci1), 4-bit, non-removable
  *   - Ethernet PHY is an RTL8211E (addr 0) instead of the ZedBoard's 88E1518
  *   - PS LED on MIO9, PS button on MIO0
- *   - axi_regs (this project's VHDL AXI slave) exported as a UIO node
+ *   - axi_regs (this project's VHDL AXI slave) comes from the PL bundle's overlay
  *
  * MIO map: doc/mio_map.md.  PS7 config: scripts/ps7_base_config.tcl.
  * Build/boot instructions: doc/linux_build.md.
@@ -74,15 +74,22 @@
 	};
 
 	/*
-	 * axi_regs — the VHDL AXI slave at the base of M_AXI_GP0 (src/hdl/axi_regs.vhd).
-	 * Not a block-design IP, so no generated node; reach it via UIO once the PL
-	 * is configured.  SIGNATURE at 0x4000001C reads 0x5A5A1234.  See doc/notes.md.
-	 * 64 KB: registers at 0x0000, the oscilloscope capture RAM at 0x8000-0xFFFF.
+	 * No PL devices here: each FPGA design brings its own device-tree overlay
+	 * for the zynq-7000.dtsi "fpga-region" (linux/pl/zynq-mini-pl.dtso, part of
+	 * the PL bundle), applied by fpgad together with the bitstream. A design
+	 * with a different register window therefore needs no new dtb and no
+	 * reboot - see doc/network_update.md.
 	 */
-	axi_regs@40000000 {
-		compatible = "generic-uio";
-		reg = <0x40000000 0x10000>;
-	};
+};
+
+/*
+ * Hardware watchdog: fpgad kicks it only after a register read returned, so a
+ * design that hangs the bus resets the board (doc/network_update.md). Without
+ * reset-on-timeout the Cadence WDT only raises an interrupt ("Internal reset
+ * not enabled") and the board stays hung.
+ */
+&watchdog0 {
+	reset-on-timeout;
 };
 
 &clkc {

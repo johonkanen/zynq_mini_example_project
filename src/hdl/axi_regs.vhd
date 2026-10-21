@@ -24,6 +24,8 @@
 --   0x1C  SIGNATURE  RO    PL -> PS   constant 0x5A5A_1234
 --   0x20  OLED_CTRL  R/W   PS -> PL   SSD1306 controls (reset 0x0000_7F01)
 --   0x24  OLED_STAT  RO    PL -> PS   SSD1306 driver status
+--   0x28  BUILD_ID   RO    PL -> PS   build timestamp (Unix seconds), generic BUILD_ID
+--   0x2C  REGMAP     RO    PL -> PS   register-map version (REGMAP_VERSION below)
 --   0x40  SCOPE_CMD  W     PS -> PL   bit0 arm, bit1 force trigger, bit2 abort (pulses)
 --   0x44  SCOPE_STAT RO    PL -> PS   capture state (see below)
 --   0x48  SCOPE_TRIG R/W   PS -> PL   [1:0] channel, bit4 falling, [31:16] level (signed)
@@ -67,6 +69,9 @@ use work.axi_pkg.all;
 use work.scope_pkg.all;
 
 entity axi_regs is
+    generic (
+        BUILD_ID : std_logic_vector(31 downto 0) := x"00000000"   -- set by scripts/build.tcl
+    );
     port (
         -- exported register view (for PL user logic)
         reg_ps2pl_o   : out std_logic_vector(4*AXI_DATA_WIDTH-1 downto 0);
@@ -100,6 +105,12 @@ architecture rtl of axi_regs is
     constant IDX_OLED_CTRL : integer := 8;                 -- 0x20
     constant IDX_OLED_STAT : integer := 9;                 -- 0x24
     constant IDX_TEXT      : integer := 32;                -- 0x80..0xFC
+    constant IDX_BUILD_ID   : integer := 10;               -- 0x28
+    constant IDX_REGMAP     : integer := 11;               -- 0x2C
+    -- Bump on every incompatible change to this map; fpgad and PL bundle
+    -- manifests check it (doc/network_update.md).
+    --   1: OLED, scope, BUILD_ID/REGMAP (this map)
+    constant REGMAP_VERSION : integer := 1;
     constant IDX_SCOPE_CMD  : integer := 16;               -- 0x40
     constant IDX_SCOPE_STAT : integer := 17;               -- 0x44
     constant IDX_SCOPE_CFG  : integer := 18;               -- 0x48..0x54: TRIG PRE DIV SRC
@@ -293,6 +304,8 @@ begin
                 when 7             => rd_word <= x"5A5A1234";
                 when IDX_OLED_CTRL => rd_word <= oled_ctrl;
                 when IDX_OLED_STAT => rd_word <= oled_stat_i;
+                when IDX_BUILD_ID  => rd_word <= BUILD_ID;
+                when IDX_REGMAP    => rd_word <= std_logic_vector(to_unsigned(REGMAP_VERSION, 32));
                 when IDX_SCOPE_CMD => rd_word <= (others => '0');
                 when IDX_SCOPE_STAT =>
                     rd_word <= (others => '0');
