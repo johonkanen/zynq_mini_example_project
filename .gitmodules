@@ -1,3 +1,4 @@
 [submodule "src/hVHDL_gigabit_ethernet"]
 	path = src/hVHDL_gigabit_ethernet
 	url = https://github.com/hVHDL/hVHDL_gigabit_ethernet.git
+	branch = main

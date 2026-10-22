@@ -11,7 +11,8 @@
 # The bundle holds one artifact for the board's "pl" repository (type trees):
 #
 #   design/zynq-mini-pl.bit.bin   bitstream as the FPGA manager wants it (bit2bin.py)
-#   design/zynq-mini-pl.dtbo      linux/pl/zynq-mini-pl.dtso, compiled with dtc -@
+#   design/zynq-mini-pl.dtbo      linux/pl/zynq-mini-pl.dtso (zynq-mini-pl-hvhdl.dtso for a
+#                                 PL_ETH=hvhdl build), compiled with dtc -@
 #   design/manifest.json          version, build_id, regmap, git, date, sha256
 #
 # fpgad checks build_id and regmap against the loaded design's BUILD_ID and
@@ -32,7 +33,14 @@ KEYS="$LINUX_BUILD_DIR/rauc-keys"
 PROJECT=arm_fpga_zynq_mini
 BIT="$REPO/output/$PROJECT.bit"
 BUILD_ID_FILE="$REPO/output/$PROJECT.build_id"
-DTSO="${PL_DTSO:-$REPO/linux/pl/zynq-mini-pl.dtso}"   # PL_DTSO: another overlay (tests)
+# the overlay that belongs to the build's PL Ethernet variant (scripts/config.tcl,
+# recorded by build.tcl): gem1 -> eth1 in the overlay, hvhdl -> the PL MAC, no gem1
+PL_ETH=$(cat "$REPO/output/$PROJECT.pl_eth" 2>/dev/null || echo gem1)
+case "$PL_ETH" in
+    hvhdl) DEFAULT_DTSO="$REPO/linux/pl/zynq-mini-pl-hvhdl.dtso" ;;
+    *)     DEFAULT_DTSO="$REPO/linux/pl/zynq-mini-pl.dtso" ;;
+esac
+DTSO="${PL_DTSO:-$DEFAULT_DTSO}"   # PL_DTSO: another overlay (tests)
 COMPATIBLE=zynq-mini
 
 die() { printf '\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
@@ -102,4 +110,4 @@ rm -f "$out"
 PATH="$HOST:$PATH" "$HOST/rauc" bundle --cert="$KEYS/signing.cert.pem" --key="$KEYS/signing.key.pem" \
     "$b" "$out" >/dev/null
 ln -sfn "$(basename "$out")" "$REPO/output/pl-latest.raucb"
-echo "PL bundle $version (build_id $build_id, regmap $regmap) -> $out"
+echo "PL bundle $version (build_id $build_id, regmap $regmap, PL Ethernet $PL_ETH) -> $out"

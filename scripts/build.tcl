@@ -60,12 +60,20 @@ foreach x $XDC_SOURCES {
 #-----------------------------------------------------------------------------
 source [file join $SCRIPT_DIR create_bd.tcl]
 
-# Keep a regenerable Tcl copy of the BD next to the scripts.
-write_bd_tcl -force [file join $SCRIPT_DIR "${BD_NAME}_bd.tcl"]
+# Keep a regenerable Tcl copy of the BD next to the scripts (the default variant's).
+if {$PL_ETH eq "gem1"} {
+    write_bd_tcl -force [file join $SCRIPT_DIR "${BD_NAME}_bd.tcl"]
+}
 
 #-----------------------------------------------------------------------------
 # Hand-written VHDL top level - instantiates the block design
 #-----------------------------------------------------------------------------
+if {[llength $ETH_SOURCES] < 3} {
+    error "hVHDL_gigabit_ethernet is missing - run: git submodule update --init --recursive"
+}
+set eth_files [add_files -norecurse -fileset sources_1 $ETH_SOURCES]
+set_property library $ETH_LIB $eth_files
+set_property file_type "VHDL 2008" $eth_files
 add_files -norecurse -fileset sources_1 $TOP_SOURCES
 foreach f $TOP_SOURCES {
     set_property file_type "VHDL 2008" [get_files [file tail $f]]
@@ -75,7 +83,9 @@ set_property top $TOP_MODULE [current_fileset]
 # BUILD_ID: the build's Unix time, readable at axi_regs 0x28 and recorded next to
 # the bitstream (output/<project>.build_id) for PL bundle manifests.
 set BUILD_ID [clock seconds]
-set_property generic "BUILD_ID=32'h[format %08X $BUILD_ID]" [current_fileset]
+set PL_ETH_N [expr {$PL_ETH eq "hvhdl" ? 1 : 0}]
+set_property generic "BUILD_ID=32'h[format %08X $BUILD_ID] PL_ETH=$PL_ETH_N" [current_fileset]
+puts "\[build] PL_ETH = $PL_ETH"
 puts "\[build] BUILD_ID = $BUILD_ID ([clock format $BUILD_ID -format {%Y-%m-%d %H:%M:%S} -gmt 1] UTC)"
 update_compile_order -fileset sources_1
 puts "\[build] top module = $TOP_MODULE ([file tail [lindex $TOP_SOURCES end]])"
@@ -131,6 +141,10 @@ file copy -force \
 puts "\[build] bitstream  -> $bit"
 set fh [open [file join $OUTPUT_DIR "$PROJECT_NAME.build_id"] w]
 puts $fh $BUILD_ID
+close $fh
+# which PL Ethernet this bitstream has - make-pl-bundle.sh picks the overlay by it
+set fh [open [file join $OUTPUT_DIR "$PROJECT_NAME.pl_eth"] w]
+puts $fh $PL_ETH
 close $fh
 
 set xsa [file join $OUTPUT_DIR "$PROJECT_NAME.xsa"]

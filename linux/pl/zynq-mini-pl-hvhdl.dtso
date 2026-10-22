@@ -1,0 +1,32 @@
+// SPDX-License-Identifier: MIT
+/*
+ * zynq-mini-pl-hvhdl.dtso - the Linux view of this FPGA design, as a device-tree
+ * overlay for the base DT's fpga-region (zynq-7000.dtsi).
+ *
+ * Applying it (fpgad, via /sys/kernel/config/device-tree/overlays) makes the
+ * kernel program the PL from /lib/firmware/<firmware-name> first, then create
+ * the nodes below. Removing it unbinds them before the next design goes in.
+ * Ships inside the PL bundle next to the bitstream (linux/make-pl-bundle.sh),
+ * so a design with another register window brings its own.
+ *
+ *   axi_regs: src/hdl/axi_regs.vhd at the base of M_AXI_GP0, 64 KB:
+ *   registers at 0x0000, oscilloscope capture RAM at 0x8000-0xFFFF.
+ *   generic-uio -> /dev/uioN (kernel arg uio_pdrv_genirq.of_id=generic-uio).
+ *
+ *   This is the PL_ETH = hvhdl build (scripts/config.tcl): the PL-side PHY is
+ *   driven by the MAC in the PL (src/hdl/eth_mac.vhd), so there is no gem1 /
+ *   eth1 here - linux/pl/zynq-mini-pl.dtso is the overlay of the default build.
+ */
+/dts-v1/;
+/plugin/;
+
+&{/fpga-region} {
+	firmware-name = "zynq-mini-pl.bit.bin";
+	#address-cells = <1>;
+	#size-cells = <1>;
+
+	axi_regs@40000000 {
+		compatible = "generic-uio";
+		reg = <0x40000000 0x10000>;
+	};
+};

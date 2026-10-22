@@ -109,8 +109,9 @@ and its QMTech sibling, **including building Linux** — see [`doc/notes.md`](do
 | `doc/notes.md`                | board details, Linux-boot resources (Habr series), `axi_regs` from Linux |
 | `doc/linux_build.md`          | step-by-step: build a bootable SD-card Linux image with Buildroot |
 | `doc/network_update.md`       | **plan + design for network updates** of FPGA, Linux and software (RAUC, signed, no JTAG) |
-| `doc/hvhdl_ethernet.md`       | **plan** for a PL Ethernet MAC from hVHDL_gigabit_ethernet |
-| `src/hVHDL_gigabit_ethernet/` | git submodule: [hVHDL_gigabit_ethernet](https://github.com/hVHDL/hVHDL_gigabit_ethernet) (RGMII MAC, VHDL) — clone with `--recurse-submodules`, or `git submodule update --init` |
+| `doc/hvhdl_ethernet.md`       | a PL Ethernet MAC from hVHDL_gigabit_ethernet: plan and phase 1 (`PL_ETH=hvhdl ./build.sh`) |
+| `src/hVHDL_gigabit_ethernet/` | git submodule, kept at the tip of its `main`: [hVHDL_gigabit_ethernet](https://github.com/hVHDL/hVHDL_gigabit_ethernet) (`ethernet_mac`: RGMII MAC, VHDL) — clone with `--recurse-submodules`, or `git submodule update --init --recursive` |
+| `src/hdl/eth_mac.vhd`, `rgmii_rx_xilinx.vhd`, `rgmii_tx_xilinx.vhd` | `ethernet_mac` on the PL PHY with 7-series RGMII I/O (echo test); `src/constrs/pl_eth_hvhdl.xdc` its RGMII timing |
 
 `build/` and `output/` are generated and git-ignored. Everything is VHDL-2008.
 
@@ -125,6 +126,10 @@ build.bat synth      :: stop after synthesis
 build.bat impl       :: stop after implementation
 build.bat gui        :: create the project and open the Vivado GUI
 ```
+
+**PL Ethernet variant:** `PL_ETH=hvhdl ./build.sh` builds the design with
+hVHDL_gigabit_ethernet's MAC on the PL-side PHY instead of GEM1 (Linux `eth1`); the
+default is `PL_ETH=gem1` (see `doc/hvhdl_ethernet.md`).
 
 Linux/WSL: `./build.sh [bd|synth|impl|gui]`. Direct:
 `vivado -mode batch -source scripts/build.tcl -tclargs bd`.

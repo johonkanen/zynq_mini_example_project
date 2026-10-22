@@ -12,7 +12,9 @@
 --     +-- u_siggen : scope_siggen   (oscilloscope test signals)
 --     +-- u_scope : scope_capture   (4-channel triggered capture, read via axi_regs)
 --     +-- u_hrpwm : hrpwm           (high-resolution PWM on the EXT IO header)
---     +-- PL Ethernet PHY reset     (the RGMII/MDIO path itself is in the BD: eth1)
+--     +-- PL Ethernet: PL_ETH = 0 -> GEM1 through the BD's gmii_to_rgmii (Linux eth1)
+--                      PL_ETH = 1 -> u_eth_mac: hVHDL_gigabit_ethernet's MAC in the PL (echo test)
+--       + the PHY reset (both)
 --     +-- placeholder PL user logic
 --
 -- Entity ports = the physical device pins: DDR_* + FIXED_IO_* (constrained
@@ -24,12 +26,16 @@ library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
+library unisim;
+use unisim.vcomponents.all;
+
 use work.axi_pkg.all;
 use work.scope_pkg.all;
 
 entity zynq_mini_top is
     generic (
-        BUILD_ID : std_logic_vector(31 downto 0) := x"00000000"   -- scripts/build.tcl: Unix time
+        BUILD_ID : std_logic_vector(31 downto 0) := x"00000000";  -- scripts/build.tcl: Unix time
+        PL_ETH   : natural := 0         -- scripts/build.tcl (PL_ETH env): 0 = GEM1/eth1, 1 = hVHDL MAC
     );
     port (
         DDR_addr          : inout std_logic_vector(14 downto 0);
@@ -66,7 +72,7 @@ entity zynq_mini_top is
         ext_lo            : out std_logic_vector(18 downto 2);
         ext_hi            : out std_logic_vector(39 downto 23);
 
-        -- second Ethernet: RTL8211E on PL pins (GEM1 via gmii_to_rgmii -> eth1)
+        -- second Ethernet: RTL8211E on PL pins (GEM1 -> eth1, or the hVHDL MAC: PL_ETH)
         eth_rgmii_td      : out   std_logic_vector(3 downto 0);
         eth_rgmii_tx_ctl  : out   std_logic;
         eth_rgmii_txc     : out   std_logic;
@@ -114,6 +120,13 @@ architecture rtl of zynq_mini_top is
     constant PHY_RESET_CLKS : natural := 2_000_000;           -- 20 ms at 100 MHz (>= 10 ms)
     signal phy_rst_cnt : natural range 0 to PHY_RESET_CLKS := 0;
 
+    -- the GMII-to-RGMII converter's side (PL_ETH = 0)
+    signal ps_rgmii_td                : std_logic_vector(3 downto 0);
+    signal ps_rgmii_tx_ctl, ps_rgmii_txc : std_logic;
+    signal ps_rgmii_rd                : std_logic_vector(3 downto 0) := (others => '0');
+    signal ps_rgmii_rx_ctl, ps_rgmii_rxc : std_logic := '0';
+    signal ps_mdc, ps_mdio_i, ps_mdio_o, ps_mdio_t : std_logic;
+
     -- ===== placeholder PL user logic ====================================
     signal heartbeat  : unsigned(27 downto 0) := (others => '0');
     signal user_probe : std_logic_vector(31 downto 0);
@@ -126,19 +139,22 @@ begin
     -- Processing system (block design + M_AXI_GP0 packed into records)
     ---------------------------------------------------------------------------
     u_ps : entity work.zynq_ps_wrapper
+        generic map (PL_ETH => PL_ETH)
         port map (
             clk               => clk,
             resetn            => resetn,
             m_axi_o           => ps_axi_o,
             m_axi_i           => ps_axi_i,
-            rgmii_td          => eth_rgmii_td,
-            rgmii_tx_ctl      => eth_rgmii_tx_ctl,
-            rgmii_txc         => eth_rgmii_txc,
-            rgmii_rd          => eth_rgmii_rd,
-            rgmii_rx_ctl      => eth_rgmii_rx_ctl,
-            rgmii_rxc         => eth_rgmii_rxc,
-            mdio_mdc          => eth_mdc,
-            mdio_io           => eth_mdio,
+            rgmii_td          => ps_rgmii_td,
+            rgmii_tx_ctl      => ps_rgmii_tx_ctl,
+            rgmii_txc         => ps_rgmii_txc,
+            rgmii_rd          => ps_rgmii_rd,
+            rgmii_rx_ctl      => ps_rgmii_rx_ctl,
+            rgmii_rxc         => ps_rgmii_rxc,
+            mdio_mdc          => ps_mdc,
+            mdio_i            => ps_mdio_i,
+            mdio_o            => ps_mdio_o,
+            mdio_t            => ps_mdio_t,
             DDR_addr          => DDR_addr,
             DDR_ba            => DDR_ba,
             DDR_cas_n         => DDR_cas_n,
@@ -273,6 +289,41 @@ begin
         end if;
     end process;
     eth_phy_rst_n <= '1' when phy_rst_cnt = PHY_RESET_CLKS else '0';
+
+    ---------------------------------------------------------------------------
+    -- PL Ethernet pins: GEM1's converter (Linux eth1) or the hVHDL MAC
+    ---------------------------------------------------------------------------
+    gen_eth_gem1 : if PL_ETH = 0 generate
+        eth_rgmii_td     <= ps_rgmii_td;
+        eth_rgmii_tx_ctl <= ps_rgmii_tx_ctl;
+        eth_rgmii_txc    <= ps_rgmii_txc;
+        ps_rgmii_rd      <= eth_rgmii_rd;
+        ps_rgmii_rx_ctl  <= eth_rgmii_rx_ctl;
+        ps_rgmii_rxc     <= eth_rgmii_rxc;
+        eth_mdc          <= ps_mdc;
+        u_mdio_buf : IOBUF
+            port map (I => ps_mdio_o, O => ps_mdio_i, T => ps_mdio_t, IO => eth_mdio);
+    end generate;
+
+    -- hVHDL_gigabit_ethernet's ethernet_mac in the PL (doc/hvhdl_ethernet.md): the
+    -- echo test. It owns the PHY, MDIO included.
+    gen_eth_hvhdl : if PL_ETH /= 0 generate
+        u_eth_mac : entity work.eth_mac
+            port map (
+                clk          => clk,
+                rgmii_rxc    => eth_rgmii_rxc,
+                rgmii_rd     => eth_rgmii_rd,
+                rgmii_rx_ctl => eth_rgmii_rx_ctl,
+                rgmii_txc    => eth_rgmii_txc,
+                rgmii_td     => eth_rgmii_td,
+                rgmii_tx_ctl => eth_rgmii_tx_ctl,
+                mdc          => eth_mdc,
+                mdio         => eth_mdio,
+                echoed       => open,
+                ignored      => open
+            );
+        ps_mdio_i <= '1';
+    end generate;
 
     ---------------------------------------------------------------------------
     -- placeholder PL user logic - replace it

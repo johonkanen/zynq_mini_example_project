@@ -110,6 +110,9 @@ set_property CONFIG.POLARITY       ACTIVE_LOW                    [get_bd_ports F
 #     address 8 (speed register) next to the PHY at address 1. Linux:
 #     linux/pl/zynq-mini-pl.dtso (gem1 + xlnx,gmii-to-rgmii-1.0).
 #-----------------------------------------------------------------------------
+# PL_ETH = hvhdl (scripts/config.tcl): no converter - the PL MAC owns the PHY, and
+# GEM1's EMIO side stays unconnected. The PS7 settings above are the same either way.
+if {$PL_ETH eq "gem1"} {
 set g2r [create_bd_cell -type ip -vlnv xilinx.com:ip:gmii_to_rgmii:4.1 gmii_to_rgmii_0]
 set_property -dict [list \
     CONFIG.SupportLevel      {Include_Shared_Logic_in_Core} \
@@ -129,6 +132,7 @@ connect_bd_net [get_bd_pins gmii_to_rgmii_rst/Res] [get_bd_pins gmii_to_rgmii_0/
                [get_bd_pins gmii_to_rgmii_0/rx_reset]
 make_bd_intf_pins_external -name RGMII    [get_bd_intf_pins gmii_to_rgmii_0/RGMII]
 make_bd_intf_pins_external -name MDIO_PHY [get_bd_intf_pins gmii_to_rgmii_0/MDIO_PHY]
+}
 
 #-----------------------------------------------------------------------------
 # 4. Record the M_AXI_GP0 window (0x4000_0000, 1 GB) in the address map so the
