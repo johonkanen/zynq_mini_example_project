@@ -10,6 +10,7 @@
  *   fpgactl stream 200 20 0x10         prints data/status lines until Ctrl-C
  *   fpgactl oled 0 "Hello, world"      text on OLED row 0..7 (16 chars) / oled clear
  *   fpgactl sensors                    XADC die temperature + supply rails
+ *   fpgactl eth                        the PL Ethernet MAC: counters, settings, PHY link
  *   fpgactl raw "<request line>"
  *
  * -s <socket> or $FPGAD_SOCKET selects the socket (default /var/run/fpgad.sock).
@@ -28,6 +29,8 @@ static const struct { uint32_t off; const char *name, *acc; } REGS[] = {
     { 0x10, "HEARTBEAT", "ro" }, { 0x14, "SUM", "ro" },
     { 0x18, "STATUS", "ro" },   { 0x1C, "SIGNATURE", "ro" },
     { 0x20, "OLED_CTRL", "rw" }, { 0x24, "OLED_STAT", "ro" },
+    { 0x28, "BUILD_ID", "ro" },  { 0x2C, "REGMAP", "ro" },
+    { 0x30, "FEATURES", "ro" },
 };
 
 static int usage(void)
@@ -35,7 +38,7 @@ static int usage(void)
     fprintf(stderr,
             "usage: fpgactl [-s socket] <command>\n"
             "  status | regs | read <off> | write <off> <val> | pl | activate [dir]\n"
-            "  stream <hz> <batch_hz> <off>... | oled <row> <text> | oled clear | sensors\n"
+            "  stream <hz> <batch_hz> <off>... | oled <row> <text> | oled clear | sensors | eth\n"
             "  raw \"<line>\"\n");
     return 2;
 }

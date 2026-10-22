@@ -17,8 +17,10 @@
  *   - the hardware watchdog (/dev/watchdog) is kicked only after a register
  *     read returned, so a bus hang resets the board instead of needing JTAG
  *   - a design that drops the PL Ethernet fails its trial: if eth1 (GEM1 through
- *     the PL, a port of the br0 bridge) had a link before, it must have one again
- *     within NET_WAIT_S - else someone connected through that port loses the board
+ *     the PL, a port of the br0 bridge) was the board's only link before, it must
+ *     have one again within NET_WAIT_S - else someone connected through that port
+ *     loses the board. With eth0 linked too, the board stays reachable through it
+ *     (and a design may use the PL port for something else, doc/hvhdl_ethernet.md)
  *
  * Protocol (one request line in, one response line out; text, '\n'-ended):
  *   ping                          -> ok pong
@@ -31,6 +33,9 @@
  *        good design if it passes, else the good one is reloaded (err ...).
  *   load <dir>                    -> same as activate
  *   pl                            -> ok {"loaded":true,"version":...,"build_id":...}
+ *   eth                           -> ok {"present":true,"frames_rx":...}  the PL Ethernet MAC
+ *        (hVHDL_gigabit_ethernet, doc/hvhdl_ethernet.md): counters, settings, PHY link;
+ *        {"present":false} when the loaded design doesn't have it
  *   oled <row> <text>             -> ok                (OLED row 0..7, 16 chars;
  *                                     the rest of the line, spaces kept)
  *   oled clear                    -> ok
@@ -88,6 +93,8 @@
 #define REG_HEARTBEAT   0x10
 #define REG_BUILD_ID    0x28
 #define REG_REGMAP      0x2C
+#define REG_FEATURES    0x30            /* bit0: the PL Ethernet MAC (PL_ETH=hvhdl build) */
+#define REG_ETH         0x4000          /* ETH window: ethernet_mac's APB registers, eth_mac's */
 #define REG_SIGNATURE   0x1C
 #define SIGNATURE_VALUE 0x5A5A1234u
 #define REG_OLED_CTRL   0x20
@@ -420,7 +427,7 @@ static int reg_access(int write, uint32_t off, uint32_t *val, char *err, size_t 
 #define OVERLAY_DIR     "/sys/kernel/config/device-tree/overlays/pl"
 
 /* register maps this fpgad understands (axi_regs.vhd REGMAP_VERSION) */
-static const uint32_t REGMAPS[] = { 1 };
+static const uint32_t REGMAPS[] = { 1, 2 };   /* 2: + FEATURES, ETH window (axi_regs.vhd) */
 
 static char pl_dir[128] = "/data/pl";               /* good/ + trial marker; FPGAD_PL_DIR */
 
@@ -747,12 +754,19 @@ static void trial_clear(void)
 /* the PL Ethernet (linux/pl/zynq-mini-pl.dtso): eth1 exists only while a design
  * with the GEM1 path is loaded */
 #define NET_IF      "eth1"
+#define NET_OTHER   "eth0"      /* the PS port, independent of the PL */
 #define NET_WAIT_S  20          /* overlay -> eth1 -> br0 port -> PHY autoneg */
+
+static int carrier(const char *ifname)
+{
+    char path[64], v[8];
+    snprintf(path, sizeof path, "/sys/class/net/%s/carrier", ifname);
+    return !sim && read_sysfs(path, v, sizeof v) == 0 && !strcmp(v, "1");
+}
 
 static int net_carrier(void)
 {
-    char v[8];
-    return !sim && read_sysfs("/sys/class/net/" NET_IF "/carrier", v, sizeof v) == 0 && !strcmp(v, "1");
+    return carrier(NET_IF);
 }
 
 /* wait for eth1's link without holding pl_lock: the watchdog thread must keep
@@ -795,7 +809,7 @@ static int pl_activate(const char *dir, char *err, size_t n)
         }
     }
 
-    int net_was_up = net_carrier();
+    int net_was_up = net_carrier() && !carrier(NET_OTHER);   /* eth1 was the only way in */
     pthread_rwlock_wrlock(&pl_lock);
     trial_mark(d.version);              /* a reset from here on means: back to good */
     int rc = load_design_locked(dir, err, n);
@@ -1198,6 +1212,93 @@ static int xadc_find(void)
     return 0;
 }
 
+/* ---- the PL Ethernet MAC (axi_regs ETH window) ---------------------------- */
+
+/* ethernet_mac's registers (Efinix TSEMAC offsets) and eth_mac's own */
+#define ETH_COMMAND_CONFIG  0x008
+#define ETH_MAC_ADDR_LO     0x00c
+#define ETH_MAC_ADDR_HI     0x010
+#define ETH_FRAMES_TX       0x068
+#define ETH_FRAMES_RX       0x06c
+#define ETH_CRC_ERRORS      0x070
+#define ETH_IN_ERRORS       0x088
+#define ETH_OUT_ERRORS      0x08c
+#define ETH_MDIO_RD_WR_EN   0x104
+#define ETH_MDIO_REG_PHY    0x108
+#define ETH_MDIO_RD_DATA    0x110
+#define ETH_MDIO_STATUS     0x114
+#define ETH_ECHOED          0x200
+#define ETH_IGNORED         0x204
+#define ETH_PHY_ADDR        1           /* the PL-side RTL8211E */
+
+static int eth_read(uint32_t off, uint32_t *v, char *err, size_t n)
+{
+    return reg_access(0, REG_ETH + off, v, err, n);
+}
+
+static int eth_write(uint32_t off, uint32_t v, char *err, size_t n)
+{
+    return reg_access(1, REG_ETH + off, &v, err, n);
+}
+
+/* one PHY register through the MAC's MDIO */
+static int eth_mdio_read(unsigned reg, uint32_t *v, char *err, size_t n)
+{
+    uint32_t st = 0;
+    if (eth_write(ETH_MDIO_REG_PHY, (ETH_PHY_ADDR << 8) | reg, err, n) || eth_write(ETH_MDIO_RD_WR_EN, 1, err, n))
+        return -1;
+    for (int i = 0; i < 100; i++) {                 /* ~30 us at 2.5 MHz MDC */
+        if (eth_read(ETH_MDIO_STATUS, &st, err, n))
+            return -1;
+        if (!(st & 2))
+            return eth_read(ETH_MDIO_RD_DATA, v, err, n);
+        usleep(50);
+    }
+    snprintf(err, n, "MDIO read of PHY register %u timed out", reg);
+    return -1;
+}
+
+static void do_eth(int fd)
+{
+    char err[160], out[640];
+    uint32_t f, cmd, lo, hi, tx, rx, crc, ine, oute, echoed, ignored, physr = 0;
+    if (sim) {
+        sendf(fd, "ok {\"present\":false}\n");
+        return;
+    }
+    if (reg_access(0, REG_FEATURES, &f, err, sizeof err)) {
+        sendf(fd, "err %s\n", err);
+        return;
+    }
+    if (!(f & 1)) {
+        sendf(fd, "ok {\"present\":false}\n");
+        return;
+    }
+    if (eth_read(ETH_COMMAND_CONFIG, &cmd, err, sizeof err) || eth_read(ETH_MAC_ADDR_LO, &lo, err, sizeof err) ||
+        eth_read(ETH_MAC_ADDR_HI, &hi, err, sizeof err) || eth_read(ETH_FRAMES_TX, &tx, err, sizeof err) ||
+        eth_read(ETH_FRAMES_RX, &rx, err, sizeof err) || eth_read(ETH_CRC_ERRORS, &crc, err, sizeof err) ||
+        eth_read(ETH_IN_ERRORS, &ine, err, sizeof err) || eth_read(ETH_OUT_ERRORS, &oute, err, sizeof err) ||
+        eth_read(ETH_ECHOED, &echoed, err, sizeof err) || eth_read(ETH_IGNORED, &ignored, err, sizeof err)) {
+        sendf(fd, "err %s\n", err);
+        return;
+    }
+    /* RTL8211E PHY specific status (0x11): bit10 link, 13 full duplex, 15:14 speed */
+    int phy_ok = eth_mdio_read(0x11, &physr, err, sizeof err) == 0;
+    static const int speeds[] = { 10, 100, 1000, 0 };
+    snprintf(out, sizeof out,
+             "ok {\"present\":true,\"mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"rx_enabled\":%s,\"tx_enabled\":%s,"
+             "\"promiscuous\":%s,\"frames_rx\":%" PRIu32 ",\"frames_tx\":%" PRIu32 ",\"crc_errors\":%" PRIu32 ","
+             "\"in_errors\":%" PRIu32 ",\"out_errors\":%" PRIu32 ",\"echoed\":%" PRIu32 ",\"ignored\":%" PRIu32 ","
+             "\"link\":%s,\"speed\":%d,\"full_duplex\":%s}\n",
+             lo & 0xff, (lo >> 8) & 0xff, (lo >> 16) & 0xff, lo >> 24, hi & 0xff, (hi >> 8) & 0xff,
+             cmd & 2 ? "true" : "false", cmd & 1 ? "true" : "false", cmd & 16 ? "true" : "false",
+             rx, tx, crc, ine, oute, echoed, ignored,
+             !phy_ok ? "null" : (physr & (1u << 10)) ? "true" : "false",
+             phy_ok ? speeds[(physr >> 14) & 3] : 0,
+             !phy_ok ? "null" : (physr & (1u << 13)) ? "true" : "false");
+    sendf(fd, "%s", out);
+}
+
 static void do_sensors(int fd)
 {
     char out[512];
@@ -1423,8 +1524,10 @@ static void handle_line(int fd, char *line)
         do_capture(fd, argv, argc);
     } else if (!strcmp(argv[0], "sensors")) {
         do_sensors(fd);
+    } else if (!strcmp(argv[0], "eth")) {
+        do_eth(fd);
     } else {
-        sendf(fd, "err unknown command '%s' (ping status read write activate pl stream oled capture sensors)\n",
+        sendf(fd, "err unknown command '%s' (ping status read write activate pl stream oled capture sensors eth)\n",
               argv[0]);
     }
 }

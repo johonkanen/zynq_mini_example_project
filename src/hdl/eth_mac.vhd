@@ -13,8 +13,11 @@
 --
 --   receive  ethernet_mac m_t* (rx_clk) -> frame buffer, addresses swapped
 --   transmit frame buffer -> s_t* (tx_clk), gapless as ethernet_mac_tx needs
---   the MAC's registers (APB) are set once after reset: address, address mask,
---   RX/TX enable - phase 2 hands them to the PS
+--   the MAC's registers (APB) are set once after reset (address, address mask,
+--   RX/TX enable), then the PS reaches them through bus_* (axi_regs' ETH window,
+--   handshake with toggles):
+--     0x000..0x1FF  ethernet_mac's APB registers (Efinix TSEMAC offsets)
+--     0x200         frames echoed            0x204  frames ignored (other EtherType)
 --   MDIO: the MAC's, on the PHY's pins (the PHY keeps its power-on settings)
 -------------------------------------------------------------------------------
 
@@ -43,15 +46,25 @@ entity eth_mac is
         rgmii_tx_ctl : out   std_logic;
         mdc          : out   std_logic;
         mdio         : inout std_logic;
-        -- counters (registers come in phase 2)
-        echoed       : out   unsigned(15 downto 0);         -- tx_clk domain
-        ignored      : out   unsigned(15 downto 0)          -- rx_clk domain: other EtherTypes
+        -- the PS's access (axi_regs ETH window): address, write and data are held
+        -- from the request toggle until the acknowledge toggle
+        bus_req      : in    std_logic;
+        bus_write    : in    std_logic;
+        bus_addr     : in    std_logic_vector(10 downto 0);
+        bus_wdata    : in    std_logic_vector(31 downto 0);
+        bus_rdata    : out   std_logic_vector(31 downto 0);
+        bus_ack      : out   std_logic;
+        -- counters, tx_clk domain (also at 0x200 / 0x204)
+        echoed       : out   unsigned(31 downto 0);
+        ignored      : out   unsigned(31 downto 0)
     );
 end entity eth_mac;
 
 architecture rtl of eth_mac is
 
     constant BUF_BYTES : natural := 2048;                   -- a frame without FCS: 1514 (1518 tagged)
+
+    attribute ASYNC_REG : string;
 
     -- clocks and resets
     signal clkfb, clkfb_buf, clk125_mmcm, tx_clk, tx_locked : std_logic;
@@ -79,6 +92,12 @@ architecture rtl of eth_mac is
         (16#008#, x"00000003"));                            -- COMMAND_CONFIG: TX_ENA, RX_ENA
     signal setup_idx : natural range 0 to SETUP'length := 0;
 
+    -- the PS's bus, in tx_clk
+    signal bus_req_meta, bus_req_sync, bus_req_seen : std_logic := '0';
+    signal bus_ack_r   : std_logic := '0';
+    signal bus_rdata_r : std_logic_vector(31 downto 0) := (others => '0');
+    attribute ASYNC_REG of bus_req_meta, bus_req_sync : signal is "TRUE";
+
     -- MAC streams and pins
     signal s_tvalid, s_tready, s_tlast : std_logic := '0';
     signal s_tdata  : std_logic_vector(7 downto 0) := (others => '0');
@@ -105,7 +124,8 @@ architecture rtl of eth_mac is
     signal frame_len  : natural range 0 to BUF_BYTES := 0;    -- held for the transmit side
     signal req_tg     : std_logic := '0';
     signal done_meta, done_sync, done_seen : std_logic := '0';
-    signal n_ignored  : unsigned(15 downto 0) := (others => '0');
+    signal ignore_pulse, ignore_tx : boolean := false;
+    signal n_ignored  : unsigned(31 downto 0) := (others => '0');
 
     -- transmit side (tx_clk)
     type tx_state_t is (tx_idle, tx_send, tx_done);
@@ -115,9 +135,8 @@ architecture rtl of eth_mac is
     signal len_m1     : natural range 0 to BUF_BYTES := 0;   -- index of the last byte
     signal ra         : natural range 0 to BUF_BYTES - 1 := 0;  -- byte shown on s_tdata
     signal q          : std_logic_vector(7 downto 0) := (others => '0');
-    signal n_echoed   : unsigned(15 downto 0) := (others => '0');
+    signal n_echoed   : unsigned(31 downto 0) := (others => '0');
 
-    attribute ASYNC_REG : string;
     attribute ASYNC_REG of done_meta, done_sync, req_meta, req_sync : signal is "TRUE";
 
     function mac_byte(i : natural) return std_logic_vector is
@@ -198,28 +217,58 @@ begin
     mdio_t <= not mdio_oe;
     u_mdio_buf : IOBUF port map (I => mdio_out, O => mdio_in, T => mdio_t, IO => mdio);
 
-    -- set the registers once after reset (APB: setup clock, then access; pready is always 1)
-    apb_setup : process (tx_clk)
+    -- APB master: the set-up after reset first, then the PS's accesses (setup
+    -- clock, then access until pready - which ethernet_mac always gives)
+    bus_rdata <= bus_rdata_r;
+    bus_ack   <= bus_ack_r;
+
+    apb_master : process (tx_clk)
+        variable a : natural range 0 to 2047;
     begin
         if rising_edge(tx_clk) then
+            bus_req_meta <= bus_req;
+            bus_req_sync <= bus_req_meta;
+
             if reset = '1' then
-                setup_idx <= 0;
-                psel      <= '0';
-                penable   <= '0';
-                pwrite    <= '0';
-            elsif setup_idx < SETUP'length then
-                if psel = '0' then
-                    paddr  <= std_logic_vector(to_unsigned(SETUP(setup_idx).addr, 9));
-                    pwdata <= SETUP(setup_idx).data;
-                    pwrite <= '1';
-                    psel   <= '1';
-                elsif penable = '0' then
+                setup_idx    <= 0;
+                psel         <= '0';
+                penable      <= '0';
+                pwrite       <= '0';
+                bus_req_seen <= bus_req_sync;
+            elsif psel = '1' then                       -- a transfer is on
+                if penable = '0' then
                     penable <= '1';
                 elsif pready = '1' then
-                    psel      <= '0';
-                    penable   <= '0';
-                    pwrite    <= '0';
-                    setup_idx <= setup_idx + 1;
+                    psel    <= '0';
+                    penable <= '0';
+                    pwrite  <= '0';
+                    if setup_idx < SETUP'length then
+                        setup_idx <= setup_idx + 1;
+                    else                                -- the PS's: answer it
+                        bus_rdata_r <= prdata;
+                        bus_ack_r   <= not bus_ack_r;
+                    end if;
+                end if;
+            elsif setup_idx < SETUP'length then
+                paddr  <= std_logic_vector(to_unsigned(SETUP(setup_idx).addr, 9));
+                pwdata <= SETUP(setup_idx).data;
+                pwrite <= '1';
+                psel   <= '1';
+            elsif bus_req_sync /= bus_req_seen then
+                bus_req_seen <= bus_req_sync;
+                a := to_integer(unsigned(bus_addr));
+                if a < 16#200# then                     -- ethernet_mac's registers
+                    paddr  <= bus_addr(8 downto 0);
+                    pwdata <= bus_wdata;
+                    pwrite <= bus_write;
+                    psel   <= '1';
+                else                                    -- eth_mac's own, read only
+                    case a is
+                        when 16#200# => bus_rdata_r <= std_logic_vector(n_echoed);
+                        when 16#204# => bus_rdata_r <= std_logic_vector(n_ignored);
+                        when others  => bus_rdata_r <= (others => '0');
+                    end case;
+                    bus_ack_r <= not bus_ack_r;
                 end if;
             end if;
         end if;
@@ -235,9 +284,10 @@ begin
     echo_rx : process (rx_clk)
     begin
         if rising_edge(rx_clk) then
-            done_meta <= done_tg;
-            done_sync <= done_meta;
-            buf_we    <= '0';
+            done_meta    <= done_tg;
+            done_sync    <= done_meta;
+            buf_we       <= '0';
+            ignore_pulse <= false;
 
             case rx_state is
                 when rx_recv =>
@@ -265,7 +315,7 @@ begin
                                 req_tg    <= not req_tg;
                                 rx_state  <= rx_wait;
                             else
-                                n_ignored <= n_ignored + 1;
+                                ignore_pulse <= true;
                             end if;
                         elsif widx < BUF_BYTES then
                             widx <= widx + 1;
@@ -335,6 +385,20 @@ begin
                     done_tg  <= not done_tg;
                     tx_state <= tx_idle;
             end case;
+        end if;
+    end process;
+
+    -- the ignored frames, counted in tx_clk (at most one a frame: far enough apart)
+    u_ignore_cdc : entity hvhdl_ethernet.cdc_pulse
+        port map (source_clock => rx_clk, source_pulse => ignore_pulse,
+                  destination_clock => tx_clk, destination_pulse => ignore_tx);
+
+    count_ignored : process (tx_clk)
+    begin
+        if rising_edge(tx_clk) then
+            if ignore_tx then
+                n_ignored <= n_ignored + 1;
+            end if;
         end if;
     end process;
 

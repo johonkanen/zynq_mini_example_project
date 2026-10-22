@@ -301,9 +301,13 @@ versions at which step of the swap the reset came and restore `good` and `prev`.
 
 The post-install handler activates the **app set first, then the FPGA design**, so a
 new fpgad that understands a new register map runs before the design that needs it.
-Both activations skip a candidate that is already active (fpgad records the good
-design's source in `/data/pl/good.source`), so an app-only bundle doesn't reload the
-FPGA and a PL-only bundle doesn't restart the services.
+It activates **only what the bundle carries** (the `[image.apps/…]` / `[image.pl/…]`
+sections of its `manifest.raucm`, read from `$RAUC_BUNDLE_MOUNT_POINT`): RAUC's artifact
+links keep pointing at the last installed contents even after a trial rejected them,
+and the first version of the handler activated whatever they pointed at - an app bundle
+then brought back an FPGA design that had failed earlier (found 2026-10-22, when fpgad's
+`eth1` rule stopped refusing that design). Both activations also skip a candidate that is
+already active (fpgad records the good design's source in `/data/pl/good.source`).
 
 ### 2.5 Tools
 

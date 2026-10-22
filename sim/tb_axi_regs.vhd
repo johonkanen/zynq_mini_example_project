@@ -50,7 +50,35 @@ architecture sim of tb_axi_regs is
 
     type slv32_array is array (natural range <>) of std_logic_vector(31 downto 0);
 
+    -- the ETH window's device model: a register file in its own clock
+    signal features   : std_logic_vector(31 downto 0) := (others => '0');
+    signal dev_clk    : std_logic := '0';
+    signal dev_mute   : boolean := false;               -- never answer (timeout test)
+    signal ext_req, ext_write, ext_ack : std_logic := '0';
+    signal ext_addr   : std_logic_vector(10 downto 0);
+    signal ext_wdata, ext_rdata : std_logic_vector(31 downto 0) := (others => '0');
+
 begin
+
+    dev_clk <= not dev_clk after 4 ns when running else '0';
+
+    ext_device : process (dev_clk)
+        variable regfile : slv32_array(0 to 511) := (others => (others => '0'));
+        variable meta, sync, seen : std_logic := '0';
+    begin
+        if rising_edge(dev_clk) then
+            if sync /= seen and not dev_mute then
+                seen := sync;
+                if ext_write = '1' then
+                    regfile(to_integer(unsigned(ext_addr(10 downto 2)))) := ext_wdata;
+                end if;
+                ext_rdata <= regfile(to_integer(unsigned(ext_addr(10 downto 2))));
+                ext_ack   <= not ext_ack;
+            end if;
+            sync := meta;
+            meta := ext_req;
+        end if;
+    end process;
 
     clk_gen : process
     begin
@@ -69,6 +97,8 @@ begin
             oled_char_addr_i => oled_char_addr, oled_char_o => oled_char,
             scope_cfg_o => scope_cfg, scope_stat_i => scope_stat,
             scope_rd_addr_o => scope_rd_addr, scope_rd_data_i => scope_rd_data,
+            features_i => features, ext_req_o => ext_req, ext_write_o => ext_write,
+            ext_addr_o => ext_addr, ext_wdata_o => ext_wdata, ext_rdata_i => ext_rdata, ext_ack_i => ext_ack,
             s_axi_aclk => aclk, s_axi_aresetn => aresetn,
             s_axi_i => m2s, s_axi_o => s2m);
 
@@ -274,7 +304,7 @@ begin
                 axi_read(16#28#, r);
                 check_equal(r, std_logic_vector'(x"6512ABCD"), "BUILD_ID from the generic");
                 axi_read(16#2C#, r);
-                check_equal(r, std_logic_vector'(x"00000001"), "REGMAP version 1");
+                check_equal(r, std_logic_vector'(x"00000002"), "REGMAP version 2");
                 axi_write(16#28#, x"FFFFFFFF");                 -- read-only
                 axi_read(16#28#, r);
                 check_equal(r, std_logic_vector'(x"6512ABCD"), "BUILD_ID ignores writes");
@@ -329,8 +359,44 @@ begin
                 end loop;
                 axi_read(16#1C#, r);                            -- registers still fine after
                 check_equal(r, std_logic_vector'(x"5A5A1234"), "SIGNATURE after RAM reads");
-                axi_read(16#401C#, r);                          -- regs repeat below 0x8000
-                check_equal(r, std_logic_vector'(x"5A5A1234"), "SIGNATURE alias at 0x401C");
+                axi_read(16#201C#, r);                          -- regs repeat below 0x4000
+                check_equal(r, std_logic_vector'(x"5A5A1234"), "SIGNATURE alias at 0x201C");
+
+            elsif run("eth_window_without_the_mac") then
+                axi_read(16#30#, r);
+                check_equal(r, std_logic_vector'(x"00000000"), "FEATURES: no MAC");
+                axi_write(16#4008#, x"00000003");               -- completes at once
+                axi_read(16#4008#, r);
+                check_equal(r, std_logic_vector'(x"00000000"), "ETH window reads 0 without the MAC");
+                check_equal(ext_req, '0', "no request went out");
+
+            elsif run("eth_window_reaches_the_device") then
+                features <= x"00000001";
+                tick(1);
+                axi_read(16#30#, r);
+                check_equal(r, std_logic_vector'(x"00000001"), "FEATURES: MAC there");
+                axi_write(16#4008#, x"00000003");
+                axi_write(16#4200#, x"CAFEF00D");
+                axi_read(16#4008#, r);
+                check_equal(r, std_logic_vector'(x"00000003"), "ETH 0x008 read back through the device");
+                axi_read(16#4200#, r);
+                check_equal(r, std_logic_vector'(x"CAFEF00D"), "ETH 0x200 read back");
+                axi_read(16#1C#, r);
+                check_equal(r, std_logic_vector'(x"5A5A1234"), "ordinary registers unaffected");
+                v4 := (x"00000011", x"00000022", x"00000033", x"00000044");
+                axi_write_burst(16#4100#, v4);
+                axi_read_burst(16#4100#, 4, v4);
+                check_equal(v4(3), std_logic_vector'(x"00000044"), "ETH burst through the device");
+
+            elsif run("eth_window_times_out") then
+                features <= x"00000001";
+                dev_mute <= true;
+                tick(1);
+                axi_read(16#4008#, r);
+                check_equal(r, std_logic_vector'(x"DEADBEEF"), "a silent device times out");
+                axi_write(16#4008#, x"00000001");               -- returns too
+                axi_read(16#1C#, r);
+                check_equal(r, std_logic_vector'(x"5A5A1234"), "the bus still works");
 
             elsif run("oled_text_buffer") then
                 -- reset text: "Hello, Zynq Mini" in row 0, little-endian per word

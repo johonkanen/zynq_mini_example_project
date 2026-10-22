@@ -7,6 +7,7 @@
  *   GET  /uPlot.iife.min.js, /uPlot.min.css   vendored uPlot (vendor/, MIT)
  *   GET  /api/status          fpgad status JSON
  *   GET  /api/sensors         XADC die temperature + supply rails: {"temp":45.1,"vccint":1.0,...}
+ *   GET  /api/eth             the PL Ethernet MAC: {"present":true,"frames_rx":...} (fpgad eth)
  *   GET  /api/regs            all axi_regs registers: {"ok":true,"regs":[{...}]}
  *   GET  /api/reg?addr=0x1c   one register: {"ok":true,"addr":"0x1c","value":"0x5a5a1234"}
  *   POST /api/reg             addr=0x00&value=0x1234 (form body or query) -> {"ok":true}
@@ -51,6 +52,9 @@ static const struct { uint32_t off; const char *name, *acc, *desc; } REGS[] = {
     { 0x1C, "SIGNATURE", "ro", "constant 0x5A5A1234" },
     { 0x20, "OLED_CTRL", "rw", "bit0 on, bit1 invert, bit2 flip, [15:8] contrast" },
     { 0x24, "OLED_STAT", "ro", "bit0 ready, [31:16] frames sent" },
+    { 0x28, "BUILD_ID",  "ro", "build time of the design (Unix seconds)" },
+    { 0x2C, "REGMAP",    "ro", "register-map version" },
+    { 0x30, "FEATURES",  "ro", "bit0: the PL Ethernet MAC (PL_ETH=hvhdl build)" },
 };
 #define NREGS (sizeof REGS / sizeof REGS[0])
 
@@ -172,14 +176,14 @@ static int status_handler(struct mg_connection *c, void *cb)
     return reply(c, 200, "%s", msg);
 }
 
-static int sensors_handler(struct mg_connection *c, void *cb)
+/* an fpgad command whose answer is JSON, passed on as is (cb = the command) */
+static int fpgad_json_handler(struct mg_connection *c, void *cb)
 {
-    (void)cb;
     struct fpgad_conn *f = open_fpgad(c);
     if (!f)
         return 503;
     char msg[1024];
-    int rc = fpgad_request(f, "sensors", msg, sizeof msg);
+    int rc = fpgad_request(f, (const char *)cb, msg, sizeof msg);
     fpgad_close(f);
     if (rc != 0)
         return reply_err(c, 503, rc < 0 ? "fpgad connection failed" : msg);
@@ -833,7 +837,8 @@ int main(int argc, char **argv)
     mg_set_request_handler(ctx, "/events", events_handler, NULL);
     mg_set_request_handler(ctx, "/api/status", status_handler, NULL);
     mg_set_request_handler(ctx, "/api/regs", regs_handler, NULL);
-    mg_set_request_handler(ctx, "/api/sensors", sensors_handler, NULL);
+    mg_set_request_handler(ctx, "/api/sensors", fpgad_json_handler, (void *)"sensors");
+    mg_set_request_handler(ctx, "/api/eth", fpgad_json_handler, (void *)"eth");
     mg_set_request_handler(ctx, "/api/reg$", reg_handler, NULL);
     mg_set_request_handler(ctx, "/$", asset_handler, (void *)&ASSET_INDEX);
     mg_set_request_handler(ctx, "/index.html$", asset_handler, (void *)&ASSET_INDEX);

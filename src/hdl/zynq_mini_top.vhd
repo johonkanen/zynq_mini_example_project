@@ -127,6 +127,22 @@ architecture rtl of zynq_mini_top is
     signal ps_rgmii_rx_ctl, ps_rgmii_rxc : std_logic := '0';
     signal ps_mdc, ps_mdio_i, ps_mdio_o, ps_mdio_t : std_logic;
 
+    -- axi_regs FEATURES and its ETH window (the PL MAC's registers, PL_ETH = 1)
+    function features_word(pl_eth : natural) return std_logic_vector is
+        variable f : std_logic_vector(31 downto 0) := (others => '0');
+    begin
+        if pl_eth /= 0 then
+            f(0) := '1';                                -- the PL Ethernet MAC is there
+        end if;
+        return f;
+    end function;
+    constant FEATURES : std_logic_vector(31 downto 0) := features_word(PL_ETH);
+    signal eth_bus_req, eth_bus_write : std_logic;
+    signal eth_bus_addr  : std_logic_vector(10 downto 0);
+    signal eth_bus_wdata : std_logic_vector(31 downto 0);
+    signal eth_bus_rdata : std_logic_vector(31 downto 0) := (others => '0');
+    signal eth_bus_ack   : std_logic := '0';
+
     -- ===== placeholder PL user logic ====================================
     signal heartbeat  : unsigned(27 downto 0) := (others => '0');
     signal user_probe : std_logic_vector(31 downto 0);
@@ -194,6 +210,13 @@ begin
             scope_stat_i     => scope_stat,
             scope_rd_addr_o  => scope_rd_addr,
             scope_rd_data_i  => scope_rd_data,
+            features_i       => FEATURES,
+            ext_req_o        => eth_bus_req,
+            ext_write_o      => eth_bus_write,
+            ext_addr_o       => eth_bus_addr,
+            ext_wdata_o      => eth_bus_wdata,
+            ext_rdata_i      => eth_bus_rdata,
+            ext_ack_i        => eth_bus_ack,
             s_axi_aclk    => clk,
             s_axi_aresetn => resetn,
             s_axi_i       => ps_axi_o,
@@ -319,6 +342,12 @@ begin
                 rgmii_tx_ctl => eth_rgmii_tx_ctl,
                 mdc          => eth_mdc,
                 mdio         => eth_mdio,
+                bus_req      => eth_bus_req,
+                bus_write    => eth_bus_write,
+                bus_addr     => eth_bus_addr,
+                bus_wdata    => eth_bus_wdata,
+                bus_rdata    => eth_bus_rdata,
+                bus_ack      => eth_bus_ack,
                 echoed       => open,
                 ignored      => open
             );

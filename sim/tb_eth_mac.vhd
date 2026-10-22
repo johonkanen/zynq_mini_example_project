@@ -57,7 +57,12 @@ architecture sim of tb_eth_mac is
     signal mac_mdc : std_logic;
     signal mdio    : std_logic := 'H';
 
-    signal echoed, ignored : unsigned(15 downto 0);
+    signal echoed, ignored : unsigned(31 downto 0);
+
+    -- the PS's bus (axi_regs' ETH window), driven here
+    signal bus_req, bus_write, bus_ack : std_logic := '0';
+    signal bus_addr  : std_logic_vector(10 downto 0) := (others => '0');
+    signal bus_wdata, bus_rdata : std_logic_vector(31 downto 0) := (others => '0');
 
     -- what the PC received
     signal rx_bytes  : bytes_t(0 to 8191);
@@ -78,7 +83,9 @@ begin
         generic map (MAC_ADDR => MAC)
         port map (clk => clk100, rgmii_rxc => mac_rxc, rgmii_rd => mac_rxd, rgmii_rx_ctl => mac_rx_ctl,
                   rgmii_txc => mac_txc, rgmii_td => mac_txd, rgmii_tx_ctl => mac_tx_ctl,
-                  mdc => mac_mdc, mdio => mdio, echoed => echoed, ignored => ignored);
+                  mdc => mac_mdc, mdio => mdio, bus_req => bus_req, bus_write => bus_write,
+                  bus_addr => bus_addr, bus_wdata => bus_wdata, bus_rdata => bus_rdata, bus_ack => bus_ack,
+                  echoed => echoed, ignored => ignored);
     mdio <= 'H';
 
     ---------------------------------------------------------------------------
@@ -197,6 +204,24 @@ begin
             end loop;
         end procedure;
 
+        -- one access on the PS's bus, as axi_regs makes it
+        procedure bus_access(address : natural; write : std_logic; wdata : std_logic_vector(31 downto 0);
+                             variable rdata : out std_logic_vector(31 downto 0)) is
+            variable ack0 : std_logic;
+        begin
+            ack0      := bus_ack;
+            bus_addr  <= std_logic_vector(to_unsigned(address, 11));
+            bus_write <= write;
+            bus_wdata <= wdata;
+            wait for 10 ns;
+            bus_req   <= not bus_req;
+            wait until bus_ack /= ack0 for 2 us;
+            check(bus_ack /= ack0, "bus access answered");
+            wait for 30 ns;                                -- as axi_regs: sample after its synchroniser
+            rdata := bus_rdata;
+        end procedure;
+
+        variable r  : std_logic_vector(31 downto 0);
         variable f1 : bytes_t(0 to 59);
         variable f2 : bytes_t(0 to 99);
         variable fl : bytes_t(0 to 1513);
@@ -255,6 +280,31 @@ begin
                 check_equal(rx_frames, 2, "both echoes arrived");
                 check_echo(f1, 0);
                 check_echo(f2, 1);
+
+            elsif run("registers through the bus") then
+                bus_access(16#00c#, '0', x"00000000", r);
+                check_equal(r, MAC(23 downto 16) & MAC(31 downto 24) & MAC(39 downto 32) & MAC(47 downto 40),
+                            "MAC_ADDR_LO as set after reset");
+                bus_access(16#008#, '0', x"00000000", r);
+                check_equal(r(1 downto 0), std_logic_vector'("11"), "COMMAND_CONFIG: RX + TX on");
+                f1 := frame(MAC, x"88B5", 9, 60);
+                send(f1);
+                wait until rx_frames = 1 for 30 us;
+                bus_access(16#06c#, '0', x"00000000", r);
+                check_equal(to_integer(unsigned(r)), 1, "MAC: frames received");
+                bus_access(16#068#, '0', x"00000000", r);
+                check_equal(to_integer(unsigned(r)), 1, "MAC: frames transmitted");
+                bus_access(16#200#, '0', x"00000000", r);
+                check_equal(to_integer(unsigned(r)), 1, "echoed at 0x200");
+                send(frame(MAC, x"0800", 10, 60));
+                wait for 20 us;
+                bus_access(16#204#, '0', x"00000000", r);
+                check_equal(to_integer(unsigned(r)), 1, "ignored at 0x204");
+                -- a write: receiving off, then a frame is not echoed
+                bus_access(16#008#, '1', x"00000001", r);
+                send(frame(MAC, x"88B5", 11, 60));
+                wait for 20 us;
+                check_equal(rx_frames, 1, "no echo with RX off");
 
             elsif run("a full size frame is echoed") then
                 fl := frame(MAC, x"88B5", 8, 1514);

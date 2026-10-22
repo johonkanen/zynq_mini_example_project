@@ -115,6 +115,20 @@
       <table id="rails"><thead><tr><th>rail</th><th>nominal</th><th>now</th><th>deviation</th></tr></thead><tbody></tbody></table>
     </div>
   </section>
+  <section class="card" id="ethcard" hidden>
+    <h2>PL Ethernet MAC — hVHDL_gigabit_ethernet in the PL, on the PL-side PHY (echo test)</h2>
+    <div class="stats">
+      <div><h2>link</h2><div class="big" id="elink">–</div></div>
+      <div><h2>MAC address</h2><div class="big mono" id="emac">–</div></div>
+      <div><h2>receive / transmit</h2><div class="big" id="eena">–</div></div>
+    </div>
+    <div class="table-wrap" style="margin-top:.5rem">
+      <table><thead><tr><th>frames received</th><th>transmitted</th><th>CRC errors</th><th>length / FIFO errors</th>
+        <th>cut short</th><th>echoed</th><th>ignored (other EtherType)</th></tr></thead>
+        <tbody><tr class="mono" id="ecount"></tr></tbody></table>
+    </div>
+    <small class="dim">Frames with EtherType 0x88B5 for this address (or broadcast) come back to their sender.</small>
+  </section>
   <section class="card">
     <h2>Oscilloscope — 4 channels × 4096 samples, triggered capture in the PL (scope_capture.vhd)</h2>
     <canvas id="scope"></canvas>
@@ -478,6 +492,21 @@ function drawTemp() {
   }).join("");
 }
 $("twin").onchange = () => { tDirty = true; };
+/* ---------- PL Ethernet MAC (fpgad eth): shown when the loaded design has it ---------- */
+async function refreshEth() {
+  try {
+    const r = await fetch("/api/eth"), j = await r.json();
+    $("ethcard").hidden = !j.present;
+    if (!j.present) return;
+    $("elink").textContent = j.link === null ? "?" : j.link ? `up, ${j.speed} Mb/s${j.full_duplex ? "" : " half"}` : "down";
+    $("emac").textContent = j.mac;
+    $("eena").textContent = `${j.rx_enabled ? "on" : "off"} / ${j.tx_enabled ? "on" : "off"}${j.promiscuous ? ", promiscuous" : ""}`;
+    $("ecount").innerHTML = [j.frames_rx, j.frames_tx, j.crc_errors, j.in_errors, j.out_errors, j.echoed, j.ignored]
+      .map(v => `<td>${v}</td>`).join("");
+  } catch (e) { $("ethcard").hidden = true; }
+}
+refreshEth(); setInterval(refreshEth, 1000);
+
 $("thz").onchange = () => { if (ws && ws.readyState === WebSocket.OPEN) ws.send("sensors " + $("thz").value); };
 (function tLoop() { drawTemp(); requestAnimationFrame(tLoop); })();
 

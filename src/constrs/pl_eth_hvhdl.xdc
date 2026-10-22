@@ -42,3 +42,12 @@ set_multicycle_path 0 -setup -end -fall_from $eth_tx_src -fall_to [get_clocks et
 set_clock_groups -asynchronous \
     -group [get_clocks eth_rgmii_rxc] \
     -group [get_clocks -include_generated_clocks $eth_tx_src]
+
+## The PS's access to the MAC (axi_regs ETH window <-> eth_mac bus_*): a handshake
+## between the 100 MHz AXI clock and the 125 MHz MAC clock - address, data and
+## write are held from the request toggle until the acknowledge, both toggles
+## go through two flip-flops. Vivado sees the clocks as related (the MAC's
+## MMCM runs off FCLK0); bound the crossing to a clock instead of timing it as
+## a 2 ns same-edge transfer.
+set_max_delay -datapath_only -from [get_clocks clk_fpga_0] -to [get_clocks -include_generated_clocks $eth_tx_src] 8.0
+set_max_delay -datapath_only -from [get_clocks -include_generated_clocks $eth_tx_src] -to [get_clocks clk_fpga_0] 8.0

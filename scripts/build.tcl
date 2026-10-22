@@ -142,6 +142,17 @@ puts "\[build] bitstream  -> $bit"
 set fh [open [file join $OUTPUT_DIR "$PROJECT_NAME.build_id"] w]
 puts $fh $BUILD_ID
 close $fh
+# the register-map version this bitstream was built with (axi_regs.vhd), for the
+# bundle's manifest - the source may have moved on by the time it is bundled
+set fh [open [file join $HDL_DIR axi_regs.vhd] r]
+set axi_src [read $fh]
+close $fh
+if {![regexp {constant REGMAP_VERSION *: *integer *:= *([0-9]+);} $axi_src -> REGMAP_BUILT]} {
+    error "REGMAP_VERSION not found in axi_regs.vhd"
+}
+set fh [open [file join $OUTPUT_DIR "$PROJECT_NAME.regmap"] w]
+puts $fh $REGMAP_BUILT
+close $fh
 # which PL Ethernet this bitstream has - make-pl-bundle.sh picks the overlay by it
 set fh [open [file join $OUTPUT_DIR "$PROJECT_NAME.pl_eth"] w]
 puts $fh $PL_ETH

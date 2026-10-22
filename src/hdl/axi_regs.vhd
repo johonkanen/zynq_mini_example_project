@@ -26,6 +26,8 @@
 --   0x24  OLED_STAT  RO    PL -> PS   SSD1306 driver status
 --   0x28  BUILD_ID   RO    PL -> PS   build timestamp (Unix seconds), generic BUILD_ID
 --   0x2C  REGMAP     RO    PL -> PS   register-map version (REGMAP_VERSION below)
+--   0x30  FEATURES   RO    PL -> PS   features_i: bit0 = the PL Ethernet MAC is there
+--                                     (PL_ETH = hvhdl build), so the ETH window answers
 --   0x40  SCOPE_CMD  W     PS -> PL   bit0 arm, bit1 force trigger, bit2 abort (pulses)
 --   0x44  SCOPE_STAT RO    PL -> PS   capture state (see below)
 --   0x48  SCOPE_TRIG R/W   PS -> PL   [1:0] channel, bit4 falling, [31:16] level (signed)
@@ -37,7 +39,13 @@
 --   0x64  GEN_FTW_B  R/W   PS -> PL   test generator B frequency word (reset 250 kHz)
 --   0x80..0xFC OLED_TEXT R/W          16x8 character buffer, 4 chars per word
 --   anything else in 0x00..0xFF reads 0; the map repeats every 256 bytes up to
---   0x7FFF
+--   0x3FFF
+--   0x4000..0x7FFF ETH       R/W      the PL Ethernet MAC's bus (ext_*, 2 KB, repeating):
+--                                     0x4000 + its APB registers, 0x4200.. eth_mac's own
+--                                     (eth_mac.vhd). In the MAC's clock: an access waits
+--                                     for the handshake, at most EXT_TIMEOUT clocks (then
+--                                     reads 0xDEADBEEF); without the MAC (FEATURES bit0 = 0)
+--                                     it reads 0 at once
 --   0x8000..0xFFFF SCOPE_RAM RO       capture buffer: word 2*i = ch1:ch0, word
 --                                     2*i+1 = ch3:ch2 of RAM sample i (16-bit
 --                                     signed, high:low)
@@ -89,6 +97,16 @@ entity axi_regs is
         scope_rd_addr_o  : out unsigned(SCOPE_DEPTH_LOG2 downto 0);
         scope_rd_data_i  : in  std_logic_vector(AXI_DATA_WIDTH-1 downto 0);
 
+        -- FEATURES, and the ETH window: a request/acknowledge handshake with toggles;
+        -- address, write and data are held until the acknowledge comes back
+        features_i       : in  std_logic_vector(AXI_DATA_WIDTH-1 downto 0) := (others => '0');
+        ext_req_o        : out std_logic;
+        ext_write_o      : out std_logic;
+        ext_addr_o       : out std_logic_vector(10 downto 0);
+        ext_wdata_o      : out std_logic_vector(AXI_DATA_WIDTH-1 downto 0);
+        ext_rdata_i      : in  std_logic_vector(AXI_DATA_WIDTH-1 downto 0) := (others => '0');
+        ext_ack_i        : in  std_logic := '0';               -- any clock
+
         -- AXI3 slave interface (connect straight to M_AXI_GP0)
         s_axi_aclk    : in  std_logic;
         s_axi_aresetn : in  std_logic;
@@ -109,8 +127,11 @@ architecture rtl of axi_regs is
     constant IDX_REGMAP     : integer := 11;               -- 0x2C
     -- Bump on every incompatible change to this map; fpgad and PL bundle
     -- manifests check it (doc/network_update.md).
-    --   1: OLED, scope, BUILD_ID/REGMAP (this map)
-    constant REGMAP_VERSION : integer := 1;
+    --   1: OLED, scope, BUILD_ID/REGMAP
+    --   2: + FEATURES and the ETH window (this map)
+    constant REGMAP_VERSION : integer := 2;
+    constant IDX_FEATURES   : integer := 12;               -- 0x30
+    constant EXT_TIMEOUT    : integer := 1000;             -- clocks, 10 us
     constant IDX_SCOPE_CMD  : integer := 16;               -- 0x40
     constant IDX_SCOPE_STAT : integer := 17;               -- 0x44
     constant IDX_SCOPE_CFG  : integer := 18;               -- 0x48..0x54: TRIG PRE DIV SRC
@@ -161,8 +182,24 @@ architecture rtl of axi_regs is
     signal status_w  : word_t;
     signal rd_word   : word_t;
 
+    -- ETH window: one access at a time for both channels (ext_proc)
+    signal rd_ext_req, wr_ext_req   : std_logic := '0';      -- level, held until done
+    signal rd_ext_done, wr_ext_done : std_logic := '0';      -- one-clock pulses
+    signal rd_ext_data              : word_t := (others => '0');
+    signal wr_ext_data              : word_t := (others => '0');
+    signal ext_req, ext_write       : std_logic := '0';
+    signal ext_addr                 : std_logic_vector(10 downto 0) := (others => '0');
+    signal ext_wdata                : word_t := (others => '0');
+    signal ext_ack_meta, ext_ack_sync, ext_ack_seen : std_logic := '0';
+    type ext_state_t is (X_IDLE, X_WAIT);
+    signal ext_state : ext_state_t := X_IDLE;
+    signal ext_for_read : std_logic := '0';
+    signal ext_timer : integer range 0 to EXT_TIMEOUT := 0;
+    attribute ASYNC_REG : string;
+    attribute ASYNC_REG of ext_ack_meta, ext_ack_sync : signal is "TRUE";
+
     -- write channel
-    type wr_state_t is (W_IDLE, W_DATA, W_RESP);
+    type wr_state_t is (W_IDLE, W_DATA, W_EXT, W_RESP);
     signal wr_state : wr_state_t := W_IDLE;
     signal wr_addr  : unsigned(AXI_ADDR_WIDTH-1 downto 0) := (others => '0');
     signal wr_id    : axi_id_t := (others => '0');
@@ -172,7 +209,7 @@ architecture rtl of axi_regs is
     signal awready_r, wready_r, bvalid_r : std_logic := '0';
 
     -- read channel
-    type rd_state_t is (R_IDLE, R_FETCH, R_DATA);
+    type rd_state_t is (R_IDLE, R_FETCH, R_EXT, R_DATA);
     signal rd_state : rd_state_t := R_IDLE;
     signal rd_addr  : unsigned(AXI_ADDR_WIDTH-1 downto 0) := (others => '0');
     signal rd_id    : axi_id_t := (others => '0');
@@ -190,6 +227,11 @@ architecture rtl of axi_regs is
     function is_ram(a : unsigned) return boolean is        -- 0x8000..0xFFFF
     begin
         return a(15) = '1';
+    end function;
+
+    function is_eth(a : unsigned) return boolean is        -- 0x4000..0x7FFF
+    begin
+        return a(15 downto 14) = "01";
     end function;
 
     function next_addr(a : unsigned; size : std_logic_vector; burst : std_logic_vector)
@@ -295,6 +337,8 @@ begin
         idx := reg_index(rd_addr);
         if is_ram(rd_addr) then
             rd_word <= scope_rd_data_i;
+        elsif is_eth(rd_addr) then
+            rd_word <= rd_ext_data;
         else
             case idx is
                 when 0 to 3        => rd_word <= regs(idx);
@@ -306,6 +350,7 @@ begin
                 when IDX_OLED_STAT => rd_word <= oled_stat_i;
                 when IDX_BUILD_ID  => rd_word <= BUILD_ID;
                 when IDX_REGMAP    => rd_word <= std_logic_vector(to_unsigned(REGMAP_VERSION, 32));
+                when IDX_FEATURES  => rd_word <= features_i;
                 when IDX_SCOPE_CMD => rd_word <= (others => '0');
                 when IDX_SCOPE_STAT =>
                     rd_word <= (others => '0');
@@ -333,10 +378,11 @@ begin
     begin
         if rising_edge(s_axi_aclk) then
             if s_axi_aresetn = '0' then
-                wr_state  <= W_IDLE;
-                awready_r <= '0';
-                wready_r  <= '0';
-                bvalid_r  <= '0';
+                wr_state   <= W_IDLE;
+                awready_r  <= '0';
+                wready_r   <= '0';
+                bvalid_r   <= '0';
+                wr_ext_req <= '0';
                 regs      <= (others => (others => '0'));
                 oled_ctrl <= OLED_CTRL_RESET;
                 text      <= OLED_TEXT_RESET;
@@ -361,7 +407,13 @@ begin
                         end if;
 
                     when W_DATA =>
-                        if s_axi_i.w.valid = '1' and wready_r = '1' then
+                        if s_axi_i.w.valid = '1' and wready_r = '1' and is_eth(wr_addr) then
+                            -- the ETH window: hand the word to ext_proc, wait for it
+                            wr_ext_data <= s_axi_i.w.data;
+                            wr_ext_req  <= '1';
+                            wready_r    <= '0';
+                            wr_state    <= W_EXT;
+                        elsif s_axi_i.w.valid = '1' and wready_r = '1' then
                             idx := reg_index(wr_addr);
                             if not is_ram(wr_addr) and idx = IDX_SCOPE_CMD and s_axi_i.w.strb(0) = '1' then
                                 scope_cmd <= s_axi_i.w.data(2 downto 0);
@@ -391,6 +443,20 @@ begin
                             end if;
                         end if;
 
+                    when W_EXT =>
+                        if wr_ext_done = '1' then
+                            wr_ext_req <= '0';
+                            wr_addr    <= next_addr(wr_addr, wr_size, wr_burst);
+                            if wr_beats = 1 then            -- (the beat's WLAST is gone by now)
+                                bvalid_r <= '1';
+                                wr_state <= W_RESP;
+                            else
+                                wr_beats <= wr_beats - 1;
+                                wready_r <= '1';
+                                wr_state <= W_DATA;
+                            end if;
+                        end if;
+
                     when W_RESP =>
                         if s_axi_i.bready = '1' then
                             bvalid_r <= '0';
@@ -409,10 +475,11 @@ begin
     begin
         if rising_edge(s_axi_aclk) then
             if s_axi_aresetn = '0' then
-                rd_state  <= R_IDLE;
-                arready_r <= '0';
-                rvalid_r  <= '0';
-                rlast_r   <= '0';
+                rd_state   <= R_IDLE;
+                arready_r  <= '0';
+                rvalid_r   <= '0';
+                rlast_r    <= '0';
+                rd_ext_req <= '0';
             else
                 case rd_state is
 
@@ -431,9 +498,22 @@ begin
                         end if;
 
                     when R_FETCH =>                     -- capture RAM reads rd_addr this clock
-                        rvalid_r <= '1';
-                        rlast_r  <= '1' when rd_beats = 1 else '0';
-                        rd_state <= R_DATA;
+                        if is_eth(rd_addr) then
+                            rd_ext_req <= '1';
+                            rd_state   <= R_EXT;
+                        else
+                            rvalid_r <= '1';
+                            rlast_r  <= '1' when rd_beats = 1 else '0';
+                            rd_state <= R_DATA;
+                        end if;
+
+                    when R_EXT =>                       -- rd_ext_data is there with the done pulse
+                        if rd_ext_done = '1' then
+                            rd_ext_req <= '0';
+                            rvalid_r   <= '1';
+                            rlast_r    <= '1' when rd_beats = 1 else '0';
+                            rd_state   <= R_DATA;
+                        end if;
 
                     when R_DATA =>
                         if s_axi_i.rready = '1' and rvalid_r = '1' then
@@ -448,6 +528,66 @@ begin
                             end if;
                         end if;
 
+                end case;
+            end if;
+        end if;
+    end process;
+
+    ---------------------------------------------------------------------------
+    -- ETH window: one access at a time (writes first), handshake with the
+    -- device's clock domain, a timeout so a missing answer can't hang the bus
+    ---------------------------------------------------------------------------
+    ext_req_o   <= ext_req;
+    ext_write_o <= ext_write;
+    ext_addr_o  <= ext_addr;
+    ext_wdata_o <= ext_wdata;
+
+    ext_proc : process (s_axi_aclk)
+    begin
+        if rising_edge(s_axi_aclk) then
+            ext_ack_meta <= ext_ack_i;
+            ext_ack_sync <= ext_ack_meta;
+            rd_ext_done  <= '0';
+            wr_ext_done  <= '0';
+
+            if s_axi_aresetn = '0' then
+                ext_state    <= X_IDLE;
+                ext_ack_seen <= ext_ack_sync;
+            else
+                case ext_state is
+                    when X_IDLE =>
+                        if (wr_ext_req = '1' and wr_ext_done = '0') or (rd_ext_req = '1' and rd_ext_done = '0') then
+                            ext_for_read <= not (wr_ext_req and not wr_ext_done);
+                            if wr_ext_req = '1' and wr_ext_done = '0' then
+                                ext_write <= '1';
+                                ext_addr  <= std_logic_vector(wr_addr(10 downto 0));
+                                ext_wdata <= wr_ext_data;
+                            else
+                                ext_write <= '0';
+                                ext_addr  <= std_logic_vector(rd_addr(10 downto 0));
+                            end if;
+                            if features_i(0) = '1' then
+                                ext_req   <= not ext_req;
+                                ext_timer <= 0;
+                                ext_state <= X_WAIT;
+                            else                        -- nothing there: done at once, reads 0
+                                rd_ext_data <= (others => '0');
+                                if wr_ext_req = '1' then wr_ext_done <= '1'; else rd_ext_done <= '1'; end if;
+                            end if;
+                        end if;
+                    when X_WAIT =>
+                        if ext_ack_sync /= ext_ack_seen or ext_timer = EXT_TIMEOUT then
+                            if ext_ack_sync /= ext_ack_seen then
+                                rd_ext_data <= ext_rdata_i;     -- held by the device since its ack
+                            else
+                                rd_ext_data <= x"DEADBEEF";
+                            end if;
+                            ext_ack_seen <= ext_ack_sync;
+                            if ext_for_read = '1' then rd_ext_done <= '1'; else wr_ext_done <= '1'; end if;
+                            ext_state <= X_IDLE;
+                        else
+                            ext_timer <= ext_timer + 1;
+                        end if;
                 end case;
             end if;
         end if;

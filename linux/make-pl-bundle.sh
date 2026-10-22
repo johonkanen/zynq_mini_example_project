@@ -56,7 +56,10 @@ fi
 [ -x "$HOST/dtc" ] || die "no $HOST/dtc - run linux/build-linux.sh once"
 
 build_id=$(tr -d ' \r\n' < "$BUILD_ID_FILE")
-regmap=$(sed -n 's/.*constant REGMAP_VERSION *: *integer *:= *\([0-9]*\);.*/\1/p' "$REPO/src/hdl/axi_regs.vhd")
+# the register map the bitstream was built with (build.tcl records it); the source
+# only for builds from before that
+regmap=$(tr -d ' \r\n' < "$REPO/output/$PROJECT.regmap" 2>/dev/null)
+[ -n "$regmap" ] || regmap=$(sed -n 's/.*constant REGMAP_VERSION *: *integer *:= *\([0-9]*\);.*/\1/p' "$REPO/src/hdl/axi_regs.vhd")
 [ -n "$regmap" ] || die "REGMAP_VERSION not found in src/hdl/axi_regs.vhd"
 git=$(git -C "$REPO" describe --always --dirty --abbrev=7 2>/dev/null || echo unknown)
 date=$(date -u -d "@$build_id" +%Y-%m-%dT%H:%M:%SZ)

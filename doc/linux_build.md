@@ -538,6 +538,7 @@ your next process ───────────┘   (line protocol)        
 | `oled <row> <text>` | `ok` — put up to 16 characters on OLED row 0–7 (rest of the line, spaces kept, padded) |
 | `oled clear` | `ok` — blank all 8 rows |
 | `sensors` | `ok {"temp":45.12,"vccint":1.001,"vccaux":1.799,"vccbram":1.0,"vccpint":1.0,"vccpaux":1.8,"vccoddr":1.5}` — Zynq **XADC** read through the kernel's IIO driver (`xilinx-xadc`, the PS-XADC interface, `adc@f8007100` in the DT): die temperature in °C, supply rails in V. Doesn't need the PL. |
+| `eth` | `ok {"present":true,"mac":"02:5a:4d:00:00:10","frames_rx":…,"echoed":…,"link":true,"speed":1000,…}` — the PL Ethernet MAC of a `PL_ETH=hvhdl` design (`doc/hvhdl_ethernet.md`): its counters and settings through axi_regs' ETH window, the PHY's link through the MAC's MDIO; `{"present":false}` for other designs. |
 | `capture [key=value…]` | one oscilloscope acquisition: `ok capture {"n":4096,"ch":4,"pre":…,"div":…,"fs":…,"triggered":…,"bytes":32768}` followed by **32768 raw bytes**: int16 little-endian, channel-major, in time order, trigger at sample `pre`. Keys (others keep their register value): `src=a,b,c,d` (0–15) `div=1..100000` `trig=0..3` `edge=rise\|fall` `level=-32768..32767` `pre=0..4095` `timeout=0..5000` (ms to wait for a trigger) `auto=0\|1` (force a trigger after the timeout, or reply `ok timeout`). One capture at a time; a client that hangs up aborts its capture. |
 | `stream <hz> <batch_hz> <off>...` | `ok streaming`, then `data {"t":[µs…],"v":[[…],…]}` per batch and `status {…}` on PL state changes, until the client disconnects |
 
@@ -600,6 +601,7 @@ civetweb, and `update-board.sh web` pushes `libcivetweb` along with `fpga-web`.
 ```bash
 curl http://<ip>/api/status
 curl http://<ip>/api/sensors                            # XADC temperature + rails
+curl http://<ip>/api/eth                                # the PL Ethernet MAC (fpgad eth)
 curl http://<ip>/api/regs                               # all registers, named
 curl "http://<ip>/api/reg?addr=0x1c"                    # read
 curl -X POST -d 'addr=0x00&value=0x12340000' http://<ip>/api/reg   # write
@@ -623,6 +625,7 @@ fpgactl activate /data/pl/good          # reload the good design (blocks all acc
 fpgactl stream 200 20 0x10              # Ctrl-C to stop
 fpgactl oled 3 "Hello from Linux"       # OLED text row 0..7 (the PL draws it)
 fpgactl sensors                         # XADC die temperature + supply rails
+fpgactl eth                             # the PL Ethernet MAC: counters, PHY link
 /etc/init.d/S98oled-status stop         # OLED rows 6/7 (IP, temperature) stop updating
 /etc/init.d/S96fpgad restart            # fpga-web reconnects on its own
 grep -E 'fpgad|fpga-web' /var/log/messages
@@ -725,9 +728,11 @@ one MAC (`02:5a:4d:00:00:01`) and one DHCP address either way.
   kernel's hotplug helper, adds `eth1` whenever fpgad's overlay creates it (MAC
   `02:5a:4d:00:00:02`). udhcpc keeps trying in the background, so a cable plugged in later
   — or only in the PL port, which appears after fpgad has loaded the FPGA — still works.
-- **Safety** (fpgad): if `eth1` had a link before an FPGA update, the new design must bring
-  it back within 20 s, else the trial fails and the good design is reloaded — someone
-  connected through the PL port would otherwise lose the board.
+- **Safety** (fpgad): if `eth1` was the board's only link before an FPGA update (`eth0`
+  without carrier), the new design must bring it back within 20 s, else the trial fails and
+  the good design is reloaded — someone connected through the PL port would otherwise lose
+  the board. With `eth0` linked too, the board stays reachable through it, so the rule
+  doesn't apply (a design may then use the PL port for its own MAC, `doc/hvhdl_ethernet.md`).
 - Tools in the image: `iproute2` (`ip`, `bridge`), `ethtool`, `iperf3`.
 
 Measured on the board (2026-10-22, cable in the PL port, PC on the same LAN):

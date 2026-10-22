@@ -11,7 +11,8 @@ Ethernet frames without Linux in the data path: line-rate streaming (oscilloscop
 later ADC data), fixed-latency register access, and traffic that keeps flowing while Linux is
 busy or rebooting.
 
-**Status:** phase 1 done in simulation and as a build variant (2026-10-22), not yet on the board.
+**Status:** phases 1 and 2 done (2026-10-22): the MAC echoes frames on the board at 1 Gb/s,
+and its registers are reachable from Linux (fpgad `eth`, the web page).
 
 ## 1. What the library gives: `ethernet_mac/`
 
@@ -109,7 +110,48 @@ same constraints. The echo's frame buffer has to be written as a plain simple-du
 (registered write port, separate read process): the first version landed in 896 LUTs of
 distributed RAM and missed timing by 0.29 ns.
 
-## 4. Protocols: what a PC can reach
+## 4. Phase 2: on the board
+
+**Setup:** the PL port cabled straight to a PC adapter (Windows, scapy + Npcap - raw frames don't
+leave WSL2's NAT), the PS port to the LAN, so the board stays reachable while the `hvhdl` design
+owns the PL port. fpgad's `eth1` rule (`doc/linux_build.md` §14) now applies only when `eth1` was
+the board's only link, so such a design can be installed while `eth0` is up.
+
+**Registers from the PS** (register map **2**, `src/hdl/axi_regs.vhd`):
+
+| offset | |
+|---|---|
+| `0x30` FEATURES | bit0: the PL Ethernet MAC is in this design |
+| `0x4000..0x41FF` | `ethernet_mac`'s APB registers (+ its own offset: `COMMAND_CONFIG` 0x008, MAC address 0x00c/0x010, counters 0x068.., MDIO 0x104..) |
+| `0x4200` / `0x4204` | frames echoed / ignored (other EtherType), `eth_mac`'s |
+
+An access to the window is a request/acknowledge handshake into the MAC's 125 MHz clock
+(`axi_regs` `ext_*` ↔ `eth_mac` `bus_*`), one at a time for both AXI channels; without the MAC
+(`FEATURES` bit0 = 0) it completes at once and reads 0, and a silent device times out after 10 µs
+with `0xDEADBEEF` instead of hanging the SoC. `pl_eth_hvhdl.xdc` bounds the crossing to one
+clock (datapath only). Software: `fpgactl eth` / fpgad `eth` (counters, settings, the PHY's link
+through the MAC's MDIO), `GET /api/eth`, a card on the main page.
+
+**Results** (`PL_ETH=hvhdl`, timing met: WNS 0.326 ns, WHS 0.019 ns):
+
+| test (from Windows on the PL port) | result |
+|---|---|
+| 7 sizes, 60 .. 1514 bytes | 7/7 echoed, byte-exact, addresses swapped |
+| broadcast | echoed |
+| other EtherType / other destination | no echo (ignored / dropped by the MAC's filter) |
+| burst of 200 × 1514 bytes | 200/200 echoed byte-exact (scapy offers only 50–90 Mbit/s) |
+| counters after the test | received +209, transmitted +208, echoed +208, ignored +1, 0 CRC / length / cut-short errors - exactly what was sent |
+| PHY through the MAC's MDIO | link up, 1000 Mb/s, full duplex |
+
+Found and fixed on the way: RAUC's post-install handler activated the artifact links even when
+the bundle didn't carry that artifact, so an app bundle re-loaded an FPGA design rejected earlier
+(`doc/network_update.md` §2.4); and the PL bundle's REGMAP came from the source, not from the
+build (`build.tcl` now records it as `output/<project>.regmap`).
+
+Not measured yet: the echo at line rate - it needs a faster frame generator than scapy, and the
+echo itself moves one frame at a time through its buffer (about half of line rate for long frames).
+
+## 5. Protocols: what a PC can reach
 
 The PC here runs the tools in **WSL2 behind NAT**: raw Ethernet frames from WSL never reach the
 LAN, only routed IP traffic does. So:
@@ -120,18 +162,18 @@ LAN, only routed IP traffic does. So:
   any program, also in WSL, talks to the FPGA with an ordinary UDP socket. The library has none of
   this yet; it fits naturally as a stream stage between `m_t*` and `s_t*`.
 
-## 5. Phases
+## 6. Phases
 
 | phase | content | done when |
 |---|---|---|
 | 0 | submodule, library tests run here | **done** |
 | 1 | Xilinx DDR I/O + clocks + constraints; simulation through them; the `hvhdl` design variant (option A) with an echo | **done**: 33/33 in simulation, the variant builds (see §3) |
-| 2 | on the board: the echo at 1 Gb/s from a peer (the board's own `eth0` → switch → PL port, or Windows); the MAC's APB registers bridged to the PS (axi_regs or its own AXI window), counters in fpgad / the web page | frames echo with no FCS errors; counters visible |
+| 2 | on the board: the echo at 1 Gb/s from a peer; the MAC's APB registers bridged to the PS, counters in fpgad / the web page | **done** (§4) |
 | 3 | ARP + IPv4 + UDP (+ ICMP echo) as stream stages, FPGA IP/MAC from registers | `ping <fpga ip>` and a UDP echo from WSL |
 | 4 | use it: UDP register access and streaming oscilloscope captures at line rate | throughput against Linux's 474–553 Mbit/s on the same port |
 | 5 | option B: GMII switch so `eth1` and the FPGA share the PL port | Linux on `eth1` and FPGA UDP traffic at the same time; fpgad's relink rule still holds |
 
-## 6. Notes and open questions
+## 7. Notes and open questions
 
 - The Xilinx I/O wrappers (`rgmii_rx_xilinx`, `rgmii_tx_xilinx`) could live in the library next to
   its RGMII code, as the 7-series counterpart of the device primitives it keeps outside.
