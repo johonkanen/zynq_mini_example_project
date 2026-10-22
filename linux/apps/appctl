@@ -1,0 +1,166 @@
+#!/bin/sh
+#
+# appctl - install, check and roll back our software as a unit (doc/network_update.md,
+# phase 2). Part of the image, not of the app set it manages.
+#
+#   appctl activate [<dir>]   trial-install an app tree (default: the RAUC artifact
+#                             /data/rauc/apps/zynq-mini-apps): restart the services on
+#                             it, health-check, keep it or put the previous one back
+#   appctl rollback           go back to the previous app set
+#   appctl factory            drop the installed app sets, run the image's own copies
+#   appctl status             what is installed
+#   appctl boot               at boot (S90apps): finish an interrupted trial by
+#                             restoring the previous app set
+#
+# An app tree: bin/{fpgad,fpgactl,fpga-web,oled-status}, lib/ (libcivetweb),
+# manifest.json {"version","git","date","regmaps":[...]}.
+#
+# /data/apps/good, prev, failed are copies of app trees; each carries the RAUC
+# artifact it came from in .source, so it moves with its directory.
+#
+CANDIDATE=/data/rauc/apps/zynq-mini-apps
+A=/data/apps
+GOOD=$A/good
+PREV=$A/prev
+TRIAL=$A/trial
+PL_CANDIDATE=/data/rauc/pl/design
+SERVICES="S96fpgad S97fpga-web S98oled-status"
+
+log() { echo "appctl: $*"; logger -t appctl "$*" 2>/dev/null; }
+die() { log "$*"; exit 1; }
+
+json_field() {   # json_field <file> <key>  - a string or number value
+	sed -n "s/.*\"$2\": *\"\{0,1\}\([^\",}]*\).*/\1/p" "$1" 2>/dev/null | head -n 1
+}
+regmaps_of() {   # "1 2" from "regmaps":[1,2]
+	sed -n 's/.*"regmaps": *\[\([0-9, ]*\)\].*/\1/p' "$1" 2>/dev/null | tr ',' ' '
+}
+
+services() {     # services start|stop, in order (stop: reverse)
+	list=$SERVICES
+	[ "$1" = stop ] && list=$(echo $SERVICES | tr ' ' '\n' | sed '1!G;h;$!d')
+	for s in $list; do
+		[ -x /etc/init.d/$s ] && /etc/init.d/$s "$1" >/dev/null 2>&1
+	done
+}
+
+healthy() {      # up to 20 s: fpgad answers, the PL is as good as before, the web answers,
+	pl_was_ok=$1  # and the daemons run from the new set (app-exec falls back to the factory
+	              # copies when a binary is missing - that must not pass as healthy)
+	i=0
+	while [ $i -lt 20 ]; do
+		i=$((i + 1))
+		sleep 1
+		fpgactl ping >/dev/null 2>&1 || continue
+		if [ "$pl_was_ok" = 1 ]; then
+			fpgactl status 2>/dev/null | grep -q '"ok":true' || continue
+		fi
+		wget -q -T 2 -O - http://127.0.0.1/api/status 2>/dev/null | grep -q '"pl"' || continue
+		pidof oled-status >/dev/null 2>&1 || ps | grep -q '[o]led-status' || continue
+		ps | grep -q "[ ]$GOOD/bin/fpgad" && ps | grep -q "[ ]$GOOD/bin/fpga-web" || continue
+		return 0
+	done
+	return 1
+}
+
+copy_tree() {    # copy_tree <src> <dst>: fresh copy of the directory's contents, synced
+	rm -rf "$2" "$2.tmp" && mkdir -p "$2.tmp" && cp -a "$1/." "$2.tmp/" && sync && mv "$2.tmp" "$2" && sync
+}
+
+activate() {
+	src=${1:-$CANDIDATE}
+	[ -f "$src/manifest.json" ] || die "no $src/manifest.json"
+	real=$(readlink -f "$src")
+	if [ -d "$GOOD" ] && [ "$(cat "$GOOD/.source" 2>/dev/null)" = "$real" ]; then
+		log "app set $(json_field "$GOOD/manifest.json" version) is already active"
+		return 0
+	fi
+	ver=$(json_field "$src/manifest.json" version)
+	for b in fpgad fpgactl fpga-web oled-status; do
+		[ -x "$src/bin/$b" ] || die "app set $ver has no bin/$b - not installed"
+	done
+
+	# the new fpgad must understand the register map of the design that will run:
+	# the PL candidate if it is about to be activated too, else the running one
+	pl_source=$(cat /data/pl/good.source 2>/dev/null)
+	if [ -f "$PL_CANDIDATE/manifest.json" ] && [ "$(readlink -f $PL_CANDIDATE)" != "$pl_source" ]; then
+		need=$(json_field "$PL_CANDIDATE/manifest.json" regmap)
+	else
+		need=$(fpgactl pl 2>/dev/null | sed -n 's/.*"regmap":\([0-9]*\).*/\1/p')
+	fi
+	if [ -n "$need" ]; then
+		echo " $(regmaps_of "$src/manifest.json") " | grep -q " $need " ||
+			die "app set $ver supports REGMAP [$(regmaps_of "$src/manifest.json")], the FPGA design needs $need - not installed"
+	fi
+
+	pl_ok=0
+	fpgactl status 2>/dev/null | grep -q '"ok":true' && pl_ok=1
+	log "trial: app set $ver"
+	mkdir -p "$A"
+	copy_tree "$real" "$A/new" && echo "$real" > "$A/new/.source" || die "copying $src failed"
+	echo "$ver" > "$TRIAL"; sync          # a reset from here on: S90apps restores prev
+	services stop
+	rm -rf "$PREV.old"
+	[ -d "$PREV" ] && mv "$PREV" "$PREV.old"
+	[ -d "$GOOD" ] && mv "$GOOD" "$PREV"
+	mv "$A/new" "$GOOD"; sync
+	services start
+	if healthy $pl_ok; then
+		rm -rf "$PREV.old" "$TRIAL"; sync
+		log "app set $ver is up"
+		return 0
+	fi
+	log "app set $ver failed its health check - restoring the previous one"
+	services stop
+	rm -rf "$A/failed"; mv "$GOOD" "$A/failed"
+	[ -d "$PREV" ] && mv "$PREV" "$GOOD"
+	[ -d "$PREV.old" ] && mv "$PREV.old" "$PREV"
+	rm -f "$TRIAL"; sync
+	services start
+	die "app set $ver failed (kept in $A/failed); running $( [ -d "$GOOD" ] && json_field "$GOOD/manifest.json" version || echo "the factory copies")"
+}
+
+rollback() {
+	[ -d "$PREV" ] || die "no previous app set"
+	log "rolling back to $(json_field "$PREV/manifest.json" version)"
+	services stop
+	rm -rf "$A/rolledback"; [ -d "$GOOD" ] && mv "$GOOD" "$A/rolledback"
+	mv "$PREV" "$GOOD"; sync
+	services start
+}
+
+boot() {          # before the services start: an interrupted trial means back to prev
+	[ -f "$TRIAL" ] || return 0
+	ver=$(cat "$TRIAL")
+	log "the board reset during the trial of app set $ver - restoring the previous app set"
+	rm -rf "$A/new" "$A/new.tmp"
+	# the reset may have come at any step of activate's swap: good is the trial set,
+	# or missing (moved to prev, new not yet in place), or still the old good set
+	if [ ! -d "$GOOD" ] || [ "$(json_field "$GOOD/manifest.json" version)" = "$ver" ]; then
+		[ -d "$GOOD" ] && rm -rf "$A/failed" && mv "$GOOD" "$A/failed"
+		[ -d "$PREV" ] && mv "$PREV" "$GOOD"
+	fi
+	[ ! -d "$PREV" ] && [ -d "$PREV.old" ] && mv "$PREV.old" "$PREV"
+	rm -rf "$PREV.old" "$TRIAL"; sync
+}
+
+status() {
+	for s in good prev failed; do
+		if [ -f "$A/$s/manifest.json" ]; then
+			echo "$s: $(json_field "$A/$s/manifest.json" version)  regmaps [$(regmaps_of "$A/$s/manifest.json")]"
+		fi
+	done
+	[ -d "$GOOD" ] || echo "good: none - running the factory copies from the image"
+	[ -f "$TRIAL" ] && echo "trial in progress: $(cat "$TRIAL")"
+	return 0
+}
+
+case "$1" in
+	activate) activate "$2" ;;
+	rollback) rollback ;;
+	factory)  services stop; rm -rf "$GOOD" "$PREV" "$PREV.old"; sync
+	          services start; log "running the factory copies" ;;
+	status)   status ;;
+	boot)     boot ;;
+	*) echo "usage: appctl activate [dir] | rollback | factory | status | boot" >&2; exit 2 ;;
+esac

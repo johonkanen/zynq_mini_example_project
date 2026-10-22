@@ -243,12 +243,104 @@ Notes from the hardware run:
 
 ## Phase 2 — live app updates
 
-Our software moves out of the rootfs into an artifact repository on `/data`:
-`/data/rauc/apps/<name> -> <hash>/` (`trees`). The init scripts start the binaries
-from there; RAUC's post-install handler restarts the changed services and checks them
-(fpgad `ping`, fpga-web `/api/status`). On failure the previous version is linked back
-and restarted. An app bundle declares the `REGMAP` versions it supports, so fpgad and
-the PL can't drift apart.
+Our software (fpgad, fpgactl, fpga-web, oled-status, and the WebSocket-enabled
+`libcivetweb` fpga-web needs) is updated as a unit, with no reboot.
+
+### 2.1 Factory copies and the app layer
+
+The image keeps its own binaries as **factory copies** in `/usr/lib/zynq-mini/bin`.
+`/usr/sbin/fpgad`, `/usr/bin/fpgactl`, `/usr/bin/fpga-web` and `/usr/bin/oled-status`
+are links to a tiny launcher, `/usr/lib/zynq-mini/app-exec`: it runs the program of
+that name from the installed app set, `/data/apps/good/bin`, when there is one, else
+the factory copy (with `LD_LIBRARY_PATH` pointing at the set's `lib/`). Init scripts,
+the RAUC handler, oled-status and a shell all get the right binary without knowing
+about the layers, and `appctl factory` gets back to exactly what the image shipped.
+
+### 2.2 App bundle
+
+`linux/make-app-bundle.sh` rebuilds fpgad and fpga-web in Buildroot and packs a
+signed `output/apps-<version>.raucb` with one `trees` artifact `apps/zynq-mini-apps`:
+
+```
+bin/fpgad  bin/fpgactl  bin/fpga-web  bin/oled-status
+lib/libcivetweb.so.1
+manifest.json     {"version", "git", "date", "regmaps": [1]}
+```
+
+`regmaps` comes from fpgad's own list of register-map versions it supports.
+
+### 2.3 appctl: trial, health check, rollback
+
+`appctl activate` (part of the image, not of the app sets it manages), called by
+RAUC's post-install handler:
+
+1. skip if this artifact is already the active set;
+2. refuse a set whose `regmaps` doesn't include the `REGMAP` of the design that will
+   run (the PL candidate if the same bundle brings one, else the running design);
+3. copy it to `/data/apps/new`, write the trial marker `/data/apps/trial`;
+4. stop the services (fpgad's clean stop disarms the watchdog), move `good` → `prev`,
+   `new` → `good`, start the services;
+5. health check, up to 20 s: `fpgactl ping`, the PL still `ok` if it was before,
+   fpga-web's `/api/status`, oled-status running, and fpgad and fpga-web really
+   running from `/data/apps/good` (the launcher falls back to the factory copies
+   when a binary is missing — that must not count as a pass);
+6. **pass**: drop the marker. **fail**: stop, move the set to `/data/apps/failed`,
+   `prev` → `good`, start again, report the error to `rauc install`.
+
+`S90apps` runs `appctl boot` before the services start: if the trial marker is still
+there, the board reset during a trial (for example the new fpgad crashed and the
+watchdog fired), and the previous set is put back first.
+
+Each set carries the RAUC artifact it came from in `<set>/.source`, so the
+"already active" check moves with the directory, and `appctl boot` can tell from the
+versions at which step of the swap the reset came and restore `good` and `prev`.
+
+`appctl rollback` goes back to `prev` by hand; `appctl status` shows the sets.
+
+### 2.4 Order in a combined bundle
+
+The post-install handler activates the **app set first, then the FPGA design**, so a
+new fpgad that understands a new register map runs before the design that needs it.
+Both activations skip a candidate that is already active (fpgad records the good
+design's source in `/data/pl/good.source`), so an app-only bundle doesn't reload the
+FPGA and a PL-only bundle doesn't restart the services.
+
+### 2.5 Tools
+
+```sh
+./linux/make-app-bundle.sh                  # rebuild + bundle -> output/apps-latest.raucb
+./linux/update-board.sh <ip> apps           # rauc install + appctl trial; no reboot
+appctl status | rollback | factory          # on the board
+```
+
+`update-board.sh`'s old `fpgad` and `web` parts are now names for `apps` (copying
+files over the launcher links would have bypassed the app layer).
+
+### 2.6 Status — done, verified on the board (2026-10-22)
+
+| test | result |
+|---|---|
+| migration to the phase-2 image with `reflash-over-ssh.sh` | ok, no JTAG; factory copies run until the first app bundle |
+| first app bundle | trial passed, daemons run from `/data/apps/good`, ~6 s, PL not reloaded |
+| second app bundle | new set `good`, first set `prev` |
+| app set whose fpgad exits at once | health check failed after 20 s, previous set back, `rauc install` failed |
+| app set supporting only REGMAP 2 (design has 1) | refused before anything changed (fpgad pid unchanged), <2 s |
+| hard reset (`reboot -f`) during a trial | `S90apps` restored `good` and `prev`, trial set in `failed` |
+| same bundle again | "already active", nothing restarted |
+| `appctl rollback` | back to `prev`, services restarted on it |
+| combined bundle (app set + design) | app set activated first, then its fpgad trial-loaded the design and kept it |
+| apps-only bundle after that | PL "already active", not reloaded |
+
+Found and fixed on the board: the first `appctl` copied RAUC's artifact *symlink*
+instead of the tree, and the health check passed because the launcher quietly fell
+back to the factory copies — hence the "running from the set" check above. The
+interrupted-swap recovery was also simulated for every step of the swap.
+
+Still open: an app set that passed its trial but fails later. An fpgad crash leaves
+the watchdog armed, so the board resets — but with no trial marker it boots the same
+set again (a reset loop); a clean exit disarms the watchdog and nothing restarts
+fpgad. A boot counter for the app set (fall back to `prev` after N resets) and a
+supervisor would cover it.
 
 ## Phase 3 — A/B Linux, and no JTAG for the bootloader
 

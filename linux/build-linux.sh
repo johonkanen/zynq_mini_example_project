@@ -121,7 +121,8 @@ if [ ! -f "$KEYS/signing.key.pem" ]; then
       rm -f signing.csr.pem leaf.ext
       chmod 600 ca.key.pem signing.key.pem )
 fi
-mkdir -p "$OV/rootfs/etc/rauc" "$OV/rootfs/usr/lib/rauc" "$OV/rootfs/data/rauc/pl" "$OV/rootfs/data/pl"
+mkdir -p "$OV/rootfs/etc/rauc" "$OV/rootfs/usr/lib/rauc" "$OV/rootfs/data/rauc/pl" "$OV/rootfs/data/pl" \
+         "$OV/rootfs/data/rauc/apps" "$OV/rootfs/data/apps"
 cp "$REPO/linux/rauc/system.conf" "$OV/rootfs/etc/rauc/system.conf"
 cp "$KEYS/ca.cert.pem" "$OV/rootfs/etc/rauc/keyring.pem"
 install -m 0755 "$REPO/linux/rauc/post-install.sh" "$OV/rootfs/usr/lib/rauc/post-install.sh"

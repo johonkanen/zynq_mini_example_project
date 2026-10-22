@@ -1,0 +1,19 @@
+#!/bin/sh
+#
+# app-exec - launcher for our software (doc/network_update.md, phase 2).
+#
+# /usr/sbin/fpgad, /usr/bin/fpgactl, /usr/bin/fpga-web and /usr/bin/oled-status
+# are symlinks to this script. It runs the program of that name from the
+# installed app set (/data/apps/good, from an app bundle) when there is one,
+# otherwise the image's factory copy (/usr/lib/zynq-mini/bin). It execs, so the
+# pid stays the same for start-stop-daemon.
+#
+name=${0##*/}
+for d in /data/apps/good /usr/lib/zynq-mini; do
+	if [ -x "$d/bin/$name" ]; then
+		[ -d "$d/lib" ] && export LD_LIBRARY_PATH="$d/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+		exec "$d/bin/$name" "$@"
+	fi
+done
+echo "$name: not installed (neither /data/apps/good/bin nor /usr/lib/zynq-mini/bin)" >&2
+exit 127

@@ -668,8 +668,8 @@ no hang).
 For day-to-day changes, push only what changed to a board that's up on the network:
 
 ```bash
-./linux/update-board.sh <board-ip>              # kernel + dtb + PL bundle + fpgad + web server
-./linux/update-board.sh <board-ip> pl web       # just some parts: kernel dtb pl fpgad web all
+./linux/update-board.sh <board-ip>              # kernel + dtb + app bundle + PL bundle
+./linux/update-board.sh <board-ip> apps pl      # just some parts: kernel dtb apps pl all
 ./linux/update-board.sh --no-reboot <board-ip>  # new kernel/dtb wait for the next boot
 ./linux/update-board.sh --new-hostkey <ip>      # after reflashing (dropbear made a new host key)
 ```
@@ -679,8 +679,7 @@ For day-to-day changes, push only what changed to a board that's up on the netwo
 | `kernel` | `output/images/uImage` | SD p1 `/uImage` | reboot |
 | `dtb` | `output/images/zynq-zynqmini.dtb` | SD p1 `/system.dtb` | reboot |
 | `pl` | `output/pl-latest.raucb` (`linux/make-pl-bundle.sh`) | `rauc install` → `/data/rauc/pl` | fpgad trial-loads it: kept, or rolled back to the good design — no reboot |
-| `fpgad` | `fpgad`, `fpgactl` | `/usr/sbin/`, `/usr/bin/` | `fpgad` restarted (clients reconnect) |
-| `web` | `fpga-web` | `/usr/bin/` | service restarted |
+| `apps` | `output/apps-latest.raucb` (`linux/make-app-bundle.sh`) | `rauc install` → `/data/rauc/apps` | `appctl` trial-runs fpgad, fpgactl, fpga-web, oled-status: kept or rolled back — no reboot |
 
 - Unchanged files (same md5 on the board) are skipped; the board reboots only if
   the kernel or dtb actually changed.

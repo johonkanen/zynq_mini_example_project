@@ -11,9 +11,11 @@
 #   pl       output/pl-latest.raucb (or PL_BUNDLE=<file>) -> `rauc install`: signature
 #            checked, design trial-loaded by fpgad, kept or rolled back. No reboot.
 #            Make the bundle with linux/make-pl-bundle.sh (doc/network_update.md).
-#   fpgad    fpgad + fpgactl + oled-status   -> /usr/sbin, /usr/bin, /etc/init.d; restarted
-#   web      fpga-web + libcivetweb          -> /usr/bin, /usr/lib; service restarted
-#   all      kernel dtb pl fpgad web
+#   apps     output/apps-latest.raucb (or APPS_BUNDLE=<file>) -> `rauc install`: our
+#            software (fpgad, fpgactl, fpga-web, oled-status) trial-run by appctl, kept
+#            or rolled back. No reboot. Make it with linux/make-app-bundle.sh.
+#            (fpgad, web: old names for apps)
+#   all      kernel dtb pl apps
 #
 # Unchanged files (same md5 as on the board) are skipped. The board reboots
 # afterwards only if the kernel or the dtb actually changed. (Soft reboots work
@@ -51,15 +53,16 @@ while [ $# -gt 0 ]; do
         *)             break ;;
     esac
 done
-[ $# -ge 1 ] || die "usage: $0 [--no-reboot] [--new-hostkey] <board-ip> [kernel|dtb|pl|fpgad|web|all]..."
+[ $# -ge 1 ] || die "usage: $0 [--no-reboot] [--new-hostkey] <board-ip> [kernel|dtb|pl|apps|all]..."
 BOARD=$1; shift
 parts=("${@:-all}")
 want() { local p; for p in "${parts[@]}"; do [ "$p" = all ] || [ "$p" = "$1" ] && return 0; done; return 1; }
 for p in "${parts[@]}"; do
     case "$p" in
-        kernel|dtb|pl|fpgad|web|all) ;;
+        kernel|dtb|pl|apps|all) ;;
+        fpgad|web) ;;                         # old names for apps
         bit) die "'bit' is gone: FPGA designs go as signed PL bundles - linux/make-pl-bundle.sh, then 'pl'" ;;
-        *) die "unknown part '$p' (kernel dtb pl fpgad web all)" ;;
+        *) die "unknown part '$p' (kernel dtb pl apps all)" ;;
     esac
 done
 
@@ -118,41 +121,29 @@ if want kernel || want dtb; then
     want dtb    && push "$BR/images/zynq-zynqmini.dtb" /mnt/boot/system.dtb && need_reboot=1 || true
 fi
 
+# a signed bundle -> rauc install; the post-install handler activates it
+install_bundle() {   # install_bundle <what> <file>
+    rsh 'command -v rauc >/dev/null' || die "no rauc on the board - it needs a newer image (doc/network_update.md)"
+    echo "   $(basename "$(readlink -f "$2")")"
+    rsh "cat > /tmp/update.raucb" < "$2"
+    rsh 'rauc install /tmp/update.raucb; rc=$?; rm -f /tmp/update.raucb; exit $rc' \
+        || die "$1 bundle not installed (see above) - the board keeps what it had"
+}
+
+if want apps || want fpgad || want web; then
+    log "our software (app bundle)"
+    bundle=${APPS_BUNDLE:-$REPO/output/apps-latest.raucb}
+    [ -f "$bundle" ] || die "no $bundle - run linux/make-app-bundle.sh"
+    install_bundle app "$bundle"
+    rsh 'appctl status'
+fi
+
 if want pl; then
     log "FPGA design (PL bundle)"
     bundle=${PL_BUNDLE:-$REPO/output/pl-latest.raucb}
     [ -f "$bundle" ] || die "no $bundle - run linux/make-pl-bundle.sh"
-    rsh 'command -v rauc >/dev/null' || die "no rauc on the board - it needs the phase-1 image (doc/network_update.md)"
-    echo "   $(basename "$(readlink -f "$bundle")")"
-    rsh "cat > /tmp/pl.raucb" < "$bundle"
-    # RAUC checks the signature, installs into /data/rauc/pl, then its post-install
-    # handler has fpgad trial-load the design (kept if it passes, else rolled back)
-    rsh 'rauc install /tmp/pl.raucb; rc=$?; rm -f /tmp/pl.raucb; fpgactl pl; exit $rc' \
-        || die "PL bundle not installed (see above) - the board stays on its good design"
-fi
-
-if want fpgad; then
-    log "fpgad + fpgactl"
-    push "$BR/target/usr/bin/fpgactl" /usr/bin/fpgactl 755 || true
-    if push "$BR/target/usr/sbin/fpgad" /usr/sbin/fpgad 755; then
-        rsh "/etc/init.d/S96fpgad restart"    # clients (fpga-web) reconnect on their own
-    fi
-    # IP + temperature on the OLED (an fpgad client)
-    st=0
-    push "$BR/target/usr/bin/oled-status" /usr/bin/oled-status 755 && st=1
-    push "$BR/target/etc/init.d/S98oled-status" /etc/init.d/S98oled-status 755 && st=1
-    [ "$st" = 0 ] || rsh "/etc/init.d/S98oled-status restart"
-fi
-
-if want web; then
-    log "fpga-web"
-    restart=0
-    # civetweb with WebSocket support (fpga-web.mk turns it on) for /ws
-    lib=$(cd "$BR/target/usr/lib" && ls libcivetweb.so.1.* 2>/dev/null | head -1)
-    [ -n "$lib" ] || die "missing $BR/target/usr/lib/libcivetweb.so.1.* - build it first"
-    push "$BR/target/usr/lib/$lib" "/usr/lib/$lib" 755 && restart=1
-    push "$BR/target/usr/bin/fpga-web" /usr/bin/fpga-web 755 && restart=1
-    [ "$restart" = 0 ] || rsh "/etc/init.d/S97fpga-web restart"
+    install_bundle PL "$bundle"
+    rsh 'fpgactl pl'
 fi
 
 if [ "$need_reboot" = 1 ]; then

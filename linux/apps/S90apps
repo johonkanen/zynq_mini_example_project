@@ -1,0 +1,10 @@
+#!/bin/sh
+#
+# S90apps - before our services start: if the board reset in the middle of an app
+# trial (appctl activate), put the previous app set back (doc/network_update.md).
+#
+case "$1" in
+	start) /usr/sbin/appctl boot ;;
+	stop|restart|reload) ;;
+	*) echo "Usage: $0 {start|stop|restart}"; exit 1 ;;
+esac

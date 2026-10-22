@@ -94,6 +94,8 @@ and its QMTech sibling, **including building Linux** — see [`doc/notes.md`](do
 | `linux/br2-external/`         | Buildroot external tree: `fpgad` + `fpga-web` packages and init scripts |
 | `linux/update-board.sh`       | push kernel/dtb, PL bundles, fpgad and the web server to a running board over SSH — `doc/linux_build.md` §13 |
 | `linux/make-pl-bundle.sh`     | FPGA build → signed RAUC **PL bundle** (bitstream + DT overlay + manifest) — `doc/network_update.md` |
+| `linux/make-app-bundle.sh`    | fpgad / fpga-web / oled-status → signed RAUC **app bundle** |
+| `linux/apps/`                 | `app-exec` (runs the installed app set or the factory copy), `appctl` (trial / rollback), `S90apps` |
 | `linux/pl/zynq-mini-pl.dtso`  | the design's device-tree overlay (`axi_regs` UIO node), applied by fpgad with the bitstream |
 | `linux/rauc/`                 | RAUC `system.conf` and post-install handler for the board |
 | `linux/kernel-rauc.config`    | kernel config fragment RAUC needs (squashfs, dm-verity) |

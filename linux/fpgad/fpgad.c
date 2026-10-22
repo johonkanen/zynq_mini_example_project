@@ -678,7 +678,11 @@ static int keep_as_good(const char *dir, char *err, size_t n)
     snprintf(gnew, sizeof gnew, "%s/good.new", pl_dir);
     snprintf(gold, sizeof gold, "%s/good.old", pl_dir);
     char r1[PATH_MAX], r2[PATH_MAX];
-    if (realpath(dir, r1) && realpath(good, r2) && !strcmp(r1, r2))
+    if (!realpath(dir, r1)) {
+        snprintf(err, n, "%.200s: %s", dir, strerror(errno));
+        return -1;
+    }
+    if (realpath(good, r2) && !strcmp(r1, r2))
         return 0;                       /* it is the good design already */
     remove_design_dir(gnew);
     if (mkdir(gnew, 0755) < 0) {
@@ -701,6 +705,16 @@ static int keep_as_good(const char *dir, char *err, size_t n)
         return -1;
     }
     remove_design_dir(gold);
+    /* remember where it came from: activating the same artifact again is a no-op */
+    char src[200];
+    snprintf(src, sizeof src, "%s/good.source", pl_dir);
+    int fd = open(src, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd >= 0) {
+        if (write(fd, r1, strlen(r1)) < 0)
+            logmsg(LOG_WARNING, "writing %s: %s", src, strerror(errno));
+        fsync(fd);
+        close(fd);
+    }
     sync();
     return 0;
 }
@@ -740,6 +754,20 @@ static int pl_activate(const char *dir, char *err, size_t n)
         return -1;
     }
     snprintf(good, sizeof good, "%s/good", pl_dir);
+
+    /* already the good design, loaded and checked? then there is nothing to do
+     * (an app-only bundle runs this handler too) */
+    char real[PATH_MAX], src[PATH_MAX] = "", srcfile[200];
+    snprintf(srcfile, sizeof srcfile, "%s/good.source", pl_dir);
+    if (realpath(dir, real) && read_file(srcfile, src, sizeof src, NULL) == 0 && !strcmp(real, src)) {
+        pthread_rwlock_rdlock(&pl_lock);
+        int same = pl_ok && pl_cur.build_id == d.build_id;
+        pthread_rwlock_unlock(&pl_lock);
+        if (same) {
+            logmsg(LOG_INFO, "design %s from %s is already active", d.version, real);
+            return 0;
+        }
+    }
 
     pthread_rwlock_wrlock(&pl_lock);
     trial_mark(d.version);              /* a reset from here on means: back to good */

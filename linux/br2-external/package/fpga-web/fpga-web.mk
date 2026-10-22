@@ -21,8 +21,11 @@ define FPGA_WEB_BUILD_CMDS
 	$(TARGET_MAKE_ENV) $(MAKE) $(TARGET_CONFIGURE_OPTS) -C $(@D)
 endef
 
+# factory copy + app-exec link, as in fpgad.mk (doc/network_update.md, phase 2)
 define FPGA_WEB_INSTALL_TARGET_CMDS
-	$(INSTALL) -D -m 0755 $(@D)/fpga-web $(TARGET_DIR)/usr/bin/fpga-web
+	$(INSTALL) -D -m 0755 $(@D)/fpga-web $(TARGET_DIR)/usr/lib/zynq-mini/bin/fpga-web
+	mkdir -p $(TARGET_DIR)/usr/bin
+	ln -sf ../lib/zynq-mini/app-exec $(TARGET_DIR)/usr/bin/fpga-web
 endef
 
 define FPGA_WEB_INSTALL_INIT_SYSV
