@@ -46,6 +46,11 @@
 --                                     for the handshake, at most EXT_TIMEOUT clocks (then
 --                                     reads 0xDEADBEEF); without the MAC (FEATURES bit0 = 0)
 --                                     it reads 0 at once
+--
+-- A second way in, udp_*: the PL Ethernet MAC's UDP register access (eth_mac.vhd),
+-- a request/acknowledge handshake with toggles from its clock; it reaches the
+-- registers 0x00..0xFF only (the rest reads 0, writes are ignored) and is served
+-- while the AXI write channel is idle.
 --   0x8000..0xFFFF SCOPE_RAM RO       capture buffer: word 2*i = ch1:ch0, word
 --                                     2*i+1 = ch3:ch2 of RAM sample i (16-bit
 --                                     signed, high:low)
@@ -106,6 +111,15 @@ entity axi_regs is
         ext_wdata_o      : out std_logic_vector(AXI_DATA_WIDTH-1 downto 0);
         ext_rdata_i      : in  std_logic_vector(AXI_DATA_WIDTH-1 downto 0) := (others => '0');
         ext_ack_i        : in  std_logic := '0';               -- any clock
+
+        -- register access from the PL (eth_mac's UDP commands): address, write and
+        -- data held from the request toggle until the acknowledge toggle
+        udp_req_i        : in  std_logic := '0';               -- any clock
+        udp_write_i      : in  std_logic := '0';
+        udp_addr_i       : in  std_logic_vector(15 downto 0) := (others => '0');
+        udp_wdata_i      : in  std_logic_vector(AXI_DATA_WIDTH-1 downto 0) := (others => '0');
+        udp_rdata_o      : out std_logic_vector(AXI_DATA_WIDTH-1 downto 0);
+        udp_ack_o        : out std_logic;
 
         -- AXI3 slave interface (connect straight to M_AXI_GP0)
         s_axi_aclk    : in  std_logic;
@@ -198,6 +212,12 @@ architecture rtl of axi_regs is
     attribute ASYNC_REG : string;
     attribute ASYNC_REG of ext_ack_meta, ext_ack_sync : signal is "TRUE";
 
+    -- register access from the PL
+    signal udp_req_meta, udp_req_sync, udp_req_seen : std_logic := '0';
+    signal udp_ack   : std_logic := '0';
+    signal udp_rdata : word_t := (others => '0');
+    attribute ASYNC_REG of udp_req_meta, udp_req_sync : signal is "TRUE";
+
     -- write channel
     type wr_state_t is (W_IDLE, W_DATA, W_EXT, W_RESP);
     signal wr_state : wr_state_t := W_IDLE;
@@ -251,6 +271,43 @@ architecture rtl of axi_regs is
             if v(i) = '1' then n := n + 1; end if;
         end loop;
         return n;
+    end function;
+
+    -- a register's value (0x00..0xFF block; the map repeats), for AXI and the PL alike
+    function read_register(a : unsigned; regs : word_array_t; heartbeat : unsigned; sum_w, status_w : word_t;
+                           oled_ctrl, oled_stat : word_t; features : word_t; scope_stat : scope_stat_t;
+                           scope_cfg : word_array_t; text : word_array_t) return word_t is
+        variable idx : integer range 0 to N_REGS-1;
+        variable w   : word_t := (others => '0');
+    begin
+        idx := reg_index(a);
+        case idx is
+            when 0 to 3        => w := regs(idx);
+            when 4             => w := std_logic_vector(heartbeat);
+            when 5             => w := sum_w;
+            when 6             => w := status_w;
+            when 7             => w := x"5A5A1234";
+            when IDX_OLED_CTRL => w := oled_ctrl;
+            when IDX_OLED_STAT => w := oled_stat;
+            when IDX_BUILD_ID  => w := BUILD_ID;
+            when IDX_REGMAP    => w := std_logic_vector(to_unsigned(REGMAP_VERSION, 32));
+            when IDX_FEATURES  => w := features;
+            when IDX_SCOPE_CMD => w := (others => '0');
+            when IDX_SCOPE_STAT =>
+                w(1 downto 0) := std_logic_vector(scope_stat.state);
+                w(2) := scope_stat.done;
+                w(3) := scope_stat.trig_cond;
+                w(16+SCOPE_DEPTH_LOG2-1 downto 16) := std_logic_vector(scope_stat.trig_ptr);
+            when IDX_SCOPE_CFG to IDX_SCOPE_CFG+3 => w := scope_cfg(idx - IDX_SCOPE_CFG);
+            when IDX_SCOPE_INFO =>
+                w := std_logic_vector(to_unsigned(FCLK_MHZ, 16)) &
+                     std_logic_vector(to_unsigned(SCOPE_DEPTH_LOG2, 8)) &
+                     std_logic_vector(to_unsigned(SCOPE_CH, 8));
+            when IDX_GEN_FTW to IDX_GEN_FTW+1 => w := scope_cfg(4 + idx - IDX_GEN_FTW);
+            when IDX_TEXT to N_REGS-1 => w := text(idx - IDX_TEXT);
+            when others        => w := (others => '0');
+        end case;
+        return w;
     end function;
 
 begin
@@ -332,52 +389,55 @@ begin
     s_axi_o.r.valid <= rvalid_r;
 
     rd_mux : process (all)
-        variable idx : integer range 0 to N_REGS-1;
     begin
-        idx := reg_index(rd_addr);
         if is_ram(rd_addr) then
             rd_word <= scope_rd_data_i;
         elsif is_eth(rd_addr) then
             rd_word <= rd_ext_data;
         else
-            case idx is
-                when 0 to 3        => rd_word <= regs(idx);
-                when 4             => rd_word <= std_logic_vector(heartbeat);
-                when 5             => rd_word <= sum_w;
-                when 6             => rd_word <= status_w;
-                when 7             => rd_word <= x"5A5A1234";
-                when IDX_OLED_CTRL => rd_word <= oled_ctrl;
-                when IDX_OLED_STAT => rd_word <= oled_stat_i;
-                when IDX_BUILD_ID  => rd_word <= BUILD_ID;
-                when IDX_REGMAP    => rd_word <= std_logic_vector(to_unsigned(REGMAP_VERSION, 32));
-                when IDX_FEATURES  => rd_word <= features_i;
-                when IDX_SCOPE_CMD => rd_word <= (others => '0');
-                when IDX_SCOPE_STAT =>
-                    rd_word <= (others => '0');
-                    rd_word(1 downto 0) <= std_logic_vector(scope_stat_i.state);
-                    rd_word(2) <= scope_stat_i.done;
-                    rd_word(3) <= scope_stat_i.trig_cond;
-                    rd_word(16+SCOPE_DEPTH_LOG2-1 downto 16) <= std_logic_vector(scope_stat_i.trig_ptr);
-                when IDX_SCOPE_CFG to IDX_SCOPE_CFG+3 => rd_word <= scope_cfg(idx - IDX_SCOPE_CFG);
-                when IDX_SCOPE_INFO =>
-                    rd_word <= std_logic_vector(to_unsigned(FCLK_MHZ, 16)) &
-                               std_logic_vector(to_unsigned(SCOPE_DEPTH_LOG2, 8)) &
-                               std_logic_vector(to_unsigned(SCOPE_CH, 8));
-                when IDX_GEN_FTW to IDX_GEN_FTW+1 => rd_word <= scope_cfg(4 + idx - IDX_GEN_FTW);
-                when IDX_TEXT to N_REGS-1 => rd_word <= text(idx - IDX_TEXT);
-                when others        => rd_word <= (others => '0');
-            end case;
+            rd_word <= read_register(rd_addr, regs, heartbeat, sum_w, status_w, oled_ctrl, oled_stat_i,
+                                     features_i, scope_stat_i, scope_cfg, text);
         end if;
     end process;
+
+    udp_rdata_o <= udp_rdata;
+    udp_ack_o   <= udp_ack;
 
     ---------------------------------------------------------------------------
     -- AXI write channel
     ---------------------------------------------------------------------------
     write_proc : process (s_axi_aclk)
-        variable idx : integer range 0 to N_REGS-1;
+
+        -- a register write (0x00..0xFF block) with byte strobes, for AXI and the PL alike
+        procedure write_register(a : unsigned; data : word_t; strb : std_logic_vector) is
+            variable i : integer range 0 to N_REGS-1;
+        begin
+            i := reg_index(a);
+            if i = IDX_SCOPE_CMD and strb(0) = '1' then
+                scope_cmd <= data(2 downto 0);
+            end if;
+            for b in strb'range loop
+                if strb(b) = '1' then
+                    if i <= 3 then
+                        regs(i)(8*b+7 downto 8*b) <= data(8*b+7 downto 8*b);
+                    elsif i = IDX_OLED_CTRL then
+                        oled_ctrl(8*b+7 downto 8*b) <= data(8*b+7 downto 8*b);
+                    elsif i >= IDX_SCOPE_CFG and i <= IDX_SCOPE_CFG+3 then
+                        scope_cfg(i - IDX_SCOPE_CFG)(8*b+7 downto 8*b) <= data(8*b+7 downto 8*b);
+                    elsif i = IDX_GEN_FTW or i = IDX_GEN_FTW+1 then
+                        scope_cfg(4 + i - IDX_GEN_FTW)(8*b+7 downto 8*b) <= data(8*b+7 downto 8*b);
+                    elsif i >= IDX_TEXT then
+                        text(i - IDX_TEXT)(8*b+7 downto 8*b) <= data(8*b+7 downto 8*b);
+                    end if;
+                end if;
+            end loop;
+        end procedure;
     begin
         if rising_edge(s_axi_aclk) then
+            udp_req_meta <= udp_req_i;
+            udp_req_sync <= udp_req_meta;
             if s_axi_aresetn = '0' then
+                udp_req_seen <= udp_req_sync;
                 wr_state   <= W_IDLE;
                 awready_r  <= '0';
                 wready_r   <= '0';
@@ -395,6 +455,22 @@ begin
                     when W_IDLE =>
                         bvalid_r  <= '0';
                         awready_r <= '1';
+                        -- the PL's register access, served while AXI writes are idle (an
+                        -- address taken here starts its data phase in W_DATA, later)
+                        if udp_req_sync /= udp_req_seen then
+                            udp_req_seen <= udp_req_sync;
+                            if unsigned(udp_addr_i(15 downto 8)) = 0 then
+                                if udp_write_i = '1' then
+                                    write_register(unsigned(udp_addr_i), udp_wdata_i, "1111");
+                                end if;
+                                udp_rdata <= read_register(unsigned(udp_addr_i), regs, heartbeat, sum_w, status_w,
+                                                           oled_ctrl, oled_stat_i, features_i, scope_stat_i,
+                                                           scope_cfg, text);
+                            else
+                                udp_rdata <= (others => '0');
+                            end if;
+                            udp_ack <= not udp_ack;
+                        end if;
                         if s_axi_i.aw.valid = '1' and awready_r = '1' then
                             wr_addr   <= unsigned(s_axi_i.aw.addr);
                             wr_id     <= s_axi_i.aw.id;
@@ -414,25 +490,9 @@ begin
                             wready_r    <= '0';
                             wr_state    <= W_EXT;
                         elsif s_axi_i.w.valid = '1' and wready_r = '1' then
-                            idx := reg_index(wr_addr);
-                            if not is_ram(wr_addr) and idx = IDX_SCOPE_CMD and s_axi_i.w.strb(0) = '1' then
-                                scope_cmd <= s_axi_i.w.data(2 downto 0);
+                            if not is_ram(wr_addr) then
+                                write_register(wr_addr, s_axi_i.w.data, s_axi_i.w.strb);
                             end if;
-                            for b in s_axi_i.w.strb'range loop
-                                if s_axi_i.w.strb(b) = '1' and not is_ram(wr_addr) then
-                                    if idx <= 3 then
-                                        regs(idx)(8*b+7 downto 8*b) <= s_axi_i.w.data(8*b+7 downto 8*b);
-                                    elsif idx = IDX_OLED_CTRL then
-                                        oled_ctrl(8*b+7 downto 8*b) <= s_axi_i.w.data(8*b+7 downto 8*b);
-                                    elsif idx >= IDX_SCOPE_CFG and idx <= IDX_SCOPE_CFG+3 then
-                                        scope_cfg(idx - IDX_SCOPE_CFG)(8*b+7 downto 8*b) <= s_axi_i.w.data(8*b+7 downto 8*b);
-                                    elsif idx = IDX_GEN_FTW or idx = IDX_GEN_FTW+1 then
-                                        scope_cfg(4 + idx - IDX_GEN_FTW)(8*b+7 downto 8*b) <= s_axi_i.w.data(8*b+7 downto 8*b);
-                                    elsif idx >= IDX_TEXT then
-                                        text(idx - IDX_TEXT)(8*b+7 downto 8*b) <= s_axi_i.w.data(8*b+7 downto 8*b);
-                                    end if;
-                                end if;
-                            end loop;
                             wr_addr <= next_addr(wr_addr, wr_size, wr_burst);
                             if wr_beats = 1 or s_axi_i.w.last = '1' then
                                 wready_r <= '0';

@@ -34,8 +34,9 @@
  *   load <dir>                    -> same as activate
  *   pl                            -> ok {"loaded":true,"version":...,"build_id":...}
  *   eth                           -> ok {"present":true,"frames_rx":...}  the PL Ethernet MAC
- *        (hVHDL_gigabit_ethernet, doc/hvhdl_ethernet.md): counters, settings, PHY link;
- *        {"present":false} when the loaded design doesn't have it
+ *        (hVHDL_gigabit_ethernet, doc/hvhdl_ethernet.md): counters, settings, its IP and
+ *        UDP echo port, ARP/ICMP/UDP replies, PHY link; {"present":false} when the loaded
+ *        design doesn't have it. Its IP: write 0x4208 (fpgactl write 0x4208 0xC0A8140A)
  *   oled <row> <text>             -> ok                (OLED row 0..7, 16 chars;
  *                                     the rest of the line, spaces kept)
  *   oled clear                    -> ok
@@ -1229,6 +1230,11 @@ static int xadc_find(void)
 #define ETH_MDIO_STATUS     0x114
 #define ETH_ECHOED          0x200
 #define ETH_IGNORED         0x204
+#define ETH_IP_ADDR         0x208       /* RW, eth_mac's responder (ARP / ICMP / UDP echo) */
+#define ETH_UDP_PORT        0x20C       /* RW */
+#define ETH_ARP_REPLIES     0x210
+#define ETH_ICMP_REPLIES    0x214
+#define ETH_UDP_REPLIES     0x218
 #define ETH_PHY_ADDR        1           /* the PL-side RTL8211E */
 
 static int eth_read(uint32_t off, uint32_t *v, char *err, size_t n)
@@ -1260,8 +1266,9 @@ static int eth_mdio_read(unsigned reg, uint32_t *v, char *err, size_t n)
 
 static void do_eth(int fd)
 {
-    char err[160], out[640];
+    char err[160], out[900];
     uint32_t f, cmd, lo, hi, tx, rx, crc, ine, oute, echoed, ignored, physr = 0;
+    uint32_t ip, port, arp, icmp, udp;
     if (sim) {
         sendf(fd, "ok {\"present\":false}\n");
         return;
@@ -1278,7 +1285,10 @@ static void do_eth(int fd)
         eth_read(ETH_MAC_ADDR_HI, &hi, err, sizeof err) || eth_read(ETH_FRAMES_TX, &tx, err, sizeof err) ||
         eth_read(ETH_FRAMES_RX, &rx, err, sizeof err) || eth_read(ETH_CRC_ERRORS, &crc, err, sizeof err) ||
         eth_read(ETH_IN_ERRORS, &ine, err, sizeof err) || eth_read(ETH_OUT_ERRORS, &oute, err, sizeof err) ||
-        eth_read(ETH_ECHOED, &echoed, err, sizeof err) || eth_read(ETH_IGNORED, &ignored, err, sizeof err)) {
+        eth_read(ETH_ECHOED, &echoed, err, sizeof err) || eth_read(ETH_IGNORED, &ignored, err, sizeof err) ||
+        eth_read(ETH_IP_ADDR, &ip, err, sizeof err) || eth_read(ETH_UDP_PORT, &port, err, sizeof err) ||
+        eth_read(ETH_ARP_REPLIES, &arp, err, sizeof err) || eth_read(ETH_ICMP_REPLIES, &icmp, err, sizeof err) ||
+        eth_read(ETH_UDP_REPLIES, &udp, err, sizeof err)) {
         sendf(fd, "err %s\n", err);
         return;
     }
@@ -1289,10 +1299,13 @@ static void do_eth(int fd)
              "ok {\"present\":true,\"mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"rx_enabled\":%s,\"tx_enabled\":%s,"
              "\"promiscuous\":%s,\"frames_rx\":%" PRIu32 ",\"frames_tx\":%" PRIu32 ",\"crc_errors\":%" PRIu32 ","
              "\"in_errors\":%" PRIu32 ",\"out_errors\":%" PRIu32 ",\"echoed\":%" PRIu32 ",\"ignored\":%" PRIu32 ","
+             "\"ip\":\"%u.%u.%u.%u\",\"udp_port\":%" PRIu32 ",\"arp_replies\":%" PRIu32 ","
+             "\"icmp_replies\":%" PRIu32 ",\"udp_replies\":%" PRIu32 ","
              "\"link\":%s,\"speed\":%d,\"full_duplex\":%s}\n",
              lo & 0xff, (lo >> 8) & 0xff, (lo >> 16) & 0xff, lo >> 24, hi & 0xff, (hi >> 8) & 0xff,
              cmd & 2 ? "true" : "false", cmd & 1 ? "true" : "false", cmd & 16 ? "true" : "false",
              rx, tx, crc, ine, oute, echoed, ignored,
+             ip >> 24, (ip >> 16) & 0xff, (ip >> 8) & 0xff, ip & 0xff, port & 0xffff, arp, icmp, udp,
              !phy_ok ? "null" : (physr & (1u << 10)) ? "true" : "false",
              phy_ok ? speeds[(physr >> 14) & 3] : 0,
              !phy_ok ? "null" : (physr & (1u << 13)) ? "true" : "false");

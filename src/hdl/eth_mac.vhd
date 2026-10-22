@@ -4,20 +4,38 @@
 -- A MAC in the PL: hVHDL_gigabit_ethernet's ethernet_mac (submodule
 -- src/hVHDL_gigabit_ethernet, compiled into library hvhdl_ethernet) on the
 -- PL-side RTL8211E, through the Xilinx RGMII I/O cells (rgmii_rx_xilinx /
--- rgmii_tx_xilinx). Gigabit only. doc/hvhdl_ethernet.md, phase 1.
+-- rgmii_tx_xilinx). Gigabit only. doc/hvhdl_ethernet.md.
 --
--- For now an echo test: ethernet_mac passes on frames for MAC_ADDR or
--- broadcast with a good CRC and length; those with EtherType ETHERTYPE go back
--- to their sender (destination = the old source, source = MAC_ADDR, payload as
--- received). Others are ignored.
+-- On it, hVHDL_gigabit_ethernet's network_responder gives the FPGA an address
+-- on the network: it answers ARP and ping for our IP, echoes UDP to our port and
+-- sends frames with EtherType ETHERTYPE back (the phase 1 test) - between the
+-- MAC's receive and transmit streams, with no Linux in the path.
 --
---   receive  ethernet_mac m_t* (rx_clk) -> frame buffer, addresses swapped
---   transmit frame buffer -> s_t* (tx_clk), gapless as ethernet_mac_tx needs
---   the MAC's registers (APB) are set once after reset (address, address mask,
---   RX/TX enable), then the PS reaches them through bus_* (axi_regs' ETH window,
---   handshake with toggles):
+-- And a UDP application on its user port (UDP_USER_PORT, 5000), commands in a
+-- datagram's first bytes:
+--   0x01 count(4) size(2)   stream: count datagrams of size payload bytes (18..1472)
+--                           back to the sender, back to back - a 32-bit sequence
+--                           number, then byte i = (sequence + i) mod 256; the time
+--                           on the wire is kept in clocks (0x220) for the rate
+--   0x02 addr(2)            read an axi_regs register (0x00..0xFF): reply
+--                           02 00 addr(2) value(4)
+--   0x03 addr(2) value(4)   write one: reply 03 00 addr(2) value(4)
+--   0x04                    the oscilloscope's capture: 32 datagrams of 1028 bytes,
+--                           offset(2) 4096(2) then 128 samples of ch0..ch3 (int16,
+--                           little-endian) from the trigger's pre-history on; if no
+--                           capture is done, the reply 04 FF 00 00 00000000
+-- numbers big-endian unless said; every reply goes to the command's sender.
+-- The datagrams go out through the library's udp_sender, sharing the MAC's
+-- transmit stream with the responder's replies through its frame_mux.
+--
+--   registers: ethernet_mac's (APB) are set after reset (address, mask, RX/TX
+--   on); the PS reaches them and ours through bus_* (axi_regs' ETH window):
 --     0x000..0x1FF  ethernet_mac's APB registers (Efinix TSEMAC offsets)
---     0x200         frames echoed            0x204  frames ignored (other EtherType)
+--     0x200  raw frames echoed     0x204  frames ignored     (RO)
+--     0x208  our IPv4 address      0x20C  UDP echo port       (RW)
+--     0x210  ARP replies    0x214  ICMP echo replies    0x218  UDP replies (RO)
+--     0x21C  UDP user port (RW)   0x220  last stream's clocks, 8 ns   0x224  its datagrams
+--     0x228  datagrams to the user port
 --   MDIO: the MAC's, on the PHY's pins (the PHY keeps its power-on settings)
 -------------------------------------------------------------------------------
 
@@ -34,6 +52,9 @@ use hvhdl_ethernet.ethernet_pkg.all;
 entity eth_mac is
     generic (
         MAC_ADDR  : std_logic_vector(47 downto 0) := x"025A4D000010";   -- first byte on the wire in 47:40
+        IP_ADDR   : std_logic_vector(31 downto 0) := x"C0A8140A";       -- 192.168.20.10 after reset
+        UDP_PORT  : std_logic_vector(15 downto 0) := x"0007";           -- the echo port after reset
+        UDP_USER_PORT : std_logic_vector(15 downto 0) := x"1388";       -- 5000: the application
         ETHERTYPE : std_logic_vector(15 downto 0) := x"88B5"            -- IEEE local experimental
     );
     port (
@@ -54,6 +75,19 @@ entity eth_mac is
         bus_wdata    : in    std_logic_vector(31 downto 0);
         bus_rdata    : out   std_logic_vector(31 downto 0);
         bus_ack      : out   std_logic;
+        -- register access for the UDP commands (axi_regs udp_*), handshake with toggles
+        reg_req      : out   std_logic;
+        reg_write    : out   std_logic;
+        reg_addr     : out   std_logic_vector(15 downto 0);
+        reg_wdata    : out   std_logic_vector(31 downto 0);
+        reg_rdata    : in    std_logic_vector(31 downto 0);
+        reg_ack      : in    std_logic;
+        -- the oscilloscope's capture: a second read port in our clock, its state from axi_regs' clock
+        scope_clk    : out   std_logic;
+        scope_addr   : out   unsigned(11 downto 0);
+        scope_data   : in    std_logic_vector(63 downto 0);   -- ch3:ch2:ch1:ch0, a clock after scope_addr
+        scope_done   : in    std_logic;
+        scope_start  : in    unsigned(11 downto 0);           -- RAM index of the capture's first sample
         -- counters, tx_clk domain (also at 0x200 / 0x204)
         echoed       : out   unsigned(31 downto 0);
         ignored      : out   unsigned(31 downto 0)
@@ -61,8 +95,6 @@ entity eth_mac is
 end entity eth_mac;
 
 architecture rtl of eth_mac is
-
-    constant BUF_BYTES : natural := 2048;                   -- a frame without FCS: 1514 (1518 tagged)
 
     attribute ASYNC_REG : string;
 
@@ -92,11 +124,60 @@ architecture rtl of eth_mac is
         (16#008#, x"00000003"));                            -- COMMAND_CONFIG: TX_ENA, RX_ENA
     signal setup_idx : natural range 0 to SETUP'length := 0;
 
-    -- the PS's bus, in tx_clk
+    -- the PS's bus and our registers, in tx_clk
     signal bus_req_meta, bus_req_sync, bus_req_seen : std_logic := '0';
     signal bus_ack_r   : std_logic := '0';
     signal bus_rdata_r : std_logic_vector(31 downto 0) := (others => '0');
     attribute ASYNC_REG of bus_req_meta, bus_req_sync : signal is "TRUE";
+    signal my_ip       : std_logic_vector(31 downto 0) := IP_ADDR;
+    signal udp_port_r  : std_logic_vector(15 downto 0) := UDP_PORT;
+    signal user_port_r : std_logic_vector(15 downto 0) := UDP_USER_PORT;
+    signal n_arp, n_icmp, n_udp, n_echoed, n_ignored, n_user : unsigned(31 downto 0) := (others => '0');
+    signal arp_replied, icmp_replied, udp_replied, raw_echoed, user_received, frame_ignored : boolean;
+
+    -- the responder's replies and the application's datagrams, onto the MAC's transmit stream
+    signal r_tvalid, r_tready, r_tlast : std_logic;
+    signal r_tdata : std_logic_vector(7 downto 0);
+    signal d_tvalid, d_tready, d_tlast : std_logic;
+    signal d_tdata : std_logic_vector(7 downto 0);
+
+    -- datagrams to the user port (tx_clk)
+    signal user_tvalid, user_tlast : std_logic;
+    signal user_tdata : std_logic_vector(7 downto 0);
+    signal user_length : natural range 0 to 2047;
+    signal user_source_address : std_logic_vector(47 downto 0);
+    signal user_source_ip : std_logic_vector(31 downto 0);
+    signal user_source_port : std_logic_vector(15 downto 0);
+    signal cmd_index : natural range 0 to 7 := 0;
+    type cmd_array is array (0 to 6) of std_logic_vector(7 downto 0);
+    signal cmd : cmd_array := (others => (others => '0'));
+
+    -- the application's jobs and their payloads into udp_sender
+    type job_t is (no_job, register_access, reply, stream, scope);
+    signal job         : job_t := no_job;
+    signal dst_address : std_logic_vector(47 downto 0) := (others => '0');
+    signal dst_ip      : std_logic_vector(31 downto 0) := (others => '0');
+    signal dst_port    : std_logic_vector(15 downto 0) := (others => '0');
+    signal size        : natural range 1 to 1472 := 18;    -- this datagram's payload
+    signal byte_index  : natural range 0 to 1471 := 0;
+    signal datagrams   : unsigned(31 downto 0) := (others => '0');   -- still to send
+    signal stream_seq  : unsigned(31 downto 0) := (others => '0');
+    signal stream_clocks, stream_sent : unsigned(31 downto 0) := (others => '0');
+    signal reply_bytes : cmd_array := (others => (others => '0'));
+    signal reply_last  : std_logic_vector(7 downto 0) := (others => '0');   -- the 8th byte
+    signal reg_req_r, reg_write_r : std_logic := '0';
+    signal reg_addr_r  : std_logic_vector(15 downto 0) := (others => '0');
+    signal reg_wdata_r : std_logic_vector(31 downto 0) := (others => '0');
+    signal reg_ack_meta, reg_ack_sync, reg_ack_seen : std_logic := '0';
+    attribute ASYNC_REG of reg_ack_meta, reg_ack_sync : signal is "TRUE";
+    signal scope_state : std_logic_vector(12 downto 0);           -- done & start, in tx_clk
+    signal scope_first : unsigned(11 downto 0) := (others => '0');
+    signal scope_n     : natural range 0 to 31 := 0;              -- datagram of the capture
+    signal sample_addr : unsigned(11 downto 0) := (others => '0');
+    signal sample_word : std_logic_vector(63 downto 0) := (others => '0');
+    signal p_tvalid, p_tready, p_tlast : std_logic := '0';
+    signal p_tdata : std_logic_vector(7 downto 0);
+    signal datagram_sent : boolean;
 
     -- MAC streams and pins
     signal s_tvalid, s_tready, s_tlast : std_logic := '0';
@@ -106,42 +187,16 @@ architecture rtl of eth_mac is
     signal rgmii_rx_in, rgmii_tx_out, tx_clock_out : rgmii_ddio_record;
     signal mdio_out, mdio_oe, mdio_in, mdio_t : std_logic;
 
-    -- frame buffer: written in rx_clk, read in tx_clk (one block RAM)
-    type buf_t is array (0 to BUF_BYTES - 1) of std_logic_vector(7 downto 0);
-    signal buf : buf_t;
-    attribute ram_style : string;
-    attribute ram_style of buf : signal is "block";
-    signal buf_we    : std_logic := '0';
-    signal buf_waddr : natural range 0 to BUF_BYTES - 1 := 0;
-    signal buf_wdata : std_logic_vector(7 downto 0) := (others => '0');
-    signal buf_raddr : natural range 0 to BUF_BYTES - 1;
-
-    -- receive side (rx_clk)
-    type rx_state_t is (rx_recv, rx_wait);
-    signal rx_state   : rx_state_t := rx_recv;
-    signal widx       : natural range 0 to BUF_BYTES := 0;
-    signal etype      : std_logic_vector(15 downto 0) := (others => '0');
-    signal frame_len  : natural range 0 to BUF_BYTES := 0;    -- held for the transmit side
-    signal req_tg     : std_logic := '0';
-    signal done_meta, done_sync, done_seen : std_logic := '0';
-    signal ignore_pulse, ignore_tx : boolean := false;
-    signal n_ignored  : unsigned(31 downto 0) := (others => '0');
-
-    -- transmit side (tx_clk)
-    type tx_state_t is (tx_idle, tx_send, tx_done);
-    signal tx_state   : tx_state_t := tx_idle;
-    signal req_meta, req_sync, req_seen : std_logic := '0';
-    signal done_tg    : std_logic := '0';
-    signal len_m1     : natural range 0 to BUF_BYTES := 0;   -- index of the last byte
-    signal ra         : natural range 0 to BUF_BYTES - 1 := 0;  -- byte shown on s_tdata
-    signal q          : std_logic_vector(7 downto 0) := (others => '0');
-    signal n_echoed   : unsigned(31 downto 0) := (others => '0');
-
-    attribute ASYNC_REG of done_meta, done_sync, req_meta, req_sync : signal is "TRUE";
-
-    function mac_byte(i : natural) return std_logic_vector is
+    -- an address with its first byte (on the wire) in bits 7:0, as hVHDL_gigabit_ethernet takes it
+    function byte_0_low(v : std_logic_vector) return std_logic_vector is
+        constant n : natural := v'length / 8;
+        variable w : std_logic_vector(v'length - 1 downto 0) := v;
+        variable r : std_logic_vector(v'length - 1 downto 0);
     begin
-        return MAC_ADDR(47 - 8 * i downto 40 - 8 * i);
+        for i in 0 to n - 1 loop
+            r(8 * i + 7 downto 8 * i) := w(8 * (n - i) - 1 downto 8 * (n - i - 1));
+        end loop;
+        return r;
     end function;
 
 begin
@@ -262,10 +317,27 @@ begin
                     pwdata <= bus_wdata;
                     pwrite <= bus_write;
                     psel   <= '1';
-                else                                    -- eth_mac's own, read only
+                else                                    -- ours
+                    if bus_write = '1' then
+                        case a is
+                            when 16#208# => my_ip      <= bus_wdata;
+                            when 16#20C# => udp_port_r <= bus_wdata(15 downto 0);
+                            when 16#21C# => user_port_r <= bus_wdata(15 downto 0);
+                            when others  => null;
+                        end case;
+                    end if;
                     case a is
                         when 16#200# => bus_rdata_r <= std_logic_vector(n_echoed);
                         when 16#204# => bus_rdata_r <= std_logic_vector(n_ignored);
+                        when 16#208# => bus_rdata_r <= my_ip;
+                        when 16#20C# => bus_rdata_r <= x"0000" & udp_port_r;
+                        when 16#210# => bus_rdata_r <= std_logic_vector(n_arp);
+                        when 16#214# => bus_rdata_r <= std_logic_vector(n_icmp);
+                        when 16#218# => bus_rdata_r <= std_logic_vector(n_udp);
+                        when 16#21C# => bus_rdata_r <= x"0000" & user_port_r;
+                        when 16#220# => bus_rdata_r <= std_logic_vector(stream_clocks);
+                        when 16#224# => bus_rdata_r <= std_logic_vector(stream_sent);
+                        when 16#228# => bus_rdata_r <= std_logic_vector(n_user);
                         when others  => bus_rdata_r <= (others => '0');
                     end case;
                     bus_ack_r <= not bus_ack_r;
@@ -275,130 +347,277 @@ begin
     end process;
 
     ---------------------------------------------------------------------------
-    -- echo, receive side: frames into the buffer with the addresses swapped:
-    -- bytes 6..11 (the sender) go to 0..5, bytes 0..5 are dropped (6..11 are
-    -- filled with MAC_ADDR when sent), the rest stays where it is
+    -- the responder (ARP, ping, UDP echo, raw echo) between the MAC's streams
     ---------------------------------------------------------------------------
-    m_tready <= '1' when rx_state = rx_recv else '0';
+    u_responder : entity hvhdl_ethernet.network_responder
+        generic map (g_raw_ethertype => ETHERTYPE)
+        port map (
+            rx_clock      => rx_clk,
+            s_tvalid      => m_tvalid,
+            s_tready      => m_tready,
+            s_tdata       => m_tdata,
+            s_tlast       => m_tlast,
+            clock         => tx_clk,
+            m_tvalid      => r_tvalid,
+            m_tready      => r_tready,
+            m_tdata       => r_tdata,
+            m_tlast       => r_tlast,
+            own_address   => byte_0_low(MAC_ADDR),
+            own_ip        => byte_0_low(my_ip),
+            udp_echo_port => udp_port_r,
+            udp_user_port => user_port_r,
+            user_tvalid   => user_tvalid,
+            user_tready   => '1',
+            user_tdata    => user_tdata,
+            user_tlast    => user_tlast,
+            user_length   => user_length,
+            user_source_address => user_source_address,
+            user_source_ip      => user_source_ip,
+            user_source_port    => user_source_port,
+            arp_replied   => arp_replied,
+            icmp_replied  => icmp_replied,
+            udp_replied   => udp_replied,
+            raw_echoed    => raw_echoed,
+            user_received => user_received,
+            ignored       => frame_ignored
+        );
 
-    echo_rx : process (rx_clk)
+    u_sender : entity hvhdl_ethernet.udp_sender
+        port map (
+            clock               => tx_clk,
+            source_address      => byte_0_low(MAC_ADDR),
+            source_ip           => byte_0_low(my_ip),
+            source_port         => user_port_r,
+            destination_address => dst_address,
+            destination_ip      => dst_ip,
+            destination_port    => dst_port,
+            payload_length      => size,
+            s_tvalid            => p_tvalid,
+            s_tready            => p_tready,
+            s_tdata             => p_tdata,
+            s_tlast             => p_tlast,
+            m_tvalid            => d_tvalid,
+            m_tready            => d_tready,
+            m_tdata             => d_tdata,
+            m_tlast             => d_tlast,
+            sent                => datagram_sent
+        );
+
+    -- the responder's replies first, then the application's datagrams
+    u_tx_mux : entity hvhdl_ethernet.frame_mux
+        port map (
+            clock    => tx_clk,
+            a_tvalid => r_tvalid,
+            a_tready => r_tready,
+            a_tdata  => r_tdata,
+            a_tlast  => r_tlast,
+            b_tvalid => d_tvalid,
+            b_tready => d_tready,
+            b_tdata  => d_tdata,
+            b_tlast  => d_tlast,
+            m_tvalid => s_tvalid,
+            m_tready => s_tready,
+            m_tdata  => s_tdata,
+            m_tlast  => s_tlast
+        );
+
+    ---------------------------------------------------------------------------
+    -- the application: commands from datagrams to the user port, one job at a time
+    ---------------------------------------------------------------------------
+    reg_req   <= reg_req_r;
+    reg_write <= reg_write_r;
+    reg_addr  <= reg_addr_r;
+    reg_wdata <= reg_wdata_r;
+    scope_clk <= tx_clk;
+    scope_addr <= sample_addr;
+
+    u_scope_state_cdc : entity hvhdl_ethernet.cdc_snapshot
+        generic map (g_width => 13)
+        port map (source_clock => clk, source_data => scope_done & std_logic_vector(scope_start),
+                  destination_clock => tx_clk, destination_data => scope_state);
+
+    application : process (tx_clk)
+        variable c    : cmd_array;
+        variable n    : natural range 0 to 65535;
+        variable last : boolean;
     begin
-        if rising_edge(rx_clk) then
-            done_meta    <= done_tg;
-            done_sync    <= done_meta;
-            buf_we       <= '0';
-            ignore_pulse <= false;
+        if rising_edge(tx_clk) then
+            reg_ack_meta <= reg_ack;
+            reg_ack_sync <= reg_ack_meta;
 
-            case rx_state is
-                when rx_recv =>
-                    if m_tvalid = '1' then
-                        -- the write lands a clock later (buf_write)
-                        buf_wdata <= m_tdata;
-                        if widx >= 6 and widx < 12 then
-                            buf_we    <= '1';
-                            buf_waddr <= widx - 6;
-                        elsif widx >= 12 and widx < BUF_BYTES then
-                            buf_we    <= '1';
-                            buf_waddr <= widx;
-                        end if;
-                        if widx = 12 then
-                            etype(15 downto 8) <= m_tdata;
-                        elsif widx = 13 then
-                            etype(7 downto 0) <= m_tdata;
-                        end if;
-
-                        if m_tlast = '1' then
-                            widx <= 0;
-                            -- ethernet_mac passes 60..1518 bytes: the EtherType is in
-                            if etype = ETHERTYPE and widx < BUF_BYTES then
-                                frame_len <= widx + 1;
-                                req_tg    <= not req_tg;
-                                rx_state  <= rx_wait;
-                            else
-                                ignore_pulse <= true;
+            if user_tvalid = '1' then
+                if cmd_index < 7 then
+                    cmd(cmd_index) <= user_tdata;
+                    cmd_index <= cmd_index + 1;
+                end if;
+                if user_tlast = '1' then
+                    cmd_index <= 0;
+                    c := cmd;                               -- with this, the last byte
+                    if cmd_index < 7 then
+                        c(cmd_index) := user_tdata;
+                    end if;
+                    if job = no_job then
+                        dst_address <= user_source_address;
+                        dst_ip      <= user_source_ip;
+                        dst_port    <= user_source_port;
+                        reply_bytes <= (c(0), x"00", c(1), c(2), x"00", x"00", x"00");
+                        reply_last  <= x"00";
+                        byte_index  <= 0;
+                        if c(0) = x"01" and user_length = 7 then             -- stream
+                            n := to_integer(unsigned(std_logic_vector'(c(5) & c(6))));
+                            if n < 18 then n := 18; elsif n > 1472 then n := 1472; end if;
+                            datagrams     <= unsigned(std_logic_vector'(c(1) & c(2) & c(3) & c(4)));
+                            size          <= n;
+                            stream_seq    <= (others => '0');
+                            stream_clocks <= (others => '0');
+                            stream_sent   <= (others => '0');
+                            if unsigned(std_logic_vector'(c(1) & c(2) & c(3) & c(4))) /= 0 then
+                                job <= stream;
                             end if;
-                        elsif widx < BUF_BYTES then
-                            widx <= widx + 1;
+                        elsif (c(0) = x"02" and user_length = 3) or (c(0) = x"03" and user_length = 7) then
+                            reg_addr_r  <= c(1) & c(2);
+                            reg_write_r <= '1' when c(0) = x"03" else '0';
+                            reg_wdata_r <= c(3) & c(4) & c(5) & c(6);
+                            reg_req_r   <= not reg_req_r;
+                            job         <= register_access;
+                        elsif c(0) = x"04" and user_length = 1 then           -- the capture
+                            if scope_state(12) = '1' then
+                                scope_first <= unsigned(scope_state(11 downto 0));
+                                sample_addr <= unsigned(scope_state(11 downto 0));
+                                scope_n     <= 0;
+                                datagrams   <= to_unsigned(32, 32);
+                                size        <= 1028;
+                                job         <= scope;
+                            else
+                                reply_bytes <= (x"04", x"FF", x"00", x"00", x"00", x"00", x"00");   -- no capture
+                                size <= 8;
+                                job  <= reply;
+                            end if;
+                        end if;
+                    end if;
+                end if;
+            end if;
+
+            CASE job is
+                WHEN register_access =>
+                    if reg_ack_sync /= reg_ack_seen then
+                        reg_ack_seen   <= reg_ack_sync;
+                        if reg_write_r = '1' then           -- the value written
+                            reply_bytes(4) <= reg_wdata_r(31 downto 24);
+                            reply_bytes(5) <= reg_wdata_r(23 downto 16);
+                            reply_bytes(6) <= reg_wdata_r(15 downto 8);
+                            reply_last     <= reg_wdata_r(7 downto 0);
+                        else
+                            reply_bytes(4) <= reg_rdata(31 downto 24);
+                            reply_bytes(5) <= reg_rdata(23 downto 16);
+                            reply_bytes(6) <= reg_rdata(15 downto 8);
+                            reply_last     <= reg_rdata(7 downto 0);
+                        end if;
+                        size           <= 8;
+                        job            <= reply;
+                    end if;
+
+                WHEN reply =>
+                    if p_tvalid = '1' and p_tready = '1' then
+                        if byte_index = size - 1 then
+                            job <= no_job;
+                        else
+                            byte_index <= byte_index + 1;
                         end if;
                     end if;
 
-                when rx_wait =>                             -- the MAC's FIFO holds new frames meanwhile
-                    -- (the last byte's write lands in the first clock here, long before
-                    -- the transmit side sees the request)
-                    if done_sync /= done_seen then
-                        done_seen <= done_sync;
-                        rx_state  <= rx_recv;
+                WHEN stream =>
+                    stream_clocks <= stream_clocks + 1;
+                    if p_tvalid = '1' and p_tready = '1' then
+                        if byte_index = size - 1 then
+                            byte_index  <= 0;
+                            stream_seq  <= stream_seq + 1;
+                            stream_sent <= stream_sent + 1;
+                            if datagrams = 1 then
+                                job <= no_job;
+                            end if;
+                            datagrams <= datagrams - 1;
+                        else
+                            byte_index <= byte_index + 1;
+                        end if;
                     end if;
-            end case;
+
+                WHEN scope =>
+                    -- 4 header bytes, then 8 bytes a sample: the next sample is read while one
+                    -- goes out (scope_data comes a clock after sample_addr)
+                    if p_tvalid = '1' and p_tready = '1' then
+                        -- (not at a datagram's last byte: the next one fetches at its byte 3)
+                        if byte_index = 3 or (byte_index >= 4 and (byte_index - 4) mod 8 = 7
+                                              and byte_index /= size - 1) then
+                            sample_word <= scope_data;              -- the sample for the next 8 bytes
+                            sample_addr <= sample_addr + 1;
+                        end if;
+                        if byte_index = size - 1 then
+                            byte_index <= 0;
+                            scope_n    <= scope_n + 1 when scope_n < 31 else 0;
+                            if datagrams = 1 then
+                                job <= no_job;
+                            end if;
+                            datagrams <= datagrams - 1;
+                        else
+                            byte_index <= byte_index + 1;
+                        end if;
+                    end if;
+
+                WHEN no_job =>
+                    null;
+            end CASE;
         end if;
     end process;
 
-    buf_write : process (rx_clk)
+    p_tvalid <= '1' when job = reply or job = stream or job = scope else '0';
+    p_tlast  <= '1' when p_tvalid = '1' and byte_index = size - 1 else '0';
+
+    payload_byte : process (all)
+        variable k : natural range 0 to 7;
+        variable offset : unsigned(15 downto 0);
     begin
-        if rising_edge(rx_clk) then
-            if buf_we = '1' then
-                buf(buf_waddr) <= buf_wdata;
-            end if;
-        end if;
+        p_tdata <= (others => '0');
+        CASE job is
+            WHEN reply =>
+                if byte_index < 7 then
+                    p_tdata <= reply_bytes(byte_index);
+                else
+                    p_tdata <= reply_last;
+                end if;
+            WHEN stream =>
+                case byte_index is
+                    when 0      => p_tdata <= std_logic_vector(stream_seq(31 downto 24));
+                    when 1      => p_tdata <= std_logic_vector(stream_seq(23 downto 16));
+                    when 2      => p_tdata <= std_logic_vector(stream_seq(15 downto 8));
+                    when 3      => p_tdata <= std_logic_vector(stream_seq(7 downto 0));
+                    when others => p_tdata <= std_logic_vector(stream_seq(7 downto 0) + to_unsigned(byte_index mod 256, 8));
+                end case;
+            WHEN scope =>
+                offset := to_unsigned(scope_n * 128, 16);
+                case byte_index is
+                    when 0      => p_tdata <= std_logic_vector(offset(15 downto 8));
+                    when 1      => p_tdata <= std_logic_vector(offset(7 downto 0));
+                    when 2      => p_tdata <= x"10";        -- 4096 samples
+                    when 3      => p_tdata <= x"00";
+                    when others =>
+                        k := (byte_index - 4) mod 8;        -- byte k of ch3:ch2:ch1:ch0, little-endian
+                        p_tdata <= sample_word(8 * k + 7 downto 8 * k);
+                end case;
+            WHEN others =>
+                null;
+        end CASE;
     end process;
 
-    buf_read : process (tx_clk)
+    counters : process (tx_clk)
     begin
         if rising_edge(tx_clk) then
-            q <= buf(buf_raddr);
-        end if;
-    end process;
-
-    ---------------------------------------------------------------------------
-    -- echo, transmit side: the buffer onto s_t*, one byte a clock without gaps.
-    -- q always holds buf(ra): the next address (buf_raddr) is chosen before the clock.
-    ---------------------------------------------------------------------------
-    s_tvalid <= '1' when tx_state = tx_send else '0';
-    s_tdata  <= mac_byte(ra - 6) when ra >= 6 and ra < 12 else q;
-    s_tlast  <= '1' when tx_state = tx_send and ra = len_m1 else '0';
-
-    -- the byte to show next clock: 0 while idle, the next one when this one is taken
-    buf_raddr <= 0      when tx_state = tx_idle else
-                 ra + 1 when tx_state = tx_send and s_tready = '1' and ra /= len_m1 else
-                 ra;
-
-    echo_tx : process (tx_clk)
-    begin
-        if rising_edge(tx_clk) then
-            req_meta <= req_tg;
-            req_sync <= req_meta;
-            ra       <= buf_raddr;
-
-            case tx_state is
-                when tx_idle =>
-                    if req_sync /= req_seen then
-                        req_seen <= req_sync;
-                        len_m1   <= frame_len - 1;          -- stable since before the toggle
-                        tx_state <= tx_send;
-                    end if;
-                when tx_send =>
-                    if s_tready = '1' and ra = len_m1 then
-                        n_echoed <= n_echoed + 1;
-                        tx_state <= tx_done;
-                    end if;
-                when tx_done =>
-                    done_tg  <= not done_tg;
-                    tx_state <= tx_idle;
-            end case;
-        end if;
-    end process;
-
-    -- the ignored frames, counted in tx_clk (at most one a frame: far enough apart)
-    u_ignore_cdc : entity hvhdl_ethernet.cdc_pulse
-        port map (source_clock => rx_clk, source_pulse => ignore_pulse,
-                  destination_clock => tx_clk, destination_pulse => ignore_tx);
-
-    count_ignored : process (tx_clk)
-    begin
-        if rising_edge(tx_clk) then
-            if ignore_tx then
-                n_ignored <= n_ignored + 1;
-            end if;
+            if arp_replied   then n_arp     <= n_arp + 1;     end if;
+            if icmp_replied  then n_icmp    <= n_icmp + 1;    end if;
+            if udp_replied   then n_udp     <= n_udp + 1;     end if;
+            if raw_echoed    then n_echoed  <= n_echoed + 1;  end if;
+            if frame_ignored then n_ignored <= n_ignored + 1; end if;
+            if user_received then n_user    <= n_user + 1;    end if;
         end if;
     end process;
 

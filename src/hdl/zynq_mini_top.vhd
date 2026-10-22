@@ -142,6 +142,16 @@ architecture rtl of zynq_mini_top is
     signal eth_bus_wdata : std_logic_vector(31 downto 0);
     signal eth_bus_rdata : std_logic_vector(31 downto 0) := (others => '0');
     signal eth_bus_ack   : std_logic := '0';
+    -- the PL MAC's UDP commands: register access (axi_regs udp_*) and the scope's capture
+    signal eth_reg_req, eth_reg_write : std_logic := '0';
+    signal eth_reg_addr  : std_logic_vector(15 downto 0) := (others => '0');
+    signal eth_reg_wdata : std_logic_vector(31 downto 0) := (others => '0');
+    signal eth_reg_rdata : std_logic_vector(31 downto 0);
+    signal eth_reg_ack   : std_logic;
+    signal eth_scope_clk : std_logic := '0';
+    signal eth_scope_addr  : ptr_t := (others => '0');
+    signal eth_scope_data  : std_logic_vector(63 downto 0);
+    signal eth_scope_start : ptr_t;
 
     -- ===== placeholder PL user logic ====================================
     signal heartbeat  : unsigned(27 downto 0) := (others => '0');
@@ -217,6 +227,12 @@ begin
             ext_wdata_o      => eth_bus_wdata,
             ext_rdata_i      => eth_bus_rdata,
             ext_ack_i        => eth_bus_ack,
+            udp_req_i        => eth_reg_req,
+            udp_write_i      => eth_reg_write,
+            udp_addr_i       => eth_reg_addr,
+            udp_wdata_i      => eth_reg_wdata,
+            udp_rdata_o      => eth_reg_rdata,
+            udp_ack_o        => eth_reg_ack,
             s_axi_aclk    => clk,
             s_axi_aresetn => resetn,
             s_axi_i       => ps_axi_o,
@@ -295,8 +311,13 @@ begin
             ch_i    => scope_in,
             stat_o  => scope_stat,
             rd_addr => scope_rd_addr,
-            rd_data => scope_rd_data
+            rd_data => scope_rd_data,
+            rd2_clk  => eth_scope_clk,
+            rd2_addr => eth_scope_addr,
+            rd2_data => eth_scope_data
         );
+    -- the capture's first sample in the RAM (scope_capture.vhd), for the PL MAC's stream
+    eth_scope_start <= scope_stat.trig_ptr - scope_cfg.pre;
 
     ---------------------------------------------------------------------------
     -- PL Ethernet PHY: the RTL8211E's reset pin is wired to the PL (G17); keep it
@@ -348,6 +369,17 @@ begin
                 bus_wdata    => eth_bus_wdata,
                 bus_rdata    => eth_bus_rdata,
                 bus_ack      => eth_bus_ack,
+                reg_req      => eth_reg_req,
+                reg_write    => eth_reg_write,
+                reg_addr     => eth_reg_addr,
+                reg_wdata    => eth_reg_wdata,
+                reg_rdata    => eth_reg_rdata,
+                reg_ack      => eth_reg_ack,
+                scope_clk    => eth_scope_clk,
+                scope_addr   => eth_scope_addr,
+                scope_data   => eth_scope_data,
+                scope_done   => scope_stat.done,
+                scope_start  => eth_scope_start,
                 echoed       => open,
                 ignored      => open
             );

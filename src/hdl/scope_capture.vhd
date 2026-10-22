@@ -19,6 +19,10 @@
 --
 -- Read port: word index rd_addr = 2*sample + half, half 0 = ch1:ch0, half 1 =
 -- ch3:ch2 (high:low 16 bits). Data is valid one clock after rd_addr.
+--
+-- A second read port in its own clock (rd2_*, the PL Ethernet's scope stream):
+-- a whole sample, ch3:ch2:ch1:ch0, one clock after rd2_addr. It reads a copy of
+-- the RAM written alongside the first (one simple dual port RAM each).
 -------------------------------------------------------------------------------
 
 library ieee;
@@ -35,16 +39,19 @@ entity scope_capture is
         ch_i    : in  sample_array_t;
         stat_o  : out scope_stat_t;
         rd_addr : in  unsigned(SCOPE_DEPTH_LOG2 downto 0);
-        rd_data : out std_logic_vector(31 downto 0)
+        rd_data : out std_logic_vector(31 downto 0);
+        rd2_clk  : in  std_logic := '0';
+        rd2_addr : in  ptr_t := (others => '0');
+        rd2_data : out std_logic_vector(63 downto 0)
     );
 end entity scope_capture;
 
 architecture rtl of scope_capture is
 
     type ram_t is array (0 to SCOPE_DEPTH-1) of std_logic_vector(63 downto 0);
-    signal ram : ram_t;
+    signal ram, ram2 : ram_t;
     attribute ram_style : string;
-    attribute ram_style of ram : signal is "block";
+    attribute ram_style of ram, ram2 : signal is "block";
 
     signal rd_q    : std_logic_vector(63 downto 0);
     signal rd_half : std_logic := '0';
@@ -86,7 +93,7 @@ begin
     end process;
 
     ---------------------------------------------------------------------------
-    -- RAM: one write port (capture), one read port (AXI)
+    -- RAM: one write port (capture), one read port (AXI); its copy for rd2_*
     ---------------------------------------------------------------------------
     process (clk)
     begin
@@ -94,6 +101,8 @@ begin
             if tick = '1' and state /= ST_IDLE then
                 ram(to_integer(wp)) <= std_logic_vector(ch_i(3)) & std_logic_vector(ch_i(2)) &
                                        std_logic_vector(ch_i(1)) & std_logic_vector(ch_i(0));
+                ram2(to_integer(wp)) <= std_logic_vector(ch_i(3)) & std_logic_vector(ch_i(2)) &
+                                        std_logic_vector(ch_i(1)) & std_logic_vector(ch_i(0));
             end if;
             rd_q    <= ram(to_integer(rd_addr(SCOPE_DEPTH_LOG2 downto 1)));
             rd_half <= rd_addr(0);
@@ -101,6 +110,13 @@ begin
     end process;
 
     rd_data <= rd_q(63 downto 32) when rd_half = '1' else rd_q(31 downto 0);
+
+    process (rd2_clk)
+    begin
+        if rising_edge(rd2_clk) then
+            rd2_data <= ram2(to_integer(rd2_addr));
+        end if;
+    end process;
 
     ---------------------------------------------------------------------------
     -- capture state machine

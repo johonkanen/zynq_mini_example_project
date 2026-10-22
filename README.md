@@ -111,7 +111,8 @@ and its QMTech sibling, **including building Linux** — see [`doc/notes.md`](do
 | `doc/network_update.md`       | **plan + design for network updates** of FPGA, Linux and software (RAUC, signed, no JTAG) |
 | `doc/hvhdl_ethernet.md`       | a PL Ethernet MAC from hVHDL_gigabit_ethernet: plan and phase 1 (`PL_ETH=hvhdl ./build.sh`) |
 | `src/hVHDL_gigabit_ethernet/` | git submodule, kept at the tip of its `main`: [hVHDL_gigabit_ethernet](https://github.com/hVHDL/hVHDL_gigabit_ethernet) (`ethernet_mac`: RGMII MAC, VHDL) — clone with `--recurse-submodules`, or `git submodule update --init --recursive` |
-| `src/hdl/eth_mac.vhd`, `rgmii_rx_xilinx.vhd`, `rgmii_tx_xilinx.vhd` | `ethernet_mac` on the PL PHY with 7-series RGMII I/O (echo test); `src/constrs/pl_eth_hvhdl.xdc` its RGMII timing |
+| `src/hdl/eth_mac.vhd`, `rgmii_rx_xilinx.vhd`, `rgmii_tx_xilinx.vhd` | the library's MAC + responder on the PL PHY with 7-series RGMII I/O: the FPGA's own IP (ARP, ping, UDP) and a UDP application (registers, scope capture, line-rate stream); `src/constrs/pl_eth_hvhdl.xdc` its RGMII timing |
+| `tools/pl_udp.py`             | PC side of that UDP application: `read`, `write`, `stream`, `scope` — `doc/hvhdl_ethernet.md` §5b |
 
 `build/` and `output/` are generated and git-ignored. Everything is VHDL-2008.
 

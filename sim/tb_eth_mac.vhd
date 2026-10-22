@@ -27,6 +27,8 @@ architecture sim of tb_eth_mac is
     constant MAC     : std_logic_vector(47 downto 0) := x"025A4D000010";   -- the DUT's
     constant PC_MAC  : std_logic_vector(47 downto 0) := x"001122334455";
     constant OTHER   : std_logic_vector(47 downto 0) := x"025A4D000099";
+    constant IP      : std_logic_vector(31 downto 0) := x"C0A8140A";       -- the DUT's, 192.168.20.10
+    constant PC_IP   : std_logic_vector(31 downto 0) := x"C0A81419";       -- 192.168.20.25
     constant T_PC    : time := 8.004 ns;
 
     type bytes_t is array (natural range <>) of std_logic_vector(7 downto 0);
@@ -64,11 +66,22 @@ architecture sim of tb_eth_mac is
     signal bus_addr  : std_logic_vector(10 downto 0) := (others => '0');
     signal bus_wdata, bus_rdata : std_logic_vector(31 downto 0) := (others => '0');
 
+    -- the register file behind reg_* and the scope RAM behind scope_*
+    signal reg_clk : std_logic := '0';
+    signal reg_req, reg_write, reg_ack : std_logic := '0';
+    signal reg_addr : std_logic_vector(15 downto 0);
+    signal reg_wdata, reg_rdata : std_logic_vector(31 downto 0) := (others => '0');
+    signal scope_clk : std_logic;
+    signal scope_addr : unsigned(11 downto 0);
+    signal scope_data : std_logic_vector(63 downto 0) := (others => '0');
+    signal scope_done : std_logic := '1';
+    constant SCOPE_START : natural := 4000;                -- the capture wraps the RAM's end
+
     -- what the PC received
-    signal rx_bytes  : bytes_t(0 to 8191);
+    signal rx_bytes  : bytes_t(0 to 65535);
     signal rx_count  : natural := 0;
     signal rx_frames : natural := 0;
-    type ends_t is array (0 to 15) of natural;
+    type ends_t is array (0 to 63) of natural;
     signal rx_ends   : ends_t := (others => 0);
 
 begin
@@ -85,8 +98,48 @@ begin
                   rgmii_txc => mac_txc, rgmii_td => mac_txd, rgmii_tx_ctl => mac_tx_ctl,
                   mdc => mac_mdc, mdio => mdio, bus_req => bus_req, bus_write => bus_write,
                   bus_addr => bus_addr, bus_wdata => bus_wdata, bus_rdata => bus_rdata, bus_ack => bus_ack,
+                  reg_req => reg_req, reg_write => reg_write, reg_addr => reg_addr, reg_wdata => reg_wdata,
+                  reg_rdata => reg_rdata, reg_ack => reg_ack, scope_clk => scope_clk, scope_addr => scope_addr,
+                  scope_data => scope_data, scope_done => scope_done,
+                  scope_start => to_unsigned(SCOPE_START, 12),
                   echoed => echoed, ignored => ignored);
     mdio <= 'H';
+
+    -- the register file (as axi_regs' udp_* port, in its own clock)
+    reg_clk <= not reg_clk after 5 ns;
+    registers : process (reg_clk)
+        type regfile_t is array (0 to 255) of std_logic_vector(31 downto 0);
+        variable regfile : regfile_t := (others => (others => '0'));
+        variable meta, sync, seen : std_logic := '0';
+    begin
+        if rising_edge(reg_clk) then
+            if sync /= seen then
+                seen := sync;
+                if reg_write = '1' then
+                    regfile(to_integer(unsigned(reg_addr(7 downto 0)))) := reg_wdata;
+                end if;
+                reg_rdata <= regfile(to_integer(unsigned(reg_addr(7 downto 0))));
+                if reg_addr = x"001C" then
+                    reg_rdata <= x"5A5A1234";
+                end if;
+                reg_ack <= not reg_ack;
+            end if;
+            sync := meta;
+            meta := reg_req;
+        end if;
+    end process;
+
+    -- the scope RAM: channel k of index a holds 4a + k (16 bits), a clock after the address
+    scope_ram : process (scope_clk)
+        variable a : natural;
+    begin
+        if rising_edge(scope_clk) then
+            a := to_integer(scope_addr);
+            for k in 0 to 3 loop
+                scope_data(16 * k + 15 downto 16 * k) <= std_logic_vector(to_unsigned((4 * a + k) mod 65536, 16));
+            end loop;
+        end if;
+    end process;
 
     ---------------------------------------------------------------------------
     -- PHY models
@@ -152,6 +205,148 @@ begin
                 f(i) := std_logic_vector(to_unsigned((i * 7 + seed) mod 256, 8));
             end loop;
             return f;
+        end function;
+
+        -- ones' complement sum of the 16-bit words of f(lo..hi), folded; hi - lo + 1 even
+        function csum16(f : bytes_t; lo, hi : natural) return unsigned is
+            variable acc : unsigned(31 downto 0) := (others => '0');
+        begin
+            for i in 0 to (hi - lo + 1) / 2 - 1 loop
+                acc := acc + unsigned(std_logic_vector'(f(lo + 2 * i) & f(lo + 2 * i + 1)));
+            end loop;
+            acc := resize(acc(15 downto 0), 32) + acc(31 downto 16);
+            acc := resize(acc(15 downto 0), 32) + acc(31 downto 16);
+            return acc(15 downto 0);
+        end function;
+
+        function put(f : bytes_t; at : natural; v : std_logic_vector) return bytes_t is
+            variable r : bytes_t(f'range) := f;
+            constant n : natural := v'length / 8;
+            variable w : std_logic_vector(v'length - 1 downto 0) := v;
+        begin
+            for i in 0 to n - 1 loop
+                r(at + i) := w(8 * (n - i) - 1 downto 8 * (n - i - 1));
+            end loop;
+            return r;
+        end function;
+
+        function get(f : bytes_t; at, n : natural) return std_logic_vector is
+            variable v : std_logic_vector(8 * n - 1 downto 0);
+        begin
+            for i in 0 to n - 1 loop
+                v(8 * (n - i) - 1 downto 8 * (n - i - 1)) := f(at + i);
+            end loop;
+            return v;
+        end function;
+
+        -- an ARP request from the PC for ip
+        function arp_request(ip_wanted : std_logic_vector(31 downto 0)) return bytes_t is
+            variable f : bytes_t(0 to 41) := (others => x"00");
+        begin
+            f := put(f, 0, x"FFFFFFFFFFFF");
+            f := put(f, 6, PC_MAC);
+            f := put(f, 12, x"0806");
+            f := put(f, 14, x"0001080006040001");
+            f := put(f, 22, PC_MAC);
+            f := put(f, 28, PC_IP);
+            f := put(f, 38, ip_wanted);
+            return f;
+        end function;
+
+        -- Ethernet + IPv4 (no options, checksum filled in) + l4 bytes
+        function ip_frame(dst_ip : std_logic_vector(31 downto 0); proto : std_logic_vector(7 downto 0);
+                          l4 : bytes_t) return bytes_t is
+            variable f : bytes_t(0 to 33 + l4'length) := (others => x"00");
+        begin
+            f := put(f, 0, MAC);
+            f := put(f, 6, PC_MAC);
+            f := put(f, 12, x"0800");
+            f := put(f, 14, x"45");
+            f := put(f, 16, std_logic_vector(to_unsigned(20 + l4'length, 16)));
+            f := put(f, 18, x"1234");                      -- identification
+            f := put(f, 20, x"4000");                      -- don't fragment
+            f := put(f, 22, x"40");                        -- TTL 64
+            f(23) := proto;
+            f := put(f, 26, PC_IP);
+            f := put(f, 30, dst_ip);
+            f := put(f, 24, std_logic_vector(not csum16(f, 14, 33)));
+            for i in l4'range loop
+                f(34 + i - l4'low) := l4(i);
+            end loop;
+            return f;
+        end function;
+
+        -- ICMP echo request: id, sequence, n payload bytes, checksum filled in
+        function icmp_echo(n : natural) return bytes_t is
+            variable m : bytes_t(0 to 7 + n) := (others => x"00");
+        begin
+            m := put(m, 0, x"0800");
+            m := put(m, 4, x"BEEF0001");
+            for i in 0 to n - 1 loop
+                m(8 + i) := std_logic_vector(to_unsigned((i * 13 + 5) mod 256, 8));
+            end loop;
+            m := put(m, 2, std_logic_vector(not csum16(m, 0, m'high)));
+            return m;
+        end function;
+
+        -- UDP datagram (checksum with the pseudo header) inside its IP frame; n even
+        function udp_frame(dst_ip : std_logic_vector(31 downto 0); dport : std_logic_vector(15 downto 0);
+                           n : natural) return bytes_t is
+            variable u  : bytes_t(0 to 7 + n) := (others => x"00");
+            variable ph : bytes_t(0 to 11 + 8 + n) := (others => x"00");
+        begin
+            u := put(u, 0, x"D431");                       -- source port 54321
+            u := put(u, 2, dport);
+            u := put(u, 4, std_logic_vector(to_unsigned(8 + n, 16)));
+            for i in 0 to n - 1 loop
+                u(8 + i) := std_logic_vector(to_unsigned((i * 7 + 3) mod 256, 8));
+            end loop;
+            ph := put(ph, 0, PC_IP);
+            ph := put(ph, 4, dst_ip);
+            ph := put(ph, 8, x"0011");
+            ph := put(ph, 10, std_logic_vector(to_unsigned(8 + n, 16)));
+            for i in u'range loop
+                ph(12 + i) := u(i);
+            end loop;
+            u := put(u, 6, std_logic_vector(not csum16(ph, 0, ph'high)));
+            return ip_frame(dst_ip, x"11", u);
+        end function;
+
+        -- a UDP datagram with the given payload (from the PC's port 54321), checksum filled in
+        function udp_payload_frame(dst_ip : std_logic_vector(31 downto 0); dport : std_logic_vector(15 downto 0);
+                                   payload : bytes_t) return bytes_t is
+            variable u  : bytes_t(0 to 7 + payload'length) := (others => x"00");
+            variable ph : bytes_t(0 to 19 + payload'length + payload'length mod 2) := (others => x"00");
+        begin
+            u := put(u, 0, x"D431");
+            u := put(u, 2, dport);
+            u := put(u, 4, std_logic_vector(to_unsigned(u'length, 16)));
+            for i in payload'range loop
+                u(8 + i - payload'low) := payload(i);
+            end loop;
+            ph := put(ph, 0, PC_IP);
+            ph := put(ph, 4, dst_ip);
+            ph := put(ph, 8, x"0011");
+            ph := put(ph, 10, std_logic_vector(to_unsigned(u'length, 16)));
+            for i in u'range loop
+                ph(12 + i) := u(i);
+            end loop;
+            u := put(u, 6, std_logic_vector(not csum16(ph, 0, ph'high)));
+            return ip_frame(dst_ip, x"11", u);
+        end function;
+
+        -- the PC's n-th received frame, as bytes
+        impure function received(n, len : natural) return bytes_t is
+            variable r : bytes_t(0 to len - 1);
+            variable first : natural := 0;
+        begin
+            if n > 0 then
+                first := rx_ends(n - 1);
+            end if;
+            for i in r'range loop
+                r(i) := rx_bytes(first + i);
+            end loop;
+            return r;
         end function;
 
         procedure apb_write(address : natural; data : std_logic_vector(31 downto 0)) is
@@ -222,6 +417,11 @@ begin
         end procedure;
 
         variable r  : std_logic_vector(31 downto 0);
+        variable fa : bytes_t(0 to 41);
+        variable fi : bytes_t(0 to 73);                    -- 14 + 20 + 8 + 32
+        variable fu : bytes_t(0 to 63);                    -- 14 + 20 + 8 + 22
+        variable g  : bytes_t(0 to 73);
+        variable prev_end : natural;
         variable f1 : bytes_t(0 to 59);
         variable f2 : bytes_t(0 to 99);
         variable fl : bytes_t(0 to 1513);
@@ -305,6 +505,167 @@ begin
                 send(frame(MAC, x"88B5", 11, 60));
                 wait for 20 us;
                 check_equal(rx_frames, 1, "no echo with RX off");
+
+            elsif run("ARP request for our IP is answered") then
+                send(arp_request(IP));
+                wait until rx_frames = 1 for 30 us;
+                check_equal(rx_frames, 1, "ARP reply arrived");
+                check_equal(rx_ends(0), 60, "reply padded like the request");
+                fa := received(0, 42);
+                check_equal(get(fa, 0, 6), PC_MAC, "to the PC");
+                check_equal(get(fa, 6, 6), MAC, "from us");
+                check_equal(get(fa, 12, 2), std_logic_vector'(x"0806"), "ARP");
+                check_equal(get(fa, 14, 8), std_logic_vector'(x"0001080006040002"), "ARP reply header");
+                check_equal(get(fa, 22, 6), MAC, "sender MAC = ours");
+                check_equal(get(fa, 28, 4), IP, "sender IP = ours");
+                check_equal(get(fa, 32, 6), PC_MAC, "target MAC = the PC");
+                check_equal(get(fa, 38, 4), PC_IP, "target IP = the PC");
+
+            elsif run("ARP request for another IP is ignored") then
+                send(arp_request(x"C0A81463"));
+                wait for 30 us;
+                check_equal(rx_frames, 0, "no reply");
+
+            elsif run("ping is answered") then
+                fi := ip_frame(IP, x"01", icmp_echo(32));
+                send(fi);
+                wait until rx_frames = 1 for 30 us;
+                check_equal(rx_frames, 1, "echo reply arrived");
+                check_equal(rx_ends(0), fi'length, "same length");
+                g := received(0, fi'length);
+                check_equal(get(g, 0, 6), PC_MAC, "to the PC");
+                check_equal(get(g, 26, 4), IP, "IP source = ours");
+                check_equal(get(g, 30, 4), PC_IP, "IP destination = the PC");
+                check_equal(csum16(g, 14, 33), unsigned'(x"FFFF"), "IP header checksum");
+                check_equal(g(34), std_logic_vector'(x"00"), "ICMP echo reply");
+                check_equal(csum16(g, 34, g'high), unsigned'(x"FFFF"), "ICMP checksum");
+                check_equal(get(g, 38, 4), std_logic_vector'(x"BEEF0001"), "id and sequence kept");
+                for i in 42 to g'high loop
+                    check_equal(g(i), fi(i), "payload byte " & integer'image(i));
+                end loop;
+
+            elsif run("UDP to the echo port is echoed") then
+                fu := udp_frame(IP, x"0007", 22);
+                send(fu);
+                wait until rx_frames = 1 for 30 us;
+                check_equal(rx_frames, 1, "UDP reply arrived");
+                g(0 to 63) := received(0, 64);
+                check_equal(get(g, 26, 4), IP, "IP source = ours");
+                check_equal(get(g, 30, 4), PC_IP, "IP destination = the PC");
+                check_equal(csum16(g(0 to 63), 14, 33), unsigned'(x"FFFF"), "IP header checksum");
+                check_equal(get(g, 34, 2), std_logic_vector'(x"0007"), "source port = 7");
+                check_equal(get(g, 36, 2), std_logic_vector'(x"D431"), "destination port = the PC's");
+                check_equal(get(g, 40, 2), get(fu, 40, 2), "UDP checksum unchanged (still valid)");
+                for i in 42 to 63 loop
+                    check_equal(g(i), fu(i), "payload byte " & integer'image(i));
+                end loop;
+
+            elsif run("UDP to another port is ignored") then
+                send(udp_frame(IP, x"1234", 22));
+                wait for 30 us;
+                check_equal(rx_frames, 0, "no reply");
+
+            elsif run("bad IP header checksum is ignored") then
+                fi := ip_frame(IP, x"01", icmp_echo(32));
+                fi(25) := fi(25) xor x"01";
+                send(fi);
+                wait for 30 us;
+                check_equal(rx_frames, 0, "no reply");
+
+            elsif run("IP address set through the bus") then
+                bus_access(16#208#, '0', x"00000000", r);
+                check_equal(r, IP, "IP after reset");
+                bus_access(16#208#, '1', x"C0A81464", r);  -- 192.168.20.100
+                wait for 1 us;
+                send(ip_frame(IP, x"01", icmp_echo(32)));
+                wait for 20 us;
+                check_equal(rx_frames, 0, "the old IP gets no reply");
+                send(ip_frame(x"C0A81464", x"01", icmp_echo(32)));
+                wait until rx_frames = 1 for 30 us;
+                check_equal(rx_frames, 1, "the new IP answers");
+                send(arp_request(IP));
+                wait until rx_frames = 2 for 30 us;
+                send(udp_frame(x"C0A81464", x"0007", 22));
+                wait until rx_frames = 2 for 30 us;
+                bus_access(16#214#, '0', x"00000000", r);
+                check_equal(to_integer(unsigned(r)), 1, "ICMP replies");
+                bus_access(16#218#, '0', x"00000000", r);
+                check_equal(to_integer(unsigned(r)), 1, "UDP replies");
+                bus_access(16#210#, '0', x"00000000", r);
+                check_equal(to_integer(unsigned(r)), 0, "no ARP reply for the old IP");
+
+            elsif run("a stream comes back to the sender") then
+                -- 0x01, 5 datagrams, 100 bytes each, to port 5000
+                send(udp_payload_frame(IP, x"1388", (x"01", x"00", x"00", x"00", x"05", x"00", x"64")));
+                wait until rx_frames = 5 for 60 us;
+                check_equal(rx_frames, 5, "five datagrams");
+                for n in 0 to 4 loop
+                    prev_end := 0;
+                    if n > 0 then
+                        prev_end := rx_ends(n - 1);
+                    end if;
+                    check_equal(rx_ends(n) - prev_end, 142, "42 + 100 bytes");
+                    fi := received(n, 74);              -- headers and the first 32 payload bytes
+                    check_equal(get(fi, 12, 2), std_logic_vector'(x"0800"), "IPv4");
+                    check_equal(csum16(fi, 14, 33), unsigned'(x"FFFF"), "IP header checksum");
+                    check_equal(get(fi, 26, 4), IP, "from the FPGA");
+                    check_equal(get(fi, 30, 4), PC_IP, "to the PC");
+                    check_equal(get(fi, 34, 4), std_logic_vector'(x"1388D431"), "ports 5000 -> the PC's");
+                    check_equal(get(fi, 38, 2), std_logic_vector'(x"006C"), "UDP length 108");
+                    check_equal(get(fi, 42, 4), std_logic_vector(to_unsigned(n, 32)), "sequence number");
+                    for i in 4 to 31 loop
+                        check_equal(fi(42 + i), std_logic_vector(to_unsigned((n + i) mod 256, 8)), "pattern byte " & integer'image(i));
+                    end loop;
+                end loop;
+                bus_access(16#224#, '0', x"00000000", r);
+                check_equal(to_integer(unsigned(r)), 5, "datagrams sent (0x224)");
+                bus_access(16#220#, '0', x"00000000", r);
+                info("stream of 5 x 100 bytes took " & integer'image(to_integer(unsigned(r))) & " clocks");
+
+            elsif run("registers over UDP") then
+                -- write 0x08 = 0xDEADBEEF, then read it back, and the signature
+                send(udp_payload_frame(IP, x"1388", (x"03", x"00", x"08", x"DE", x"AD", x"BE", x"EF")));
+                wait until rx_frames = 1 for 30 us;
+                check_equal(rx_frames, 1, "write reply");
+                g(0 to 59) := received(0, 60);
+                check_equal(get(g, 42, 8), std_logic_vector'(x"03000008DEADBEEF"), "write reply: the value written");
+                send(udp_payload_frame(IP, x"1388", (x"02", x"00", x"08")));
+                wait until rx_frames = 2 for 30 us;
+                g(0 to 59) := received(1, 60);
+                check_equal(get(g, 42, 8), std_logic_vector'(x"02000008DEADBEEF"), "read back");
+                send(udp_payload_frame(IP, x"1388", (x"02", x"00", x"1C")));
+                wait until rx_frames = 3 for 30 us;
+                g(0 to 59) := received(2, 60);
+                check_equal(get(g, 42, 8), std_logic_vector'(x"0200001C5A5A1234"), "the signature");
+
+            elsif run("the scope capture over UDP") then
+                send(udp_payload_frame(IP, x"1388", (0 => x"04")));
+                wait until rx_frames = 32 for 400 us;
+                check_equal(rx_frames, 32, "32 datagrams");
+                for n in 0 to 31 loop
+                    prev_end := 0;
+                    if n > 0 then
+                        prev_end := rx_ends(n - 1);
+                    end if;
+                    check_equal(rx_ends(n) - prev_end, 42 + 1028, "1028 payload bytes");
+                    check_equal(get(rx_bytes, prev_end + 42, 4),
+                                std_logic_vector(to_unsigned(n * 128, 16)) & x"1000", "offset, 4096");
+                    for smp in 0 to 127 loop
+                        for k in 0 to 3 loop
+                            check_equal(rx_bytes(prev_end + 46 + 8 * smp + 2 * k + 1) & rx_bytes(prev_end + 46 + 8 * smp + 2 * k),
+                                        std_logic_vector(to_unsigned((4 * ((SCOPE_START + n * 128 + smp) mod 4096) + k) mod 65536, 16)),
+                                        "sample " & integer'image(n * 128 + smp) & " ch" & integer'image(k));
+                        end loop;
+                    end loop;
+                end loop;
+
+            elsif run("no capture, an error reply") then
+                scope_done <= '0';
+                wait for 1 us;
+                send(udp_payload_frame(IP, x"1388", (0 => x"04")));
+                wait until rx_frames = 1 for 30 us;
+                g(0 to 59) := received(0, 60);
+                check_equal(get(g, 42, 8), std_logic_vector'(x"04FF000000000000"), "error reply");
 
             elsif run("a full size frame is echoed") then
                 fl := frame(MAC, x"88B5", 8, 1514);

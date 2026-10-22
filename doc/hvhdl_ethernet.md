@@ -11,8 +11,10 @@ Ethernet frames without Linux in the data path: line-rate streaming (oscilloscop
 later ADC data), fixed-latency register access, and traffic that keeps flowing while Linux is
 busy or rebooting.
 
-**Status:** phases 1 and 2 done (2026-10-22): the MAC echoes frames on the board at 1 Gb/s,
-and its registers are reachable from Linux (fpgad `eth`, the web page).
+**Status:** phases 1–4 done (2026-10-22): the FPGA has its own IP address on the PL port and a UDP
+application - register access, the oscilloscope's capture, a stream at line rate (956 Mbit/s) -
+with no Linux in the path; the protocol logic is in the library (`network_responder`,
+`udp_sender`, `frame_mux`).
 
 ## 1. What the library gives: `ethernet_mac/`
 
@@ -151,16 +153,90 @@ build (`build.tcl` now records it as `output/<project>.regmap`).
 Not measured yet: the echo at line rate - it needs a faster frame generator than scapy, and the
 echo itself moves one frame at a time through its buffer (about half of line rate for long frames).
 
-## 5. Protocols: what a PC can reach
+## 5. Phase 3: ARP, ping and UDP
 
 The PC here runs the tools in **WSL2 behind NAT**: raw Ethernet frames from WSL never reach the
-LAN, only routed IP traffic does. So:
+LAN, only routed IP traffic does - so the FPGA needs ARP and IPv4 to be reachable from ordinary
+programs. `eth_mac.vhd`'s echo became a small **responder**:
 
-- **raw frames, EtherType 0x88B5** (the echo) - from Windows (scapy + Npcap), or from Linux on the
-  board itself (`eth0` → switch → PL port);
-- **IPv4 + UDP** - needs ARP, an IPv4 header check/generation, UDP, and ICMP echo for `ping`; then
-  any program, also in WSL, talks to the FPGA with an ordinary UDP socket. The library has none of
-  this yet; it fits naturally as a stream stage between `m_t*` and `s_t*`.
+| request | reply |
+|---|---|
+| ARP request for our IP (broadcast) | ARP reply: opcode 2, sender = our MAC / IP, target = the requester |
+| ICMP echo request to our MAC + IP | echo reply: IPs swapped, type 0, ICMP checksum updated (RFC 1624: HC' = ~(~HC + ~m + m')) |
+| UDP to our MAC + IP and echo port | the datagram back: IPs and ports swapped |
+| EtherType 0x88B5 | the raw echo of phase 1 |
+
+IPv4 is accepted with version 4 and no options, not fragmented, a good header checksum (summed on
+the fly), for our MAC and IP; everything else is ignored (counted). The receive side writes the frame
+into the buffer as it is and picks the header fields up by byte position on the way; the decision
+falls at the last byte. Each reply is its request with a few fields substituted while it streams
+out of the buffer - and swapping two fields of a ones' complement sum doesn't change it, so the IP
+header checksum and the UDP checksum of the request stay valid without being recomputed.
+
+Registers (ETH window): `0x4208` our IPv4 address (RW, 192.168.20.10 after reset), `0x420C` the UDP
+echo port (RW, 7), `0x4210` / `0x4214` / `0x4218` ARP / ICMP / UDP replies. The IP and port reach
+the receive clock through the library's `cdc_snapshot`. `fpgactl eth` and the web card show them;
+`fpgactl write 0x4208 0xC0A8140A` sets the IP.
+
+**Simulation:** 8 more `tb_eth_mac` cases - ARP for our / another IP, ping (the testbench recomputes
+the reply's IP and ICMP checksums), UDP to the echo port / another port, a bad IP header checksum,
+a new IP through the bus, the counters: 15 MAC cases, **44 of 44** in all.
+
+**On the board** (PC on the PL port, its adapter at 192.168.20.25; timing met, WNS 0.326 ns,
+WHS 0.064 ns):
+
+| test | result |
+|---|---|
+| `ping 192.168.20.10` from WSL / from Windows | 5/5 / 4/4; under 1 ms from Windows |
+| `ping -s 1472 -M do` (1500-byte IP, no fragmenting) | 3/3, 0.54 ms |
+| 200 pings, 5 ms apart | 200/200, 0.34 ms average |
+| ARP | Windows resolved 192.168.20.10 to 02-5a-4d-00-00-10 |
+| UDP echo from WSL (Python socket, port 7) | 30/30 datagrams of 1..1472 bytes back byte-exact, round trip median 0.36 ms |
+| UDP to another port | no reply |
+| counters | ARP / ICMP / UDP replies = what was sent, 0 errors |
+
+The protocol logic has since moved into the library as `ethernet_mac/network_responder.vhd` (with
+its own testbench there); `eth_mac.vhd` keeps the board's part - I/O, clocks, registers.
+
+## 5b. Phase 4: a UDP application
+
+**In the library** (`ethernet_mac/`, VUnit tests there - 38 of 38):
+
+| entity | |
+|---|---|
+| `network_responder` | + a **user port**: datagrams to `udp_user_port` are handed over (payload on `user_t*`, its sender and length held), so it is a UDP endpoint |
+| `udp_sender` | FPGA-originated datagrams: Ethernet + IPv4 (checksum, three clocks while the header goes out) + UDP headers in front of a gapless payload |
+| `frame_mux` | two frame streams onto ethernet_mac's transmit stream, a whole frame at a time |
+
+**In the project:** `eth_mac.vhd` runs a command processor on UDP port 5000 (replies to the sender):
+
+| command | request | reply |
+|---|---|---|
+| `0x01` stream | count(4) size(2) | count datagrams of size bytes, back to back: sequence number + pattern; the time on the wire in clocks (`0x4220`) |
+| `0x02` read | addr(2) | `02 00 addr value` - an axi_regs register (0x00..0xFF) |
+| `0x03` write | addr(2) value(4) | `03 00 addr value` |
+| `0x04` scope | - | the capture: 32 × (offset(2) 4096(2) + 128 samples × ch0..ch3 int16 LE) - or `04 FF ...` without one |
+
+- `axi_regs` has a **second way in** (`udp_*`, a handshake from the MAC clock) beside AXI; the read mux
+  and the byte writes are one function / procedure for both.
+- `scope_capture` has a **second read port** in its own clock (a copy of the RAM, 8 more RAMB36).
+- `tools/pl_udp.py` - `read`, `write`, `stream`, `scope [--arm] [--csv]`: the PC side, standard Python.
+- Simulation: `tb_axi_regs` + the PL register access, `tb_eth_mac` + stream, registers and the capture
+  over UDP (every sample checked, across the RAM's wrap): **49 of 49**.
+
+**On the board** (timing met, WNS 0.326 ns, WHS 0.035 ns):
+
+| test | result |
+|---|---|
+| stream 10 000 × 1472 bytes, on the wire (FPGA clocks) | **956 Mbit/s payload** (theory 957), 999 Mbit/s with preamble / FCS / gap |
+| the same, received - Windows / WSL through its NAT | 10000/10000, 0 lost, 0 out of order, 0 bad / 10000/10000 at 958 Mbit/s |
+| 10 000 × 512 / × 64 bytes on the wire | 884 / 489 Mbit/s payload (998 / 992 with framing); all received |
+| registers over UDP | SIGNATURE, REGMAP, FEATURES read; a UDP write is seen by Linux and a Linux write by UDP |
+| the scope's capture over UDP | 4 × 4096 samples in **1.0 ms** (1.8 ms with arming), waveforms continuous across the 32 datagrams |
+| ping while streaming / alongside | answered (replies have priority in `frame_mux`) |
+
+The FPGA path is about **twice** what Linux reached on the same port (474–553 Mbit/s, CPU-bound) and
+doesn't depend on Linux running at all.
 
 ## 6. Phases
 
@@ -169,8 +245,8 @@ LAN, only routed IP traffic does. So:
 | 0 | submodule, library tests run here | **done** |
 | 1 | Xilinx DDR I/O + clocks + constraints; simulation through them; the `hvhdl` design variant (option A) with an echo | **done**: 33/33 in simulation, the variant builds (see §3) |
 | 2 | on the board: the echo at 1 Gb/s from a peer; the MAC's APB registers bridged to the PS, counters in fpgad / the web page | **done** (§4) |
-| 3 | ARP + IPv4 + UDP (+ ICMP echo) as stream stages, FPGA IP/MAC from registers | `ping <fpga ip>` and a UDP echo from WSL |
-| 4 | use it: UDP register access and streaming oscilloscope captures at line rate | throughput against Linux's 474–553 Mbit/s on the same port |
+| 3 | ARP + IPv4 + UDP (+ ICMP echo), FPGA IP from a register | **done** (§5) |
+| 4 | UDP register access, the oscilloscope's capture over UDP, a stream at line rate | **done** (§5b): 956 Mbit/s against Linux's 474–553 |
 | 5 | option B: GMII switch so `eth1` and the FPGA share the PL port | Linux on `eth1` and FPGA UDP traffic at the same time; fpgad's relink rule still holds |
 
 ## 7. Notes and open questions

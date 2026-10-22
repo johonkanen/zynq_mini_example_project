@@ -58,6 +58,11 @@ architecture sim of tb_axi_regs is
     signal ext_addr   : std_logic_vector(10 downto 0);
     signal ext_wdata, ext_rdata : std_logic_vector(31 downto 0) := (others => '0');
 
+    -- the PL's register access (udp_*), driven from dev_clk
+    signal udp_req, udp_write, udp_ack : std_logic := '0';
+    signal udp_addr  : std_logic_vector(15 downto 0) := (others => '0');
+    signal udp_wdata, udp_rdata : std_logic_vector(31 downto 0) := (others => '0');
+
 begin
 
     dev_clk <= not dev_clk after 4 ns when running else '0';
@@ -99,6 +104,8 @@ begin
             scope_rd_addr_o => scope_rd_addr, scope_rd_data_i => scope_rd_data,
             features_i => features, ext_req_o => ext_req, ext_write_o => ext_write,
             ext_addr_o => ext_addr, ext_wdata_o => ext_wdata, ext_rdata_i => ext_rdata, ext_ack_i => ext_ack,
+            udp_req_i => udp_req, udp_write_i => udp_write, udp_addr_i => udp_addr,
+            udp_wdata_i => udp_wdata, udp_rdata_o => udp_rdata, udp_ack_o => udp_ack,
             s_axi_aclk => aclk, s_axi_aresetn => aresetn,
             s_axi_i => m2s, s_axi_o => s2m);
 
@@ -204,6 +211,24 @@ begin
         begin
             axi_read_burst(addr, 1, a, id);
             d := a(0);
+        end procedure;
+
+        -- one access through udp_* (as eth_mac makes it, from another clock)
+        procedure udp_access(addr : natural; write : std_logic; d : std_logic_vector(31 downto 0);
+                             variable q : out std_logic_vector(31 downto 0)) is
+            variable ack0 : std_logic;
+        begin
+            ack0 := udp_ack;
+            wait until rising_edge(dev_clk);
+            udp_addr  <= std_logic_vector(to_unsigned(addr, 16));
+            udp_write <= write;
+            udp_wdata <= d;
+            wait until rising_edge(dev_clk);
+            udp_req <= not udp_req;
+            wait until udp_ack /= ack0 for 2 us;
+            check(udp_ack /= ack0, "udp access answered");
+            wait for 40 ns;
+            q := udp_rdata;
         end procedure;
 
         procedure do_reset is
@@ -397,6 +422,21 @@ begin
                 axi_write(16#4008#, x"00000001");               -- returns too
                 axi_read(16#1C#, r);
                 check_equal(r, std_logic_vector'(x"5A5A1234"), "the bus still works");
+
+            elsif run("register_access_from_the_pl") then
+                udp_access(16#00#, '1', x"12345678", r);
+                axi_read(16#00#, r);
+                check_equal(r, std_logic_vector'(x"12345678"), "a PL write is seen by AXI");
+                axi_write(16#04#, x"CAFEBABE");
+                udp_access(16#04#, '0', x"00000000", r);
+                check_equal(r, std_logic_vector'(x"CAFEBABE"), "an AXI write is seen by the PL");
+                udp_access(16#1C#, '0', x"00000000", r);
+                check_equal(r, std_logic_vector'(x"5A5A1234"), "SIGNATURE from the PL");
+                udp_access(16#40#, '1', x"00000001", r);            -- SCOPE_CMD: arm
+                tick(2);
+                check_equal(cmd_seen(0), '1', "the arm pulse came");
+                udp_access(16#8000#, '0', x"00000000", r);
+                check_equal(r, std_logic_vector'(x"00000000"), "outside 0x00..0xFF reads 0");
 
             elsif run("oled_text_buffer") then
                 -- reset text: "Hello, Zynq Mini" in row 0, little-endian per word
