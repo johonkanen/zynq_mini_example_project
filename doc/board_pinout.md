@@ -17,6 +17,41 @@ All PL I/O below is **`LVCMOS33`**. PS MIO peripherals are in
 | User LEDs `led[0..3]` | `W13` `V12` `U12` `T12` | `fpga_01_pl_led_stream` |
 | 4-pin header group (PWM / UART / EMIO-I²C) | `P15` `U15` `V15` `W15` | `arm_fpga_03` PWM = `ch1_n`/`ch1_p`/`ch2`/`ch3`; `fpga_08_uart` `rxd`=`P15` `txd`=`U15` |
 
+## 40-pin EXT IO header (CAM1, "EXT IO 3.3V")
+
+Schematic page 9. A 2×20 strip: pins 1–20 along the board edge, 21–40 on the inner row,
+pin 20/21 at the SD-card end. Pins 1, 19, 22 = GND, 20/21 = VCC_3V3, 40 = VCC5.0; the other
+34 are bank-34 PL pins (net `FPGA_GPIO_<pair>_34`, LVCMOS33). Constrained by header pin
+number in `src/constrs/zynq_mini.xdc` (`ext_lo[2..18]`, `ext_hi[23..39]`).
+
+| pin | net | ball | | pin | net | ball |
+|---|---|---|---|---|---|---|
+| 2  | 11N | `U15` | | 39 | 24P | `P15` |
+| 3  | 10N | `W15` | | 38 | 10P | `V15` |
+| 4  | 9N  | `U17` | | 37 | 21P | `V17` |
+| 5  | 21N | `V18` | | 36 | 17P | `Y18` |
+| 6  | 22P | `W18` | | 35 | 17N | `Y19` |
+| 7  | 12N | `U19` | | 34 | 22N | `W19` |
+| 8  | 11P | `U14` | | 33 | 23P | `N17` |
+| 9  | 8N  | `Y14` | | 32 | 8P  | `W14` |
+| 10 | 18P | `V16` | | 31 | 24N | `P16` |
+| 11 | 12P | `U18` | | 30 | 19P | `R16` |
+| 12 | 20P | `T17` | | 29 | 9P  | `T16` |
+| 13 | 19N | `R17` | | 28 | 18N | `W16` |
+| 14 | 16N | `W20` | | 27 | 20N | `R18` |
+| 15 | 16P | `V20` | | 26 | 13N | `P19` |
+| 16 | 15N | `U20` | | 25 | 23N | `P18` |
+| 17 | 15P | `T20` | | 24 | 13P | `N18` |
+| 18 | 14N | `P20` | | 23 | 14P | `N20` |
+
+Verified on the board (2026-10-22): every pin driven at *pin number* × 10 kHz and
+identified on a scope; pins 14, 15, 17 and 18 matched exactly. The vendor's "4-pin
+group" (`P15 U15 V15 W15`) is pins 39, 2, 38, 3.
+
+The current design uses pins 17/15/14/18 for the high-resolution PWM test
+(`src/hdl/hrpwm.vhd`, web page `/pwm.html`) and drives the other header pins with the
+identification pattern — don't connect anything that drives those pins.
+
 ## OLED (0.96" SSD1306, 4-wire SPI)
 
 | Schematic net | SSD1306 pin | Function | Pin | top-level port |
@@ -93,6 +128,6 @@ From `arm_fpga_11_ov5640` / `arm_fpga_12_double_ov5640`.
 
 ---
 
-*Not exhaustive — the board also has a 34-pin PL GPIO header, I²C EEPROM, and a
+*Not exhaustive — the board also has an I²C EEPROM and a
 second SD/eMMC on the PS. Pull the specific vendor example's XDC when you need a
 peripheral not listed here.*

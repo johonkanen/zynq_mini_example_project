@@ -3,6 +3,7 @@
  * goes through fpgad (the process that owns the PL) via libfpgad-client.
  *
  *   GET  /                    the page (index.html, compiled into the binary)
+ *   GET  /pwm.html            high-resolution PWM controls (hrpwm: SCRATCH0 = FTW, SCRATCH1 = DUTY)
  *   GET  /uPlot.iife.min.js, /uPlot.min.css   vendored uPlot (vendor/, MIT)
  *   GET  /api/status          fpgad status JSON
  *   GET  /api/sensors         XADC die temperature + supply rails: {"temp":45.1,"vccint":1.0,...}
@@ -31,6 +32,7 @@
 #include "fpgad_client.h"
 
 extern const char index_html[], index_html_end[];      /* page.S */
+extern const char pwm_html[], pwm_html_end[];
 extern const char uplot_js[], uplot_js_end[];
 extern const char uplot_css[], uplot_css_end[];
 
@@ -139,6 +141,7 @@ static int parse_u32(const char *s, uint32_t *v)
 /* files compiled into the binary (page.S) */
 struct asset { const char *data, *end, *type; };
 static const struct asset ASSET_INDEX = { index_html, index_html_end, "text/html; charset=utf-8" };
+static const struct asset ASSET_PWM = { pwm_html, pwm_html_end, "text/html; charset=utf-8" };
 static const struct asset ASSET_UPLOT_JS = { uplot_js, uplot_js_end, "text/javascript" };
 static const struct asset ASSET_UPLOT_CSS = { uplot_css, uplot_css_end, "text/css" };
 
@@ -834,6 +837,7 @@ int main(int argc, char **argv)
     mg_set_request_handler(ctx, "/api/reg$", reg_handler, NULL);
     mg_set_request_handler(ctx, "/$", asset_handler, (void *)&ASSET_INDEX);
     mg_set_request_handler(ctx, "/index.html$", asset_handler, (void *)&ASSET_INDEX);
+    mg_set_request_handler(ctx, "/pwm.html$", asset_handler, (void *)&ASSET_PWM);
     mg_set_request_handler(ctx, "/uPlot.iife.min.js$", asset_handler, (void *)&ASSET_UPLOT_JS);
     mg_set_request_handler(ctx, "/uPlot.min.css$", asset_handler, (void *)&ASSET_UPLOT_CSS);
     mg_set_websocket_handler(ctx, "/ws$", ws_connect, ws_ready, ws_data, ws_close, NULL);

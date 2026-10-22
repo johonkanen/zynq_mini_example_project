@@ -10,6 +10,7 @@
 	.endm
 
 	asset index_html,   "index.html"
+	asset pwm_html,     "pwm.html"
 	asset uplot_js,     "vendor/uPlot.iife.min.js"
 	asset uplot_css,    "vendor/uPlot.min.css"
 	.section .note.GNU-stack,"",%progbits

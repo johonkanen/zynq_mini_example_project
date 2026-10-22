@@ -55,7 +55,13 @@ entity zynq_mini_top is
         oled_sclk         : out std_logic;
         oled_sdin         : out std_logic;
         oled_dc           : out std_logic;
-        oled_res_n        : out std_logic
+        oled_res_n        : out std_logic;
+
+        -- 40-pin EXT IO header (CAM1), indexed by header pin number; pins 1, 19-22
+        -- and 40 are power. Pins 17/15/14/18 (scope CH1..CH4) carry the high-resolution
+        -- PWM test (hrpwm); the others the identification test: pin n toggles at n*10 kHz.
+        ext_lo            : out std_logic_vector(18 downto 2);
+        ext_hi            : out std_logic_vector(39 downto 23)
     );
 end entity zynq_mini_top;
 
@@ -240,6 +246,45 @@ begin
             end if;
         end if;
     end process;
+
+    ---------------------------------------------------------------------------
+    -- EXT IO pin identification: header pin n -> square wave at n * 10 kHz
+    ---------------------------------------------------------------------------
+    ext_id : for n in 2 to 39 generate
+        constant HALF : positive := (5_000 + n / 2) / n;   -- 100 MHz / (2 * n * 10 kHz)
+        signal cnt : natural range 0 to HALF - 1 := 0;
+        signal q   : std_logic := '0';
+    begin
+        sig : if (n <= 18 or n >= 23) and n /= 14 and n /= 15 and n /= 17 and n /= 18 generate
+            process (clk)
+            begin
+                if rising_edge(clk) then
+                    if cnt = HALF - 1 then
+                        cnt <= 0;
+                        q   <= not q;
+                    else
+                        cnt <= cnt + 1;
+                    end if;
+                end if;
+            end process;
+            lo : if n <= 18 generate ext_lo(n) <= q; end generate;
+            hi : if n >= 23 generate ext_hi(n) <= q; end generate;
+        end generate;
+    end generate;
+
+    ---------------------------------------------------------------------------
+    -- High-resolution PWM test: f = SCRATCH0 * 800 MHz / 2^32, duty = SCRATCH1 / 2^32
+    ---------------------------------------------------------------------------
+    u_hrpwm : entity work.hrpwm
+        port map (
+            clk      => clk,
+            ftw_i    => reg_ps2pl(31 downto 0),
+            duty_i   => reg_ps2pl(63 downto 32),
+            pwm_o(0) => ext_lo(17),     -- CH1: 100 MHz flip-flop, sawtooth
+            pwm_o(1) => ext_lo(15),     -- CH2: 100 MHz ODDR, symmetric
+            pwm_o(2) => ext_lo(14),     -- CH3: 200 MHz ODDR
+            pwm_o(3) => ext_lo(18)      -- CH4: OSERDES, 400 MHz DDR
+        );
 
     user_probe <= ("0000" & std_logic_vector(heartbeat)) xor reg_ps2pl(31 downto 0)
                   when pl_active = '1'

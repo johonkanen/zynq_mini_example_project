@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zynq Mini · PWM</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --text:#e6e6e6; --dim:#8b93a1; --line:#2a2f3a;
+          --a:#5ab0ff; --b:#ffb454; --ok:#4cc38a; --bad:#ff6b6b; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font:14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display:flex; flex-wrap:wrap; gap:.5rem 1.5rem; align-items:baseline;
+           padding:1rem 1.25rem; border-bottom:1px solid var(--line); }
+  h1 { font-size:1.1rem; margin:0; font-weight:600; }
+  a { color:var(--a); }
+  .pill { padding:.15rem .6rem; border-radius:999px; background:var(--panel);
+          border:1px solid var(--line); font-size:.85rem; }
+  .pill.ok { color:var(--ok); border-color:var(--ok); }
+  .pill.bad { color:var(--bad); border-color:var(--bad); }
+  main { padding:1rem 1.25rem; display:grid; gap:1rem; max-width:60rem; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:.75rem 1rem; min-width:0; }
+  .card h2 { font-size:.9rem; font-weight:600; margin:0 0 .5rem; color:var(--dim); }
+  .row { display:flex; flex-wrap:wrap; gap:.5rem 1rem; align-items:center; margin:.4rem 0; }
+  .big { font-size:1.6rem; font-variant-numeric:tabular-nums; }
+  .stats { display:flex; flex-wrap:wrap; gap:.5rem 2rem; margin-top:.5rem; }
+  .stats div h3 { font-size:.75rem; font-weight:500; color:var(--dim); margin:0; }
+  small, .dim { color:var(--dim); }
+  .mono { font-family:ui-monospace, "Cascadia Mono", Consolas, monospace; font-variant-numeric:tabular-nums; }
+  input { background:var(--bg); color:var(--text); border:1px solid var(--line); border-radius:4px;
+          padding:.25rem .4rem; font:inherit; }
+  input.num { width:11rem; }
+  input:focus { outline:1px solid var(--a); }
+  input[type=range] { flex:1 1 14rem; min-width:10rem; accent-color:var(--a); padding:0; }
+  input[type=checkbox] { accent-color:var(--a); }
+  button { background:#22324a; color:var(--text); border:1px solid #2f4a70; border-radius:4px;
+           padding:.25rem .7rem; font:inherit; cursor:pointer; }
+  button:hover { background:#2a3f5e; }
+  button.run { background:#1f4a33; border-color:#2f6d4b; }
+  button.stop { background:#5a2424; border-color:#7a3333; }
+  .table-wrap { overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; }
+  th, td { text-align:left; padding:.3rem .6rem; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th { color:var(--dim); font-weight:500; font-size:.8rem; }
+  td.desc { white-space:normal; color:var(--dim); font-size:.85rem; }
+  .sw { width:.8rem; height:.8rem; border-radius:2px; display:inline-block; vertical-align:middle; margin-right:.3rem; }
+  #log { min-height:1.2em; }
+  #log.err { color:var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Zynq Mini · high-resolution PWM</h1>
+  <span id="state" class="pill">reading…</span>
+  <a href="/">← FPGA page</a>
+</header>
+<main>
+  <section class="card">
+    <h2>Frequency — f = FTW × 800 MHz / 2³² (phase accumulator, 1 LSB = 0.186 Hz)</h2>
+    <div class="row">
+      <input id="f" class="num mono" type="number" min="0.2" max="50000000" step="any" value="500000"> Hz
+      <button data-df="-10">−10 LSB</button><button data-df="-1">−1 LSB</button>
+      <button data-df="1">+1 LSB</button><button data-df="10">+10 LSB</button>
+    </div>
+    <div class="row"><small>10 Hz</small><input id="fs" type="range" min="1" max="7.69897" step="0.0001" value="5.69897"><small>50 MHz</small></div>
+    <div class="stats">
+      <div><h3>actual frequency</h3><div class="big mono" id="fact">–</div></div>
+      <div><h3>period</h3><div class="big mono" id="per">–</div></div>
+      <div><h3>FTW (SCRATCH0)</h3><div class="big mono" id="ftw">–</div></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Duty — fraction of the period, DUTY / 2³² (kept when the frequency changes)</h2>
+    <div class="row">
+      <input id="d" class="num mono" type="number" min="0" max="100" step="any" value="50"> %
+      <button data-dd="-0.1">−0.1 %</button><button data-dd="0.1">+0.1 %</button>
+    </div>
+    <div class="row"><small>0 %</small><input id="ds" type="range" min="0" max="100" step="0.01" value="50"><small>100 %</small></div>
+    <div class="stats">
+      <div><h3>high time</h3><div class="big mono" id="ton">–</div></div>
+      <div><h3>DUTY (SCRATCH1)</h3><div class="big mono" id="duty">–</div></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="row">
+      <button id="apply" class="run">Apply</button>
+      <label><input type="checkbox" id="live" checked> apply while editing</label>
+      <button id="off" class="stop">Output off</button>
+      <span id="log" class="mono dim"></span>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Outputs — EXT IO header, all four from the same phase accumulator (hrpwm.vhd)</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>scope</th><th>pin</th><th>method</th><th>carrier</th><th>edge grid</th><th>period jitter now</th></tr></thead>
+        <tbody id="outs"></tbody>
+      </table>
+    </div>
+    <p class="dim" style="margin:.5rem 0 0;font-size:.85rem">
+      Each edge lands on the first grid slot after the ideal crossing, so a period that is not a whole
+      number of grid slots alternates between the neighbouring slot counts; the mean frequency and duty
+      stay exact. Measured: −3.1 ppm absolute (crystal), 1-LSB steps resolved, mean duty within 0.6 ns.
+    </p>
+  </section>
+</main>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const TICK = 800e6, TWO32 = 2 ** 32;
+const FTW_MAX = Math.round(50e6 * TWO32 / TICK);
+const OUTS = [   // grid in 1.25 ns ticks
+  { ch: "CH1", color: "#ff8c00", pin: "17 (T20)", method: "IOB flip-flop, 100 MHz", carrier: "sawtooth", grid: 8 },
+  { ch: "CH2", color: "#5c7cff", pin: "15 (V20)", method: "ODDR, 100 MHz", carrier: "symmetric", grid: 4 },
+  { ch: "CH3", color: "#22c55e", pin: "14 (W20)", method: "ODDR, 200 MHz", carrier: "sawtooth", grid: 2 },
+  { ch: "CH4", color: "#ff1493", pin: "18 (P20)", method: "OSERDESE2 8:1 DDR, 400 MHz", carrier: "sawtooth", grid: 1 },
+];
+let ftw = 0, duty = 0;           // what the page will write
+let sent = { ftw: null, duty: null };
+
+const hex = v => "0x" + (v >>> 0).toString(16).padStart(8, "0");
+function log(t, err) { const l = $("log"); l.textContent = t; l.className = "mono " + (err ? "err" : "dim"); }
+function pill(t, cls) { const p = $("state"); p.textContent = t; p.className = "pill " + (cls || ""); }
+function fmtHz(f) {
+  return f >= 1e6 ? (f / 1e6).toFixed(9) + " MHz" : f >= 1e3 ? (f / 1e3).toFixed(6) + " kHz" : f.toFixed(4) + " Hz";
+}
+function fmtNs(ns) {
+  return ns >= 1e6 ? (ns / 1e6).toFixed(6) + " ms" : ns >= 1e3 ? (ns / 1e3).toFixed(5) + " µs" : ns.toFixed(3) + " ns";
+}
+const clampFtw = v => Math.min(FTW_MAX, Math.max(1, Math.round(v)));
+const clampDuty = v => Math.min(TWO32 - 1, Math.max(0, Math.round(v)));
+
+function show() {
+  const f = ftw * TICK / TWO32, T = 1e9 / f;
+  $("fact").textContent = fmtHz(f);
+  $("per").textContent = fmtNs(T);
+  $("ftw").textContent = hex(ftw);
+  $("ton").textContent = fmtNs(T * duty / TWO32);
+  $("duty").textContent = hex(duty);
+  const ticks = TWO32 / ftw;                          // period in 1.25 ns ticks
+  $("outs").innerHTML = OUTS.map(o => {
+    const slots = ticks / o.grid, g = o.grid * 1.25;
+    const jit = Number.isInteger(slots) ? "none (whole number of slots)"
+      : `${Math.floor(slots) * g} / ${Math.ceil(slots) * g} ns`;
+    return `<tr><td><span class="sw" style="background:${o.color}"></span>${o.ch}</td><td class="mono">${o.pin}</td>` +
+           `<td>${o.method}</td><td>${o.carrier}</td><td class="mono">${g} ns</td><td class="mono">${jit}</td></tr>`;
+  }).join("");
+}
+function fromFtw(v, keepInput) {
+  ftw = clampFtw(v);
+  const f = ftw * TICK / TWO32;
+  if (!keepInput) $("f").value = +f.toFixed(4);
+  $("fs").value = Math.log10(Math.max(10, f));
+  show(); changed();
+}
+function fromDuty(v, keepInput) {
+  duty = clampDuty(v);
+  if (!keepInput) $("d").value = +(duty / TWO32 * 100).toFixed(6);
+  $("ds").value = duty / TWO32 * 100;
+  show(); changed();
+}
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  let j; try { j = await r.json(); } catch (e) { j = { ok: false, error: r.status + " " + r.statusText }; }
+  if (!j.ok) throw new Error(j.error || "request failed");
+  return j;
+}
+const writeReg = (addr, value) => api("/api/reg", { method: "POST", body: new URLSearchParams({ addr, value: hex(value) }) });
+
+let busy = false, again = false, timer = 0;
+async function apply() {
+  if (busy) { again = true; return; }
+  busy = true;
+  try {
+    // the PL takes each register as it arrives, phase-continuously
+    if (sent.ftw !== ftw) { await writeReg("0x00", ftw); sent.ftw = ftw; }
+    if (sent.duty !== duty) { await writeReg("0x04", duty); sent.duty = duty; }
+    log(`running: ${fmtHz(ftw * TICK / TWO32)}, ${(duty / TWO32 * 100).toFixed(4)} %`);
+    pill(duty ? "output on" : "output off", duty ? "ok" : "");
+  } catch (e) { log(e.message, true); pill("write failed", "bad"); }
+  busy = false;
+  if (again) { again = false; apply(); }
+}
+function changed() {
+  if (!$("live").checked) { log("not applied yet"); return; }
+  clearTimeout(timer); timer = setTimeout(apply, 60);
+}
+
+$("f").oninput = () => { const f = parseFloat($("f").value); if (f > 0) fromFtw(f * TWO32 / TICK, true); };
+$("f").onchange = () => fromFtw(ftw);
+$("fs").oninput = () => fromFtw(10 ** parseFloat($("fs").value) * TWO32 / TICK);
+document.querySelectorAll("[data-df]").forEach(b => b.onclick = () => fromFtw(ftw + +b.dataset.df));
+$("d").oninput = () => { const d = parseFloat($("d").value); if (d >= 0 && d <= 100) fromDuty(d / 100 * TWO32, true); };
+$("d").onchange = () => fromDuty(duty);
+$("ds").oninput = () => fromDuty(parseFloat($("ds").value) / 100 * TWO32);
+document.querySelectorAll("[data-dd]").forEach(b => b.onclick = () => fromDuty(duty + +b.dataset.dd / 100 * TWO32));
+$("apply").onclick = () => { sent = { ftw: null, duty: null }; apply(); };
+$("off").onclick = () => fromDuty(0);
+
+// start from what the PL is running now
+(async () => {
+  const live = $("live").checked; $("live").checked = false;
+  try {
+    const f = parseInt((await api("/api/reg?addr=0x00")).value, 16);
+    const d = parseInt((await api("/api/reg?addr=0x04")).value, 16);
+    sent = { ftw: f, duty: d };
+    fromFtw(f || Math.round(500e3 * TWO32 / TICK)); fromDuty(f ? d : TWO32 / 2);
+    pill(f && d ? "output on" : "output off", f && d ? "ok" : "");
+    log(f ? "read the running settings from the PL" : "PL output is off — set and apply");
+  } catch (e) { pill("PL not reachable", "bad"); log(e.message, true); fromFtw(Math.round(500e3 * TWO32 / TICK)); fromDuty(TWO32 / 2); }
+  $("live").checked = live;
+})();
+</script>
+</body>
+</html>

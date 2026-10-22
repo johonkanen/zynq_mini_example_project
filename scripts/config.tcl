@@ -41,6 +41,7 @@ set TOP_SOURCES [list \
     "$HDL_DIR/ssd1306_text.vhd" \
     "$HDL_DIR/scope_siggen.vhd" \
     "$HDL_DIR/scope_capture.vhd" \
+    "$HDL_DIR/hrpwm.vhd" \
     "$HDL_DIR/zynq_ps_wrapper.vhd" \
     "$HDL_DIR/zynq_mini_top.vhd" \
 ]
