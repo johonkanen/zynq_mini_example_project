@@ -127,7 +127,14 @@ cp "$REPO/linux/rauc/system.conf" "$OV/rootfs/etc/rauc/system.conf"
 cp "$KEYS/ca.cert.pem" "$OV/rootfs/etc/rauc/keyring.pem"
 install -m 0755 "$REPO/linux/rauc/post-install.sh" "$OV/rootfs/usr/lib/rauc/post-install.sh"
 
-# Fixed MAC for eth0, set before networking starts. U-Boot invents a random
+# Network: both Ethernet ports in the bridge br0, DHCP on br0 (linux/net/):
+# eth0 = PS GEM0, eth1 = GEM1 through the PL, added by the netplug hotplug helper
+# whenever fpgad's FPGA overlay creates it. ifupdown runs bridge up/down.
+mkdir -p "$OV/rootfs/etc/network" "$OV/rootfs/usr/lib/zynq-mini"
+install -m 0644 "$REPO/linux/net/interfaces" "$OV/rootfs/etc/network/interfaces"
+install -m 0755 "$REPO/linux/net/bridge" "$REPO/linux/net/netplug" "$OV/rootfs/usr/lib/zynq-mini/"
+
+# Fixed MAC for eth0 (br0 uses the same one), set before networking starts. U-Boot invents a random
 # ethaddr on every boot (and patches it into the DT), so the DHCP address kept
 # changing - awkward for SSH and for updates. 02:... = locally administered.
 # A second board needs its own: put ETHADDR=02:.. in /etc/default/ethaddr.
@@ -228,12 +235,16 @@ BR2_TARGET_ROOTFS_CPIO=y
 BR2_TARGET_ROOTFS_CPIO_GZIP=y
 BR2_TARGET_ROOTFS_CPIO_UIMAGE=y
 BR2_ROOTFS_OVERLAY="$OV/rootfs"
-BR2_SYSTEM_DHCP="eth0"
+BR2_SYSTEM_DHCP=""
 BR2_PACKAGE_DROPBEAR=y
 BR2_PACKAGE_DROPBEAR_DISABLE_REVERSEDNS=y
 BR2_PACKAGE_FPGAD=y
 BR2_PACKAGE_FPGA_WEB=y
-BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="$REPO/linux/kernel-rauc.config"
+BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="$REPO/linux/kernel-rauc.config $REPO/linux/kernel-net.config"
+BR2_LINUX_KERNEL_DTB_OVERLAY_SUPPORT=y
+BR2_PACKAGE_IPROUTE2=y
+BR2_PACKAGE_ETHTOOL=y
+BR2_PACKAGE_IPERF3=y
 BR2_PACKAGE_RAUC=y
 BR2_PACKAGE_HOST_RAUC=y
 EOS
@@ -246,10 +257,14 @@ env -i HOME="$HOME" PATH="$CLEAN_PATH" TERM="${TERM:-xterm}" \
              { [ ! -f output/images/zynq-zynqmini.dtb ] || [ ! '$DTS' -nt output/images/zynq-zynqmini.dtb ] \
                || make linux-rebuild; } && \
              { ! ls output/build/linux-custom/.config >/dev/null 2>&1 || \
-               [ ! '$REPO/linux/kernel-rauc.config' -nt output/build/linux-custom/.config ] \
+               { [ ! '$REPO/linux/kernel-rauc.config' -nt output/build/linux-custom/.config ] && \
+                 [ ! '$REPO/linux/kernel-net.config' -nt output/build/linux-custom/.config ] && \
+                 output/host/bin/fdtget output/images/zynq-zynqmini.dtb /__symbols__ gem1 >/dev/null 2>&1; } \
                || make linux-reconfigure; } && \
              { ! ls output/target/usr/lib/libcivetweb.so.1.* >/dev/null 2>&1 || \
                grep -aq 258EAFA5 output/target/usr/lib/libcivetweb.so.1.* || make civetweb-dirclean; } && \
+             { [ ! -f output/images/boot.bin ] || [ ! '$XSA' -nt output/images/boot.bin ] \
+               || make uboot-rebuild; } && \
              { [ ! -d output/build/fpgad-1.0 ] || make fpgad-rebuild; } && \
              { [ ! -d output/build/fpga-web-1.0 ] || make fpga-web-rebuild; } && \
              make -j$JOBS"
@@ -258,9 +273,12 @@ env -i HOME="$HOME" PATH="$CLEAN_PATH" TERM="${TERM:-xterm}" \
 #    install time -> reinstall it
 #  - the custom DTS is copied into the kernel tree only during the linux build
 #    -> linux-rebuild when the repo DTS is newer than the built .dtb
+#  - U-Boot SPL compiles ps7_init_gpl.c in, but isn't rebuilt when the .xsa
+#    changes it (e.g. a new PS peripheral or FCLK) -> uboot-rebuild
 #  - fpgad / fpga-web are local-source packages -> rebuild to pick up source edits
-#  - the kernel config fragment is merged only at configure time -> linux-reconfigure
-#    when linux/kernel-rauc.config is newer than the kernel's .config
+#  - the kernel config fragments are merged only at configure time -> linux-reconfigure
+#    when linux/kernel-*.config is newer than the kernel's .config, or the built
+#    dtb lacks the __symbols__ the FPGA overlay needs (DTB_OVERLAY_SUPPORT -> dtc -@)
 #  - civetweb built before fpga-web.mk turned on WITH_WEBSOCKET lacks the
 #    WebSocket handshake (its RFC 6455 GUID 258EAFA5-...) -> dirclean, rebuilt
 
@@ -274,7 +292,7 @@ cat <<EOS
   SD boot :  sudo dd if=$IMG/sdcard.img of=/dev/sdX bs=4M conv=fsync status=progress
              boot switch = SD
   console :  115200 8N1 on UART1 (MIO 48/49),  login: root  (no password)
-  network :  eth0 via DHCP;  ssh root@<board-ip>  (key auth only)
+  network :  br0 (eth0 + PL eth1) via DHCP;  ssh root@<board-ip>  (key auth only)
   web     :  http://<board-ip>/   FPGA registers + live data (fpga-web -> fpgad)
   shell   :  fpgactl regs | read <off> | write <off> <val> | status
   JTAG    :  see doc/linux_build.md section 9

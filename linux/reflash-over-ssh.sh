@@ -78,7 +78,7 @@ scan() {    # ping first so ARP is warm, then ask fpga-web; one address per line
     seq 1 254 | xargs -P 16 -I{} sh -c \
         'curl -s -m 4 http://'"$NET"'.{}/api/status 2>/dev/null | grep -q "\"pl\"" && echo '"$NET"'.{}' || true
 }
-console_ip() {   # log in on the serial console and ask for eth0's address
+console_ip() {   # log in on the serial console and ask for the board's address (br0, or eth0 on old images)
     [ -n "$TTY" ] || return 0
     env -u PYTHONHOME -u PYTHONPATH /usr/bin/python3 -I - "$TTY" <<'PY' 2>/dev/null || true
 import re, serial, sys, time
@@ -86,7 +86,7 @@ s = serial.Serial(sys.argv[1], 115200, timeout=1)
 s.write(b"\n"); time.sleep(1); r = s.read(8192)
 if b"login:" in r:
     s.write(b"root\n"); time.sleep(1.5); s.read(8192)
-s.write(b"ip -4 -o addr show eth0\n"); time.sleep(1.5)
+s.write(b"ip -4 -o addr show scope global\n"); time.sleep(1.5)
 m = re.search(rb"inet (\d+\.\d+\.\d+\.\d+)/", s.read(8192))
 print(m.group(1).decode() if m else "")
 PY

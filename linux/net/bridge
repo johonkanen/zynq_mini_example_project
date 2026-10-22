@@ -1,0 +1,45 @@
+#!/bin/sh
+#
+# bridge - the br0 bridge over both Ethernet ports (linux/net/interfaces)
+#
+#   bridge up          create br0 (STP, 2 s forward delay, the board's fixed
+#                      MAC), add the ports that exist, install netplug as the
+#                      kernel's hotplug helper so eth1 joins when it appears
+#   bridge down        remove br0
+#   bridge port <if>   add one port (netplug calls this for eth1)
+#
+# MACs: br0 and eth0 use ETHADDR, eth1 ETHADDR1 (locally administered).
+# A second board needs its own: put ETHADDR=02:.. ETHADDR1=02:.. in
+# /etc/default/ethaddr.
+#
+ETHADDR=02:5a:4d:00:00:01
+ETHADDR1=02:5a:4d:00:00:02
+[ -r /etc/default/ethaddr ] && . /etc/default/ethaddr
+BR=br0
+
+port() {
+	[ -e /sys/class/net/$1 ] && [ -e /sys/class/net/$BR ] || return 0
+	[ "$1" = eth1 ] && ip link set dev eth1 address "$ETHADDR1" 2>/dev/null
+	ip link set dev "$1" master $BR && ip link set dev "$1" up &&
+		logger -t bridge "$1 joined $BR"
+}
+
+case "$1" in
+	up)
+		echo /usr/lib/zynq-mini/netplug > /proc/sys/kernel/hotplug
+		if [ ! -e /sys/class/net/$BR ]; then
+			ip link add name $BR type bridge || exit 1
+			echo 200 > /sys/class/net/$BR/bridge/forward_delay   # centiseconds; 2 s is the STP minimum
+			echo 1 > /sys/class/net/$BR/bridge/stp_state
+			ip link set dev $BR address "$ETHADDR"
+		fi
+		for p in eth0 eth1; do port $p; done
+		ip link set dev $BR up ;;
+	down)
+		[ -e /sys/class/net/$BR ] && ip link set dev $BR down && ip link del $BR
+		exit 0 ;;
+	port)
+		port "$2" ;;
+	*)
+		echo "usage: $0 up | down | port <interface>" >&2; exit 2 ;;
+esac

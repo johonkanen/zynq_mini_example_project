@@ -8,11 +8,16 @@
 --     m_axi_o : out axi_mosi_t   -- PS master output  (AW/W/AR + B/R ready)
 --     m_axi_i : in  axi_miso_t   -- PS master input   (ready + B/R channels)
 --
--- plus the PL clock/reset and the physical DDR / FIXED_IO pins.
+-- plus the PL clock/reset, the physical DDR / FIXED_IO pins, and the RGMII +
+-- MDIO pins of the second Ethernet (GEM1 -> gmii_to_rgmii inside the BD). The
+-- BD gives MDIO as _i/_o/_t; the pad buffer is here, as make_wrapper would add.
 -------------------------------------------------------------------------------
 
 library ieee;
 use ieee.std_logic_1164.all;
+
+library unisim;
+use unisim.vcomponents.all;
 
 use work.axi_pkg.all;
 
@@ -25,6 +30,16 @@ entity zynq_ps_wrapper is
         -- M_AXI_GP0 as direction records
         m_axi_o           : out   axi_mosi_t;  -- master -> fabric
         m_axi_i           : in    axi_miso_t;  -- fabric -> master
+
+        -- second Ethernet: RTL8211E on PL pins (RGMII + MDIO)
+        rgmii_td          : out   std_logic_vector(3 downto 0);
+        rgmii_tx_ctl      : out   std_logic;
+        rgmii_txc         : out   std_logic;
+        rgmii_rd          : in    std_logic_vector(3 downto 0);
+        rgmii_rx_ctl      : in    std_logic;
+        rgmii_rxc         : in    std_logic;
+        mdio_mdc          : out   std_logic;
+        mdio_io           : inout std_logic;
 
         -- physical device pins (constrained automatically by the PS7 IP)
         DDR_addr          : inout std_logic_vector(14 downto 0);
@@ -78,6 +93,16 @@ architecture rtl of zynq_ps_wrapper is
             FIXED_IO_ps_clk   : inout std_logic;
             FIXED_IO_ps_porb  : inout std_logic;
             FIXED_IO_ps_srstb : inout std_logic;
+            MDIO_PHY_mdc      : out   std_logic;
+            MDIO_PHY_mdio_i   : in    std_logic;
+            MDIO_PHY_mdio_o   : out   std_logic;
+            MDIO_PHY_mdio_t   : out   std_logic;
+            RGMII_rd          : in    std_logic_vector(3 downto 0);
+            RGMII_rx_ctl      : in    std_logic;
+            RGMII_rxc         : in    std_logic;
+            RGMII_td          : out   std_logic_vector(3 downto 0);
+            RGMII_tx_ctl      : out   std_logic;
+            RGMII_txc         : out   std_logic;
             M_AXI_GP0_araddr  : out   std_logic_vector(31 downto 0);
             M_AXI_GP0_arburst : out   std_logic_vector(1 downto 0);
             M_AXI_GP0_arcache : out   std_logic_vector(3 downto 0);
@@ -119,7 +144,12 @@ architecture rtl of zynq_ps_wrapper is
         );
     end component zynq_mini;
 
+    signal mdio_i, mdio_o, mdio_t : std_logic;
+
 begin
+
+    u_mdio_buf : IOBUF
+        port map (I => mdio_o, O => mdio_i, T => mdio_t, IO => mdio_io);
 
     u_bd : component zynq_mini
         port map (
@@ -146,6 +176,16 @@ begin
             FIXED_IO_ps_clk   => FIXED_IO_ps_clk,
             FIXED_IO_ps_porb  => FIXED_IO_ps_porb,
             FIXED_IO_ps_srstb => FIXED_IO_ps_srstb,
+            MDIO_PHY_mdc      => mdio_mdc,
+            MDIO_PHY_mdio_i   => mdio_i,
+            MDIO_PHY_mdio_o   => mdio_o,
+            MDIO_PHY_mdio_t   => mdio_t,
+            RGMII_rd          => rgmii_rd,
+            RGMII_rx_ctl      => rgmii_rx_ctl,
+            RGMII_rxc         => rgmii_rxc,
+            RGMII_td          => rgmii_td,
+            RGMII_tx_ctl      => rgmii_tx_ctl,
+            RGMII_txc         => rgmii_txc,
             -- master outputs  -> m_axi_o
             M_AXI_GP0_araddr  => m_axi_o.ar.addr,
             M_AXI_GP0_arburst => m_axi_o.ar.burst,

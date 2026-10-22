@@ -5,6 +5,8 @@
 #     |
 #     +-- M_AXI_GP0 ------------------> exposed on the BD boundary (raw AXI3)
 #     +-- FCLK_CLK0 / FCLK_RESET0_N --> exposed on the BD boundary
+#     +-- GEM1 (EMIO GMII + MDIO) ----> gmii_to_rgmii --> RGMII + MDIO_PHY on the
+#                                       BD boundary: the PL-side RTL8211E (eth1)
 #
 # There is NO AXI interconnect and NO packaged slave in the block design. The
 # M_AXI_GP0 AXI master is routed straight out to the fabric; src/hdl/axi_regs.vhd
@@ -55,6 +57,14 @@ set_property -dict [list \
     CONFIG.PCW_EN_CLK0_PORT                {1} \
     CONFIG.PCW_EN_RST0_PORT                {1} \
     CONFIG.PCW_FPGA0_PERIPHERAL_FREQMHZ    $FCLK0_MHZ \
+    CONFIG.PCW_ENET1_PERIPHERAL_ENABLE     {1} \
+    CONFIG.PCW_ENET1_ENET1_IO              {EMIO} \
+    CONFIG.PCW_ENET1_GRP_MDIO_ENABLE       {1} \
+    CONFIG.PCW_ENET1_GRP_MDIO_IO           {EMIO} \
+    CONFIG.PCW_ENET1_PERIPHERAL_CLKSRC     {IO PLL} \
+    CONFIG.PCW_ENET1_PERIPHERAL_FREQMHZ    {1000 Mbps} \
+    CONFIG.PCW_EN_CLK1_PORT                {1} \
+    CONFIG.PCW_FPGA1_PERIPHERAL_FREQMHZ    {200} \
 ] $ps
 
 # Make the fixed-IO / DDR pins external (they map to dedicated package balls).
@@ -92,6 +102,33 @@ _expose processing_system7_0/FCLK_RESET0_N -type rst FCLK_RESET0_N
 set_property CONFIG.FREQ_HZ        [expr {$FCLK0_MHZ * 1000000}] [get_bd_ports FCLK_CLK0]
 set_property CONFIG.ASSOCIATED_BUSIF {M_AXI_GP0}                 [get_bd_ports FCLK_CLK0]
 set_property CONFIG.POLARITY       ACTIVE_LOW                    [get_bd_ports FCLK_RESET0_N]
+
+#-----------------------------------------------------------------------------
+# 3b. Second Ethernet: GEM1 over EMIO -> Xilinx GMII-to-RGMII -> the RTL8211E
+#     on the PL pins (doc/notes.md). The converter makes its own 125/25/2.5 MHz
+#     clocks and its IDELAYCTRL from the 200 MHz FCLK_CLK1, and answers MDIO at
+#     address 8 (speed register) next to the PHY at address 1. Linux:
+#     linux/pl/zynq-mini-pl.dtso (gem1 + xlnx,gmii-to-rgmii-1.0).
+#-----------------------------------------------------------------------------
+set g2r [create_bd_cell -type ip -vlnv xilinx.com:ip:gmii_to_rgmii:4.1 gmii_to_rgmii_0]
+set_property -dict [list \
+    CONFIG.SupportLevel      {Include_Shared_Logic_in_Core} \
+    CONFIG.C_EXTERNAL_CLOCK  {false} \
+    CONFIG.C_USE_IDELAY_CTRL {true} \
+    CONFIG.C_PHYADDR         {8} \
+    CONFIG.RGMII_TXC_SKEW    {0} \
+] $g2r
+set g2r_rst [create_bd_cell -type ip -vlnv xilinx.com:ip:util_vector_logic:2.0 gmii_to_rgmii_rst]
+set_property -dict [list CONFIG.C_OPERATION {not} CONFIG.C_SIZE {1}] $g2r_rst
+
+connect_bd_intf_net [get_bd_intf_pins processing_system7_0/GMII_ETHERNET_1] [get_bd_intf_pins gmii_to_rgmii_0/GMII]
+connect_bd_intf_net [get_bd_intf_pins processing_system7_0/MDIO_ETHERNET_1] [get_bd_intf_pins gmii_to_rgmii_0/MDIO_GEM]
+connect_bd_net [get_bd_pins processing_system7_0/FCLK_CLK1] [get_bd_pins gmii_to_rgmii_0/clkin]
+connect_bd_net [get_bd_pins processing_system7_0/FCLK_RESET0_N] [get_bd_pins gmii_to_rgmii_rst/Op1]
+connect_bd_net [get_bd_pins gmii_to_rgmii_rst/Res] [get_bd_pins gmii_to_rgmii_0/tx_reset] \
+               [get_bd_pins gmii_to_rgmii_0/rx_reset]
+make_bd_intf_pins_external -name RGMII    [get_bd_intf_pins gmii_to_rgmii_0/RGMII]
+make_bd_intf_pins_external -name MDIO_PHY [get_bd_intf_pins gmii_to_rgmii_0/MDIO_PHY]
 
 #-----------------------------------------------------------------------------
 # 4. Record the M_AXI_GP0 window (0x4000_0000, 1 GB) in the address map so the

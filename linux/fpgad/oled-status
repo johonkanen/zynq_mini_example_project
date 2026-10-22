@@ -14,7 +14,7 @@ INTERVAL=${1:-2}
 trap 'kill $! 2>/dev/null; exit 0' TERM INT
 
 while :; do
-	ip=$(ip -4 -o addr show dev eth0 2>/dev/null | sed -n 's/.* inet \([0-9.]*\)\/.*/\1/p' | head -n 1)
+	ip=$(ip -4 -o addr show scope global 2>/dev/null | sed -n 's/.* inet \([0-9.]*\)\/.*/\1/p' | head -n 1)
 	t=$(fpgactl sensors 2>/dev/null | sed -n 's/.*"temp":\([-0-9.]*\).*/\1/p')
 	[ -n "$t" ] && t=$(awk -v t="$t" 'BEGIN { printf "%.1f", t }')
 	fpgactl oled 6 "${ip:-no network}" >/dev/null 2>&1

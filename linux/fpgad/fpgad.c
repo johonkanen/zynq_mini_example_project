@@ -16,6 +16,9 @@
  *     good design at the next start.
  *   - the hardware watchdog (/dev/watchdog) is kicked only after a register
  *     read returned, so a bus hang resets the board instead of needing JTAG
+ *   - a design that drops the PL Ethernet fails its trial: if eth1 (GEM1 through
+ *     the PL, a port of the br0 bridge) had a link before, it must have one again
+ *     within NET_WAIT_S - else someone connected through that port loses the board
  *
  * Protocol (one request line in, one response line out; text, '\n'-ended):
  *   ping                          -> ok pong
@@ -741,6 +744,29 @@ static void trial_clear(void)
     sync();
 }
 
+/* the PL Ethernet (linux/pl/zynq-mini-pl.dtso): eth1 exists only while a design
+ * with the GEM1 path is loaded */
+#define NET_IF      "eth1"
+#define NET_WAIT_S  20          /* overlay -> eth1 -> br0 port -> PHY autoneg */
+
+static int net_carrier(void)
+{
+    char v[8];
+    return !sim && read_sysfs("/sys/class/net/" NET_IF "/carrier", v, sizeof v) == 0 && !strcmp(v, "1");
+}
+
+/* wait for eth1's link without holding pl_lock: the watchdog thread must keep
+ * reading registers meanwhile */
+static int net_wait_carrier(void)
+{
+    for (int i = 0; i < NET_WAIT_S * 4 && !stopping; i++) {
+        if (net_carrier())
+            return 0;
+        usleep(250000);
+    }
+    return -1;
+}
+
 /* trial-load a new design; keep it if it passes, else reload the good one */
 static int pl_activate(const char *dir, char *err, size_t n)
 {
@@ -769,9 +795,20 @@ static int pl_activate(const char *dir, char *err, size_t n)
         }
     }
 
+    int net_was_up = net_carrier();
     pthread_rwlock_wrlock(&pl_lock);
     trial_mark(d.version);              /* a reset from here on means: back to good */
     int rc = load_design_locked(dir, err, n);
+    if (rc == 0 && net_was_up) {
+        pthread_rwlock_unlock(&pl_lock);
+        logmsg(LOG_INFO, "design %s: waiting for " NET_IF " to get its link back", d.version);
+        if (net_wait_carrier() < 0) {
+            snprintf(err, n, NET_IF " had a link before and has none %d s after loading the design "
+                     "(it dropped the PL Ethernet)", NET_WAIT_S);
+            rc = -1;
+        }
+        pthread_rwlock_wrlock(&pl_lock);
+    }
     if (rc == 0) {
         rc = keep_as_good(dir, err, n);
         trial_clear();

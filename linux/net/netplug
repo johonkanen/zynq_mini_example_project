@@ -1,0 +1,9 @@
+#!/bin/sh
+#
+# netplug - kernel hotplug helper (/proc/sys/kernel/hotplug, set by
+# /usr/lib/zynq-mini/bridge up). The kernel runs it for every uevent; it only
+# acts when eth1 appears - fpgad loaded an FPGA design whose overlay brings the
+# PL Ethernet (GEM1) - and puts it into br0. Device nodes are devtmpfs's job.
+#
+[ "$SUBSYSTEM" = net ] && [ "$ACTION" = add ] && [ "$INTERFACE" = eth1 ] || exit 0
+exec /usr/lib/zynq-mini/bridge port eth1

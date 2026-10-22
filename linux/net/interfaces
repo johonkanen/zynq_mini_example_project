@@ -1,0 +1,24 @@
+# /etc/network/interfaces (linux/net/interfaces in the repository)
+#
+# Both Ethernet ports are ports of the bridge br0, and the board's address
+# (DHCP) lives on br0: a cable in either port reaches the same board - same
+# MAC, same IP.
+#   eth0  PS GEM0 -> RTL8211E on the MIO pins; always there
+#   eth1  PS GEM1 -> PL (gmii_to_rgmii) -> RTL8211E on the PL pins; exists while
+#         fpgad has a design with the Ethernet path loaded, and netplug adds it
+#         to br0 whenever it appears
+# The bridge runs STP with a 2 s forward delay, so plugging both ports into the
+# same switch doesn't loop; a port forwards ~4 s after it comes up.
+#
+# udhcpc: a few tries at boot, then keeps trying in the background (-b), so a
+# cable plugged in later - or only in the PL port, which appears after fpgad has
+# loaded the FPGA - still gets an address.
+
+auto lo
+iface lo inet loopback
+
+auto br0
+iface br0 inet dhcp
+	pre-up /usr/lib/zynq-mini/bridge up
+	post-down /usr/lib/zynq-mini/bridge down
+	udhcpc_opts -b -t 4

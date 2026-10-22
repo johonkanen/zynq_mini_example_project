@@ -97,6 +97,10 @@ Habr review mentions.
 | `RGMII rd[0..3]` | `L20` `K19` `J18` `J20` |
 
 From `arm_fpga_09_pl_lwip` and `FPGA逻辑部分/fpga_14_eth_pl_mdio` (`rtl8211e_mdio.v`).
+PHY MDIO address **1** (`mdio_driver.v`: `PHY_ADDR = 5'b00001`).
+
+**In use:** GEM1 over EMIO → `gmii_to_rgmii` → these pins = Linux `eth1`, bridged with
+`eth0` (`doc/linux_build.md` §14). Constrained as `eth_*` in `src/constrs/zynq_mini.xdc`.
 
 ## OV5640 camera 0 (bank pins + EMIO SCCB)
 

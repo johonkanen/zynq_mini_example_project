@@ -698,6 +698,56 @@ the ramdisk rootfs once, streams `sdcard.img` onto the card and verifies it), or
 
 ---
 
+## 14. Two Ethernet ports, one address: the `br0` bridge
+
+The board has two RTL8211E PHYs. The cable can go into **either** port; the board has
+one MAC (`02:5a:4d:00:00:01`) and one DHCP address either way.
+
+| port | path | Linux |
+|---|---|---|
+| PS Ethernet | GEM0 → MIO 16–27 → RTL8211E (MDIO addr 0) | `eth0`, always there |
+| PL Ethernet | GEM1 → EMIO → Xilinx `gmii_to_rgmii` in the PL → RTL8211E on the PL pins (MDIO addr 1; converter at addr 8) | `eth1`, while an FPGA design with the Ethernet path is loaded |
+
+- **FPGA side** (`scripts/create_bd.tcl`, `zynq_ps_wrapper.vhd`, `zynq_mini_top.vhd`,
+  `zynq_mini.xdc`): GEM1 and its MDIO over EMIO, `gmii_to_rgmii` with its clocking and
+  IDELAYCTRL from FCLK_CLK1 (200 MHz), the PHY reset (G17) held 20 ms after the design
+  starts. The converter only creates a *virtual* RX clock for its input delays —
+  `zynq_mini.xdc` must define the real one on `eth_rgmii_rxc`, or the RX path isn't timed.
+  Enabling GEM1/FCLK1 changes `ps7_init`, i.e. the SPL (`build-linux.sh` rebuilds U-Boot
+  when the `.xsa` is newer than `boot.bin`).
+- **Device tree**: `gem1` is in the design's overlay (`linux/pl/zynq-mini-pl.dtso`), not in
+  the base DT — it can only work while the PL is configured. The overlay refers to
+  `&gem1`/`&clkc`, so the base dtb is built with symbols (`BR2_LINUX_KERNEL_DTB_OVERLAY_SUPPORT`);
+  PL bundles with this overlay need an image from this version on.
+- **Kernel** (`linux/kernel-net.config`): `XILINX_GMII2RGMII`, `BRIDGE`, `STP`.
+- **Network** (`linux/net/`): `interfaces` puts DHCP on `br0`; `bridge up` creates it (STP,
+  2 s forward delay, the fixed MAC) and adds the ports that exist; `netplug`, installed as the
+  kernel's hotplug helper, adds `eth1` whenever fpgad's overlay creates it (MAC
+  `02:5a:4d:00:00:02`). udhcpc keeps trying in the background, so a cable plugged in later
+  — or only in the PL port, which appears after fpgad has loaded the FPGA — still works.
+- **Safety** (fpgad): if `eth1` had a link before an FPGA update, the new design must bring
+  it back within 20 s, else the trial fails and the good design is reloaded — someone
+  connected through the PL port would otherwise lose the board.
+- Tools in the image: `iproute2` (`ip`, `bridge`), `ethtool`, `iperf3`.
+
+Measured on the board (2026-10-22, cable in the PL port, PC on the same LAN):
+
+| test | result |
+|---|---|
+| JTAG-booted ramdisk → `eth1` up, DHCP through the PL port | 1 Gb/s full duplex, `br0` = 192.168.1.211 |
+| iperf3 PC → board / board → PC | 553 / 474 Mbit/s (the Cortex-A9 is the limit); 0 FCS, symbol or alignment errors after ~1 GB |
+| `sdcard.img` written from the ramdisk over the PL port | 92 MB in 10 s, read-back md5 ok |
+| boot from the card | reachable through the PL port ~35 s after reset |
+| FPGA update while connected through the PL port | design kept after `eth1` relinked; 8 s outage, the SSH session survived |
+| design without the PL Ethernet | fpgad waited 20 s, reloaded the good design, `rauc install` reported the failure; 29 s outage |
+
+Harmless kernel messages: `unable to generate target frequency: 125000000 Hz` (GEM1's
+TX clock comes from the converter over EMIO, not from a PS divider), `invalid hw address,
+using random` (`bridge` sets the MAC), `xgmiitorgmii ... Couldn't find phydev` (a deferred
+probe; it binds once the PHY is registered).
+
+---
+
 ## Hardware notes (found on the board, 2026-10-06)
 
 ### Soft reboot after a failed boot: `MULTIBOOT_ADDR` (fixed)

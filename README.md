@@ -11,14 +11,15 @@ AXI slave written in VHDL.
 
 ```
    zynq_mini_top.vhd  (VHDL-2008, synthesis top)
-   |  entity ports = DDR_* + FIXED_IO_* only (auto-constrained by PS7)
+   |  entity ports = DDR_* + FIXED_IO_* (auto-constrained by PS7) + OLED, EXT IO, PL Ethernet
    |  internal PS<->PL bus = two record signals
    |
    +-- u_ps : zynq_ps_wrapper
-   |     |   +-- zynq_mini  <- generated block-design entity (PS7 only)
-   |     |         DDR3 (MT41J256M16, 512 MB)
+   |     |   +-- zynq_mini  <- generated block-design entity
+   |     |         PS7: DDR3 (MT41J256M16, 512 MB)
    |     |         Ethernet GEM0 (RGMII + MDIO) / QSPI x4 / SD1 eMMC /
    |     |         SD0 microSD / UART1 console
+   |     |         GEM1 (EMIO) -> gmii_to_rgmii -> PL-side RTL8211E (eth1)
    |     |
    |     +-- clk / resetn          (FCLK_CLK0 100 MHz / FCLK_RESET0_N)
    |     +-- m_axi_o : axi_mosi_t  \  raw M_AXI_GP0 (AXI3) packed into
@@ -45,7 +46,7 @@ mirror: [pvsm.ru/fpga/383315](https://www.pvsm.ru/fpga/383315)).
 | SoC | XC7Z020-CLG400, speed grade -2 |
 | DDR3 | 512 MB, MT41J256M16 (16-bit, 533 MHz) |
 | QSPI flash | 16 MB, socketed SOIC-8 |
-| Ethernet | **two** gigabit RTL8211E PHYs: one on **PS GEM0 / MIO 16–27** (MDIO 52–53, PHY addr 0), one wired to the **PL fabric** (RGMII) |
+| Ethernet | **two** gigabit RTL8211E PHYs: one on **PS GEM0 / MIO 16–27** (MDIO 52–53, PHY addr 0), one wired to the **PL fabric** (RGMII, PHY addr 1) — both used, bridged as `br0` (`doc/linux_build.md` §14) |
 | USB | host on USB-C, ULPI PHY |
 | storage | microSD (SDIO0) + on-board eMMC (SDIO1) |
 | video / display | HDMI direct from PL GPIO (no companion chip); 128×64 SSD1306 OLED on PL pins (4-wire SPI) — driven by `ssd1306_text` |
@@ -99,6 +100,8 @@ and its QMTech sibling, **including building Linux** — see [`doc/notes.md`](do
 | `linux/pl/zynq-mini-pl.dtso`  | the design's device-tree overlay (`axi_regs` UIO node), applied by fpgad with the bitstream |
 | `linux/rauc/`                 | RAUC `system.conf` and post-install handler for the board |
 | `linux/kernel-rauc.config`    | kernel config fragment RAUC needs (squashfs, dm-verity) |
+| `linux/kernel-net.config`     | kernel config fragment for the PL Ethernet (GMII-to-RGMII) and the bridge |
+| `linux/net/`                  | `br0` over both Ethernet ports: `interfaces`, `bridge`, `netplug` (hotplug helper adding `eth1`) — `doc/linux_build.md` §14 |
 | `linux/reflash-over-ssh.sh`   | write a new `sdcard.img` to a running board over the network (no JTAG) |
 | `linux/zynq-zynqmini.dts`     | kernel device tree for the board (used by `doc/linux_build.md`) |
 | `doc/mio_map.md`              | full PS MIO map of the board |

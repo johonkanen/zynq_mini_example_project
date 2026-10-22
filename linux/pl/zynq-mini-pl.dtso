@@ -12,6 +12,11 @@
  *   axi_regs: src/hdl/axi_regs.vhd at the base of M_AXI_GP0, 64 KB:
  *   registers at 0x0000, oscilloscope capture RAM at 0x8000-0xFFFF.
  *   generic-uio -> /dev/uioN (kernel arg uio_pdrv_genirq.of_id=generic-uio).
+ *
+ *   gem1: the second Ethernet. GEM1 runs over EMIO through the design's
+ *   gmii_to_rgmii converter (MDIO address 8) to the RTL8211E on the PL pins
+ *   (MDIO address 1). It exists only while this design is loaded: eth1, which
+ *   /usr/lib/zynq-mini/netplug adds to the br0 bridge next to eth0.
  */
 /dts-v1/;
 /plugin/;
@@ -24,5 +29,27 @@
 	axi_regs@40000000 {
 		compatible = "generic-uio";
 		reg = <0x40000000 0x10000>;
+	};
+};
+
+&gem1 {
+	status = "okay";
+	phy-mode = "gmii";			/* the MAC side; the converter makes RGMII */
+	phy-handle = <&pl_eth_phy>;
+
+	mdio {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		pl_eth_phy: ethernet-phy@1 {
+			reg = <1>;
+		};
+
+		gmii-to-rgmii@8 {
+			compatible = "xlnx,gmii-to-rgmii-1.0";
+			reg = <8>;
+			phy-handle = <&pl_eth_phy>;
+			clocks = <&clkc 16>;		/* FCLK1, 200 MHz: its IDELAYCTRL + clocks */
+		};
 	};
 };

@@ -11,10 +11,13 @@
 --     +-- u_oled : ssd1306_text     (128x64 OLED, text from axi_regs OLED_TEXT)
 --     +-- u_siggen : scope_siggen   (oscilloscope test signals)
 --     +-- u_scope : scope_capture   (4-channel triggered capture, read via axi_regs)
+--     +-- u_hrpwm : hrpwm           (high-resolution PWM on the EXT IO header)
+--     +-- PL Ethernet PHY reset     (the RGMII/MDIO path itself is in the BD: eth1)
 --     +-- placeholder PL user logic
 --
 -- Entity ports = the physical device pins: DDR_* + FIXED_IO_* (constrained
--- automatically by the PS7 IP) and the OLED pins (src/constrs/zynq_mini.xdc).
+-- automatically by the PS7 IP), the OLED, EXT IO header and PL Ethernet pins
+-- (src/constrs/zynq_mini.xdc).
 -------------------------------------------------------------------------------
 
 library ieee;
@@ -61,7 +64,18 @@ entity zynq_mini_top is
         -- and 40 are power. Pins 17/15/14/18 (scope CH1..CH4) carry the high-resolution
         -- PWM test (hrpwm); the others the identification test: pin n toggles at n*10 kHz.
         ext_lo            : out std_logic_vector(18 downto 2);
-        ext_hi            : out std_logic_vector(39 downto 23)
+        ext_hi            : out std_logic_vector(39 downto 23);
+
+        -- second Ethernet: RTL8211E on PL pins (GEM1 via gmii_to_rgmii -> eth1)
+        eth_rgmii_td      : out   std_logic_vector(3 downto 0);
+        eth_rgmii_tx_ctl  : out   std_logic;
+        eth_rgmii_txc     : out   std_logic;
+        eth_rgmii_rd      : in    std_logic_vector(3 downto 0);
+        eth_rgmii_rx_ctl  : in    std_logic;
+        eth_rgmii_rxc     : in    std_logic;
+        eth_mdc           : out   std_logic;
+        eth_mdio          : inout std_logic;
+        eth_phy_rst_n     : out   std_logic
     );
 end entity zynq_mini_top;
 
@@ -96,6 +110,10 @@ architecture rtl of zynq_mini_top is
     signal scope_in       : sample_array_t := (others => (others => '0'));
     signal ext_in         : sample_array_t := (others => (others => '0'));  -- for an ADC later
 
+    -- PL Ethernet PHY reset: held after configuration, then released
+    constant PHY_RESET_CLKS : natural := 2_000_000;           -- 20 ms at 100 MHz (>= 10 ms)
+    signal phy_rst_cnt : natural range 0 to PHY_RESET_CLKS := 0;
+
     -- ===== placeholder PL user logic ====================================
     signal heartbeat  : unsigned(27 downto 0) := (others => '0');
     signal user_probe : std_logic_vector(31 downto 0);
@@ -113,6 +131,14 @@ begin
             resetn            => resetn,
             m_axi_o           => ps_axi_o,
             m_axi_i           => ps_axi_i,
+            rgmii_td          => eth_rgmii_td,
+            rgmii_tx_ctl      => eth_rgmii_tx_ctl,
+            rgmii_txc         => eth_rgmii_txc,
+            rgmii_rd          => eth_rgmii_rd,
+            rgmii_rx_ctl      => eth_rgmii_rx_ctl,
+            rgmii_rxc         => eth_rgmii_rxc,
+            mdio_mdc          => eth_mdc,
+            mdio_io           => eth_mdio,
             DDR_addr          => DDR_addr,
             DDR_ba            => DDR_ba,
             DDR_cas_n         => DDR_cas_n,
@@ -232,6 +258,21 @@ begin
             rd_addr => scope_rd_addr,
             rd_data => scope_rd_data
         );
+
+    ---------------------------------------------------------------------------
+    -- PL Ethernet PHY: the RTL8211E's reset pin is wired to the PL (G17); keep it
+    -- in reset for 20 ms after the design starts, then let it run. Not tied to
+    -- FCLK_RESET0_N, so a PS-side PL reset doesn't drop the link.
+    ---------------------------------------------------------------------------
+    phy_reset_proc : process (clk)
+    begin
+        if rising_edge(clk) then
+            if phy_rst_cnt /= PHY_RESET_CLKS then
+                phy_rst_cnt <= phy_rst_cnt + 1;
+            end if;
+        end if;
+    end process;
+    eth_phy_rst_n <= '1' when phy_rst_cnt = PHY_RESET_CLKS else '0';
 
     ---------------------------------------------------------------------------
     -- placeholder PL user logic - replace it

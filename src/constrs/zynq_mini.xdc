@@ -1,8 +1,9 @@
 #-----------------------------------------------------------------------------
 # zynq_mini.xdc  -  "Zynq Mini" board (xc7z020clg400-2)
 #
-# The only external PL I/O in use is the SSD1306 OLED (ssd1306_text); every
-# other block below is commented out.
+# PL I/O in use: the SSD1306 OLED, the 40-pin EXT IO header (hrpwm + pin
+# identification pattern) and the PL-side Ethernet PHY (eth1); the commented-out
+# blocks are the rest of the board's PL pinout.
 #
 #   * DDR3 and the MIO peripherals (GEM0 RGMII, QSPI, eMMC/SD1, microSD/SD0,
 #     UART1) use dedicated Zynq balls and are constrained automatically by the
@@ -84,20 +85,28 @@ set_false_path -to [get_cells -hierarchical -filter {NAME =~ *u_hrpwm/f_meta_reg
 # set_property -dict {PACKAGE_PIN E18 IOSTANDARD LVCMOS33} [get_ports hdmi_hpd]   ;# E18 = OLED_D0 too
 
 ## --- 2nd Gigabit Ethernet: RTL8211E on the PL (RGMII) --------------------
-# set_property -dict {PACKAGE_PIN G18 IOSTANDARD LVCMOS33} [get_ports pl_eth_mdc]
-# set_property -dict {PACKAGE_PIN G19 IOSTANDARD LVCMOS33} [get_ports pl_eth_mdio]
-# set_property -dict {PACKAGE_PIN G17 IOSTANDARD LVCMOS33} [get_ports pl_eth_rst_n]
-# set_property -dict {PACKAGE_PIN J14 IOSTANDARD LVCMOS33} [get_ports pl_eth_txc]
-# set_property -dict {PACKAGE_PIN K14 IOSTANDARD LVCMOS33} [get_ports pl_eth_tx_ctl]
-# set_property -dict {PACKAGE_PIN N16 IOSTANDARD LVCMOS33} [get_ports {pl_eth_td[0]}]
-# set_property -dict {PACKAGE_PIN J19 IOSTANDARD LVCMOS33} [get_ports {pl_eth_td[1]}]
-# set_property -dict {PACKAGE_PIN H20 IOSTANDARD LVCMOS33} [get_ports {pl_eth_td[2]}]
-# set_property -dict {PACKAGE_PIN N15 IOSTANDARD LVCMOS33} [get_ports {pl_eth_td[3]}]
-# set_property -dict {PACKAGE_PIN L16 IOSTANDARD LVCMOS33} [get_ports pl_eth_rxc]
-# set_property -dict {PACKAGE_PIN L17 IOSTANDARD LVCMOS33} [get_ports pl_eth_rx_ctl]
-# set_property -dict {PACKAGE_PIN L20 IOSTANDARD LVCMOS33} [get_ports {pl_eth_rd[0]}]
-# set_property -dict {PACKAGE_PIN K19 IOSTANDARD LVCMOS33} [get_ports {pl_eth_rd[1]}]
-# set_property -dict {PACKAGE_PIN J18 IOSTANDARD LVCMOS33} [get_ports {pl_eth_rd[2]}]
-# set_property -dict {PACKAGE_PIN J20 IOSTANDARD LVCMOS33} [get_ports {pl_eth_rd[3]}]
+# GEM1 (EMIO) -> gmii_to_rgmii in the block design -> these pins; Linux eth1.
+# The converter IP brings the RGMII IO timing (input delays against a virtual
+# clock, the forwarded TX clock), but expects the design to define the receive
+# clock on the RXC pin - without this the RX path is not timed at all.
+create_clock -name eth_rgmii_rxc -period 8.000 [get_ports eth_rgmii_rxc]
+set_property -dict {PACKAGE_PIN G18 IOSTANDARD LVCMOS33} [get_ports eth_mdc]
+set_property -dict {PACKAGE_PIN G19 IOSTANDARD LVCMOS33} [get_ports eth_mdio]
+set_property -dict {PACKAGE_PIN G17 IOSTANDARD LVCMOS33} [get_ports eth_phy_rst_n]
+set_property -dict {PACKAGE_PIN J14 IOSTANDARD LVCMOS33} [get_ports eth_rgmii_txc]
+set_property -dict {PACKAGE_PIN K14 IOSTANDARD LVCMOS33} [get_ports eth_rgmii_tx_ctl]
+set_property -dict {PACKAGE_PIN N16 IOSTANDARD LVCMOS33} [get_ports {eth_rgmii_td[0]}]
+set_property -dict {PACKAGE_PIN J19 IOSTANDARD LVCMOS33} [get_ports {eth_rgmii_td[1]}]
+set_property -dict {PACKAGE_PIN H20 IOSTANDARD LVCMOS33} [get_ports {eth_rgmii_td[2]}]
+set_property -dict {PACKAGE_PIN N15 IOSTANDARD LVCMOS33} [get_ports {eth_rgmii_td[3]}]
+set_property -dict {PACKAGE_PIN L16 IOSTANDARD LVCMOS33} [get_ports eth_rgmii_rxc]
+set_property -dict {PACKAGE_PIN L17 IOSTANDARD LVCMOS33} [get_ports eth_rgmii_rx_ctl]
+set_property -dict {PACKAGE_PIN L20 IOSTANDARD LVCMOS33} [get_ports {eth_rgmii_rd[0]}]
+set_property -dict {PACKAGE_PIN K19 IOSTANDARD LVCMOS33} [get_ports {eth_rgmii_rd[1]}]
+set_property -dict {PACKAGE_PIN J18 IOSTANDARD LVCMOS33} [get_ports {eth_rgmii_rd[2]}]
+set_property -dict {PACKAGE_PIN J20 IOSTANDARD LVCMOS33} [get_ports {eth_rgmii_rd[3]}]
+# MDC (2.5 MHz from the GEM) and the PHY reset: slow, no timing relationship
+set_false_path -to [get_ports {eth_mdc eth_mdio eth_phy_rst_n}]
+set_false_path -from [get_ports eth_mdio]
 
 # OV5640 camera pins: see ../../doc/board_pinout.md
