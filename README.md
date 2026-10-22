@@ -109,6 +109,8 @@ and its QMTech sibling, **including building Linux** — see [`doc/notes.md`](do
 | `doc/notes.md`                | board details, Linux-boot resources (Habr series), `axi_regs` from Linux |
 | `doc/linux_build.md`          | step-by-step: build a bootable SD-card Linux image with Buildroot |
 | `doc/network_update.md`       | **plan + design for network updates** of FPGA, Linux and software (RAUC, signed, no JTAG) |
+| `doc/hvhdl_ethernet.md`       | **plan** for a PL Ethernet MAC from hVHDL_gigabit_ethernet |
+| `src/hVHDL_gigabit_ethernet/` | git submodule: [hVHDL_gigabit_ethernet](https://github.com/hVHDL/hVHDL_gigabit_ethernet) (RGMII MAC, VHDL) — clone with `--recurse-submodules`, or `git submodule update --init` |
 
 `build/` and `output/` are generated and git-ignored. Everything is VHDL-2008.
 
