@@ -129,7 +129,8 @@ build.bat gui        :: create the project and open the Vivado GUI
 ```
 
 **PL Ethernet variant:** `PL_ETH=hvhdl ./build.sh` builds the design with
-hVHDL_gigabit_ethernet's MAC on the PL-side PHY instead of GEM1 (Linux `eth1`); the
+hVHDL_gigabit_ethernet's MAC on the PL-side PHY instead of GEM1 (Linux `eth1`), and
+`PL_ETH=shared ./build.sh` with both on that port, each with its own address; the
 default is `PL_ETH=gem1` (see `doc/hvhdl_ethernet.md`).
 
 Linux/WSL: `./build.sh [bd|synth|impl|gui]`. Direct:

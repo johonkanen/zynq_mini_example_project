@@ -8,6 +8,9 @@
 #   bridge down        remove br0
 #   bridge port <if>   add one port (netplug calls this for eth1)
 #
+# A port whose device-tree node has zynq-mini,gigabit-only (the PL_ETH = shared
+# design's eth1, linux/pl/zynq-mini-pl-shared.dtso) advertises 1000BASE-T alone.
+#
 # MACs: br0 and eth0 use ETHADDR, eth1 ETHADDR1 (locally administered).
 # A second board needs its own: put ETHADDR=02:.. ETHADDR1=02:.. in
 # /etc/default/ethaddr.
@@ -22,6 +25,9 @@ port() {
 	[ "$1" = eth1 ] && ip link set dev eth1 address "$ETHADDR1" 2>/dev/null
 	ip link set dev "$1" master $BR && ip link set dev "$1" up &&
 		logger -t bridge "$1 joined $BR"
+	if [ -e /sys/class/net/$1/device/of_node/zynq-mini,gigabit-only ]; then
+		ethtool -s "$1" advertise 0x020 && logger -t bridge "$1: 1000BASE-T only"
+	fi
 }
 
 case "$1" in

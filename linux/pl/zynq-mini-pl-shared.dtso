@@ -1,0 +1,53 @@
+// SPDX-License-Identifier: MIT
+/*
+ * zynq-mini-pl-shared.dtso - the Linux view of this FPGA design, as a device-tree
+ * overlay for the base DT's fpga-region (zynq-7000.dtsi).
+ *
+ * Applying it (fpgad, via /sys/kernel/config/device-tree/overlays) makes the
+ * kernel program the PL from /lib/firmware/<firmware-name> first, then create
+ * the nodes below. Removing it unbinds them before the next design goes in.
+ * Ships inside the PL bundle next to the bitstream (linux/make-pl-bundle.sh),
+ * so a design with another register window brings its own.
+ *
+ *   axi_regs: src/hdl/axi_regs.vhd at the base of M_AXI_GP0, 64 KB:
+ *   registers at 0x0000, oscilloscope capture RAM at 0x8000-0xFFFF.
+ *   generic-uio -> /dev/uioN (kernel arg uio_pdrv_genirq.of_id=generic-uio).
+ *
+ *   This is the PL_ETH = shared build (scripts/config.tcl): the PL-side PHY is
+ *   shared by GEM1 and the MAC in the PL (src/hdl/eth_mac.vhd) at the GMII
+ *   level, doc/hvhdl_ethernet.md phase 5. GEM1's GMII goes over EMIO straight
+ *   into eth_mac - no converter - and its MDIO to the PHY (address 1). eth1, as
+ *   in the default build, joins br0 (/usr/lib/zynq-mini/netplug).
+ *
+ *   The PL MAC is gigabit only, so the port is: zynq-mini,gigabit-only makes
+ *   /usr/lib/zynq-mini/bridge advertise 1000BASE-T alone on eth1.
+ */
+/dts-v1/;
+/plugin/;
+
+&{/fpga-region} {
+	firmware-name = "zynq-mini-pl.bit.bin";
+	#address-cells = <1>;
+	#size-cells = <1>;
+
+	axi_regs@40000000 {
+		compatible = "generic-uio";
+		reg = <0x40000000 0x10000>;
+	};
+};
+
+&gem1 {
+	status = "okay";
+	phy-mode = "gmii";			/* the MAC side; eth_mac makes RGMII */
+	phy-handle = <&pl_eth_phy>;
+	zynq-mini,gigabit-only;
+
+	mdio {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		pl_eth_phy: ethernet-phy@1 {
+			reg = <1>;
+		};
+	};
+};

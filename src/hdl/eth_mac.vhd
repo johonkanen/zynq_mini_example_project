@@ -37,6 +37,13 @@
 --     0x21C  UDP user port (RW)   0x220  last stream's clocks, 8 ns   0x224  its datagrams
 --     0x228  datagrams to the user port
 --   MDIO: the MAC's, on the PHY's pins (the PHY keeps its power-on settings)
+--
+-- SHARE_PORT (PL_ETH = shared, doc/hvhdl_ethernet.md phase 5): the port is shared
+-- with GEM1 = Linux eth1 at the GMII level - ethernet_mac's g_shared_port: GEM1
+-- gets every received frame (gem_rx_*, on the receive clock) and its frames go
+-- onto the line between ours through a FIFO (gem_tx_*, on our 125 MHz clock,
+-- which is GEM1's transmit clock). Each MAC filters for its own address. MDIO
+-- is then GEM1's (Linux phylib), on the same pins.
 -------------------------------------------------------------------------------
 
 library ieee;
@@ -55,7 +62,8 @@ entity eth_mac is
         IP_ADDR   : std_logic_vector(31 downto 0) := x"C0A8140A";       -- 192.168.20.10 after reset
         UDP_PORT  : std_logic_vector(15 downto 0) := x"0007";           -- the echo port after reset
         UDP_USER_PORT : std_logic_vector(15 downto 0) := x"1388";       -- 5000: the application
-        ETHERTYPE : std_logic_vector(15 downto 0) := x"88B5"            -- IEEE local experimental
+        ETHERTYPE : std_logic_vector(15 downto 0) := x"88B5";           -- IEEE local experimental
+        SHARE_PORT : boolean := false                                       -- the port shared with GEM1
     );
     port (
         clk          : in    std_logic;                     -- 100 MHz, makes the 125 MHz MAC clock
@@ -67,6 +75,19 @@ entity eth_mac is
         rgmii_tx_ctl : out   std_logic;
         mdc          : out   std_logic;
         mdio         : inout std_logic;
+        -- GEM1's GMII and MDIO (SHARE_PORT)
+        gem_tx_clk   : out   std_logic;
+        gem_txd      : in    std_logic_vector(7 downto 0) := (others => '0');
+        gem_tx_en    : in    std_logic := '0';
+        gem_tx_er    : in    std_logic := '0';
+        gem_rx_clk   : out   std_logic;
+        gem_rxd      : out   std_logic_vector(7 downto 0);
+        gem_rx_dv    : out   std_logic;
+        gem_rx_er    : out   std_logic;
+        gem_mdc      : in    std_logic := '0';
+        gem_mdio_o   : in    std_logic := '0';
+        gem_mdio_t   : in    std_logic := '1';
+        gem_mdio_i   : out   std_logic;
         -- the PS's access (axi_regs ETH window): address, write and data are held
         -- from the request toggle until the acknowledge toggle
         bus_req      : in    std_logic;
@@ -186,6 +207,8 @@ architecture rtl of eth_mac is
     signal m_tdata  : std_logic_vector(7 downto 0);
     signal rgmii_rx_in, rgmii_tx_out, tx_clock_out : rgmii_ddio_record;
     signal mdio_out, mdio_oe, mdio_in, mdio_t : std_logic;
+    signal mac_mdc, pin_mdio_o, pin_mdio_t : std_logic;
+    signal gem_tx, gem_rx : gmii_record := gmii_idle;
 
     -- an address with its first byte (on the wire) in bits 7:0, as hVHDL_gigabit_ethernet takes it
     function byte_0_low(v : std_logic_vector) return std_logic_vector is
@@ -231,6 +254,7 @@ begin
     -- the MAC
     ---------------------------------------------------------------------------
     u_mac : entity hvhdl_ethernet.ethernet_mac
+        generic map (g_shared_port => SHARE_PORT)
         port map (
             clock        => tx_clk,
             reset        => reset,
@@ -255,11 +279,28 @@ begin
             rgmii_rx_in  => rgmii_rx_in,
             rgmii_tx_out => rgmii_tx_out,
             tx_clock_out => tx_clock_out,
-            mdc          => mdc,
+            mdc          => mac_mdc,
             mdio_out     => mdio_out,
             mdio_oe      => mdio_oe,
-            mdio_in      => mdio_in
+            mdio_in      => mdio_in,
+            share_tx_in  => gem_tx,
+            share_rx_out => gem_rx
         );
+
+    -- GEM1's GMII: its transmit registered once on the way in (the PS's EMIO
+    -- outputs on our clock), its receive straight from rgmii_rx's registers
+    gem_tx_clk <= tx_clk;
+    gem_rx_clk <= rx_clk;
+    gem_rxd    <= gem_rx.data;
+    gem_rx_dv  <= '1' when gem_rx.is_valid else '0';
+    gem_rx_er  <= '1' when gem_rx.is_error else '0';
+
+    process (tx_clk)
+    begin
+        if rising_edge(tx_clk) then
+            gem_tx <= (data => gem_txd, is_valid => gem_tx_en = '1', is_error => gem_tx_er = '1');
+        end if;
+    end process;
 
     u_rx_io : entity work.rgmii_rx_xilinx
         port map (rxc => rgmii_rxc, rxd => rgmii_rd, rx_ctl => rgmii_rx_ctl, rx_clk => rx_clk,
@@ -269,8 +310,13 @@ begin
         port map (clk => tx_clk, ddio => rgmii_tx_out, tx_clock => tx_clock_out, txc => rgmii_txc,
                   txd => rgmii_td, tx_ctl => rgmii_tx_ctl);
 
-    mdio_t <= not mdio_oe;
-    u_mdio_buf : IOBUF port map (I => mdio_out, O => mdio_in, T => mdio_t, IO => mdio);
+    -- MDIO on the pins: ours, or GEM1's when the port is shared
+    mdio_t     <= not mdio_oe;
+    mdc        <= gem_mdc when SHARE_PORT else mac_mdc;
+    pin_mdio_o <= gem_mdio_o when SHARE_PORT else mdio_out;
+    pin_mdio_t <= gem_mdio_t when SHARE_PORT else mdio_t;
+    u_mdio_buf : IOBUF port map (I => pin_mdio_o, O => mdio_in, T => pin_mdio_t, IO => mdio);
+    gem_mdio_i <= mdio_in;
 
     -- APB master: the set-up after reset first, then the PS's accesses (setup
     -- clock, then access until pready - which ethernet_mac always gives)

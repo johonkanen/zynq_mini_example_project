@@ -6,6 +6,9 @@
 -- set up over APB here, on a clock 500 ppm off 125 MHz (so nothing is
 -- accidentally synchronous). PHY models: data through, RXC 2 ns late (RTL8211E,
 -- RGMII-ID); an optional bit flip on the wire spoils a frame's FCS.
+-- share_port (a config of its own test in sim/run.py): eth_mac shares the port
+-- with a GEM1 model on its GMII side, which sends frames with their FCS and
+-- counts the frames it is given.
 -------------------------------------------------------------------------------
 
 library ieee;
@@ -19,7 +22,7 @@ library hvhdl_ethernet;
 use hvhdl_ethernet.ethernet_pkg.all;
 
 entity tb_eth_mac is
-    generic (runner_cfg : string);
+    generic (runner_cfg : string; share_port : boolean := false);
 end entity;
 
 architecture sim of tb_eth_mac is
@@ -27,6 +30,7 @@ architecture sim of tb_eth_mac is
     constant MAC     : std_logic_vector(47 downto 0) := x"025A4D000010";   -- the DUT's
     constant PC_MAC  : std_logic_vector(47 downto 0) := x"001122334455";
     constant OTHER   : std_logic_vector(47 downto 0) := x"025A4D000099";
+    constant GEM_MAC : std_logic_vector(47 downto 0) := x"025A4D000002";   -- GEM1 = eth1's
     constant IP      : std_logic_vector(31 downto 0) := x"C0A8140A";       -- the DUT's, 192.168.20.10
     constant PC_IP   : std_logic_vector(31 downto 0) := x"C0A81419";       -- 192.168.20.25
     constant T_PC    : time := 8.004 ns;
@@ -77,6 +81,14 @@ architecture sim of tb_eth_mac is
     signal scope_done : std_logic := '1';
     constant SCOPE_START : natural := 4000;                -- the capture wraps the RAM's end
 
+    -- GEM1's GMII (share_port)
+    signal gem_tx_clk, gem_rx_clk, gem_rx_dv : std_logic;
+    signal gem_txd : std_logic_vector(7 downto 0) := (others => '0');
+    signal gem_tx_en : std_logic := '0';
+    signal gem_rxd : std_logic_vector(7 downto 0);
+    signal gem_frames, gem_length : natural := 0;    -- frames to send, their length without FCS
+    signal gem_received : natural := 0;              -- frames given to it, with preamble and SFD
+
     -- what the PC received
     signal rx_bytes  : bytes_t(0 to 65535);
     signal rx_count  : natural := 0;
@@ -93,7 +105,7 @@ begin
     -- DUT
     ---------------------------------------------------------------------------
     dut : entity work.eth_mac
-        generic map (MAC_ADDR => MAC)
+        generic map (MAC_ADDR => MAC, SHARE_PORT => share_port)
         port map (clk => clk100, rgmii_rxc => mac_rxc, rgmii_rd => mac_rxd, rgmii_rx_ctl => mac_rx_ctl,
                   rgmii_txc => mac_txc, rgmii_td => mac_txd, rgmii_tx_ctl => mac_tx_ctl,
                   mdc => mac_mdc, mdio => mdio, bus_req => bus_req, bus_write => bus_write,
@@ -102,8 +114,75 @@ begin
                   reg_rdata => reg_rdata, reg_ack => reg_ack, scope_clk => scope_clk, scope_addr => scope_addr,
                   scope_data => scope_data, scope_done => scope_done,
                   scope_start => to_unsigned(SCOPE_START, 12),
-                  echoed => echoed, ignored => ignored);
+                  echoed => echoed, ignored => ignored,
+                  gem_tx_clk => gem_tx_clk, gem_txd => gem_txd, gem_tx_en => gem_tx_en,
+                  gem_rx_clk => gem_rx_clk, gem_rxd => gem_rxd, gem_rx_dv => gem_rx_dv);
     mdio <= 'H';
+
+    -- GEM1: gem_frames frames from GEM_MAC to the PC, EtherType 0x88B6, byte i of
+    -- frame k = (k + i) mod 256 after the header, back to back on its clock
+    gem_tx : process
+        variable crc : std_logic_vector(31 downto 0);
+        variable b   : std_logic_vector(7 downto 0);
+    begin
+        wait until gem_frames > 0;
+        for k in 0 to gem_frames - 1 loop
+            for i in 0 to 7 loop
+                wait until rising_edge(gem_tx_clk);
+                gem_tx_en <= '1';
+                gem_txd   <= preamble_byte when i < 7 else start_of_frame_byte;
+            end loop;
+            crc := crc32_init;
+            for i in 0 to gem_length - 1 loop
+                if i < 6 then
+                    b := PC_MAC(47 - 8 * i downto 40 - 8 * i);
+                elsif i < 12 then
+                    b := GEM_MAC(47 - 8 * (i - 6) downto 40 - 8 * (i - 6));
+                elsif i = 12 then
+                    b := x"88";
+                elsif i = 13 then
+                    b := x"B6";
+                else
+                    b := std_logic_vector(to_unsigned((k + i) mod 256, 8));
+                end if;
+                wait until rising_edge(gem_tx_clk);
+                gem_txd <= b;
+                crc := next_crc32(crc, b);
+            end loop;
+            for i in 0 to 3 loop
+                wait until rising_edge(gem_tx_clk);
+                gem_txd <= fcs_byte(crc, i);
+            end loop;
+            wait until rising_edge(gem_tx_clk);
+            gem_tx_en <= '0';
+            for i in 1 to 11 loop
+                wait until rising_edge(gem_tx_clk);
+            end loop;
+        end loop;
+        wait;
+    end process;
+
+    gem_rx : process (gem_rx_clk)
+        variable n : natural := 0;
+        variable ok : boolean := true;
+    begin
+        if rising_edge(gem_rx_clk) then
+            if gem_rx_dv = '1' then
+                if n < 7 then
+                    ok := ok and gem_rxd = preamble_byte;
+                elsif n = 7 then
+                    ok := ok and gem_rxd = start_of_frame_byte;
+                end if;
+                n := n + 1;
+            elsif n > 0 then
+                if ok then
+                    gem_received <= gem_received + 1;
+                end if;
+                n  := 0;
+                ok := true;
+            end if;
+        end if;
+    end process;
 
     -- the register file (as axi_regs' udp_* port, in its own clock)
     reg_clk <= not reg_clk after 5 ns;
@@ -422,6 +501,7 @@ begin
         variable fu : bytes_t(0 to 63);                    -- 14 + 20 + 8 + 22
         variable g  : bytes_t(0 to 73);
         variable prev_end : natural;
+        variable n_fpga, n_gem : natural;
         variable f1 : bytes_t(0 to 59);
         variable f2 : bytes_t(0 to 99);
         variable fl : bytes_t(0 to 1513);
@@ -666,6 +746,42 @@ begin
                 wait until rx_frames = 1 for 30 us;
                 g(0 to 59) := received(0, 60);
                 check_equal(get(g, 42, 8), std_logic_vector'(x"04FF000000000000"), "error reply");
+
+            elsif run("shared port: GEM1's frames and a stream at the same time") then
+                -- the FPGA streams 20 x 1000 bytes while GEM1 sends 20 frames back to back:
+                -- the PC gets all 40, whole
+                send(udp_payload_frame(IP, x"1388", (x"01", x"00", x"00", x"00", x"14", x"03", x"E8")));
+                gem_length <= 300;
+                gem_frames <= 20;
+                wait until rx_frames = 40 for 600 us;
+                check_equal(rx_frames, 40, "frames at the PC");
+                check(gem_received >= 1, "GEM1 was given the PC's frame");
+                n_fpga := 0;
+                n_gem  := 0;
+                prev_end := 0;
+                for n in 0 to rx_frames - 1 loop
+                    fi := received(n, 74);
+                    if get(fi, 6, 6) = GEM_MAC then
+                        check_equal(rx_ends(n) - prev_end, 300, "GEM1's frame length");
+                        for i in 14 to 73 loop
+                            check_equal(fi(i), std_logic_vector(to_unsigned((n_gem + i) mod 256, 8)),
+                                        "GEM1's frame " & integer'image(n_gem) & " byte " & integer'image(i));
+                        end loop;
+                        n_gem := n_gem + 1;
+                    else
+                        check_equal(get(fi, 6, 6), MAC, "from the FPGA");
+                        check_equal(rx_ends(n) - prev_end, 1042, "42 + 1000 bytes");
+                        check_equal(get(fi, 42, 4), std_logic_vector(to_unsigned(n_fpga, 32)), "sequence number");
+                        n_fpga := n_fpga + 1;
+                    end if;
+                    prev_end := rx_ends(n);
+                end loop;
+                check_equal(n_gem, 20, "GEM1's frames");
+                check_equal(n_fpga, 20, "the FPGA's datagrams");
+                bus_access(16#180#, '0', x"00000000", r);
+                check_equal(to_integer(unsigned(r)), 20, "GEM1's frames sent (0x180)");
+                bus_access(16#184#, '0', x"00000000", r);
+                check_equal(to_integer(unsigned(r)), 0, "GEM1's frames dropped (0x184)");
 
             elsif run("a full size frame is echoed") then
                 fl := frame(MAC, x"88B5", 8, 1514);

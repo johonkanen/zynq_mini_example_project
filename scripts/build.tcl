@@ -83,7 +83,7 @@ set_property top $TOP_MODULE [current_fileset]
 # BUILD_ID: the build's Unix time, readable at axi_regs 0x28 and recorded next to
 # the bitstream (output/<project>.build_id) for PL bundle manifests.
 set BUILD_ID [clock seconds]
-set PL_ETH_N [expr {$PL_ETH eq "hvhdl" ? 1 : 0}]
+set PL_ETH_N [dict get {gem1 0 hvhdl 1 shared 2} $PL_ETH]
 set_property generic "BUILD_ID=32'h[format %08X $BUILD_ID] PL_ETH=$PL_ETH_N" [current_fileset]
 puts "\[build] PL_ETH = $PL_ETH"
 puts "\[build] BUILD_ID = $BUILD_ID ([clock format $BUILD_ID -format {%Y-%m-%d %H:%M:%S} -gmt 1] UTC)"

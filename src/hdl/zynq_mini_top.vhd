@@ -14,6 +14,7 @@
 --     +-- u_hrpwm : hrpwm           (high-resolution PWM on the EXT IO header)
 --     +-- PL Ethernet: PL_ETH = 0 -> GEM1 through the BD's gmii_to_rgmii (Linux eth1)
 --                      PL_ETH = 1 -> u_eth_mac: hVHDL_gigabit_ethernet's MAC in the PL (echo test)
+--                      PL_ETH = 2 -> both: u_eth_mac shares the port with GEM1 at the GMII level
 --       + the PHY reset (both)
 --     +-- placeholder PL user logic
 --
@@ -35,7 +36,7 @@ use work.scope_pkg.all;
 entity zynq_mini_top is
     generic (
         BUILD_ID : std_logic_vector(31 downto 0) := x"00000000";  -- scripts/build.tcl: Unix time
-        PL_ETH   : natural := 0         -- scripts/build.tcl (PL_ETH env): 0 = GEM1/eth1, 1 = hVHDL MAC
+        PL_ETH   : natural := 0         -- scripts/build.tcl (PL_ETH env): 0 = GEM1/eth1, 1 = hVHDL MAC, 2 = both
     );
     port (
         DDR_addr          : inout std_logic_vector(14 downto 0);
@@ -126,6 +127,10 @@ architecture rtl of zynq_mini_top is
     signal ps_rgmii_rd                : std_logic_vector(3 downto 0) := (others => '0');
     signal ps_rgmii_rx_ctl, ps_rgmii_rxc : std_logic := '0';
     signal ps_mdc, ps_mdio_i, ps_mdio_o, ps_mdio_t : std_logic;
+    -- GEM1's GMII (PL_ETH = 2)
+    signal gem_tx_clk, gem_rx_clk : std_logic;
+    signal gem_txd, gem_rxd       : std_logic_vector(7 downto 0);
+    signal gem_tx_en, gem_tx_er, gem_rx_dv, gem_rx_er : std_logic;
 
     -- axi_regs FEATURES and its ETH window (the PL MAC's registers, PL_ETH = 1)
     function features_word(pl_eth : natural) return std_logic_vector is
@@ -133,6 +138,9 @@ architecture rtl of zynq_mini_top is
     begin
         if pl_eth /= 0 then
             f(0) := '1';                                -- the PL Ethernet MAC is there
+        end if;
+        if pl_eth = 2 then
+            f(1) := '1';                                -- sharing its port with GEM1 (eth1)
         end if;
         return f;
     end function;
@@ -181,6 +189,14 @@ begin
             mdio_i            => ps_mdio_i,
             mdio_o            => ps_mdio_o,
             mdio_t            => ps_mdio_t,
+            gem_tx_clk        => gem_tx_clk,
+            gem_txd           => gem_txd,
+            gem_tx_en         => gem_tx_en,
+            gem_tx_er         => gem_tx_er,
+            gem_rx_clk        => gem_rx_clk,
+            gem_rxd           => gem_rxd,
+            gem_rx_dv         => gem_rx_dv,
+            gem_rx_er         => gem_rx_er,
             DDR_addr          => DDR_addr,
             DDR_ba            => DDR_ba,
             DDR_cas_n         => DDR_cas_n,
@@ -349,10 +365,11 @@ begin
             port map (I => ps_mdio_o, O => ps_mdio_i, T => ps_mdio_t, IO => eth_mdio);
     end generate;
 
-    -- hVHDL_gigabit_ethernet's ethernet_mac in the PL (doc/hvhdl_ethernet.md): the
-    -- echo test. It owns the PHY, MDIO included.
+    -- hVHDL_gigabit_ethernet's ethernet_mac in the PL (doc/hvhdl_ethernet.md). It
+    -- owns the PHY, MDIO included (1), or shares it with GEM1, whose MDIO it is (2).
     gen_eth_hvhdl : if PL_ETH /= 0 generate
         u_eth_mac : entity work.eth_mac
+            generic map (SHARE_PORT => PL_ETH = 2)
             port map (
                 clk          => clk,
                 rgmii_rxc    => eth_rgmii_rxc,
@@ -363,6 +380,18 @@ begin
                 rgmii_tx_ctl => eth_rgmii_tx_ctl,
                 mdc          => eth_mdc,
                 mdio         => eth_mdio,
+                gem_tx_clk   => gem_tx_clk,
+                gem_txd      => gem_txd,
+                gem_tx_en    => gem_tx_en,
+                gem_tx_er    => gem_tx_er,
+                gem_rx_clk   => gem_rx_clk,
+                gem_rxd      => gem_rxd,
+                gem_rx_dv    => gem_rx_dv,
+                gem_rx_er    => gem_rx_er,
+                gem_mdc      => ps_mdc,
+                gem_mdio_o   => ps_mdio_o,
+                gem_mdio_t   => ps_mdio_t,
+                gem_mdio_i   => ps_mdio_i,
                 bus_req      => eth_bus_req,
                 bus_write    => eth_bus_write,
                 bus_addr     => eth_bus_addr,
@@ -383,7 +412,6 @@ begin
                 echoed       => open,
                 ignored      => open
             );
-        ps_mdio_i <= '1';
     end generate;
 
     ---------------------------------------------------------------------------

@@ -89,6 +89,9 @@ lib.add_source_files(ROOT / "src" / "hdl" / "rgmii_rx_xilinx.vhd")
 lib.add_source_files(ROOT / "src" / "hdl" / "rgmii_tx_xilinx.vhd")
 lib.add_source_files(ROOT / "src" / "hdl" / "eth_mac.vhd")
 lib.add_source_files(ROOT / "sim" / "tb_eth_mac.vhd")
+# eth_mac sharing its port with GEM1 (PL_ETH=shared): that test alone, in that build
+lib.test_bench("tb_eth_mac").test("shared port: GEM1's frames and a stream at the same time").add_config(
+    name="share_port", generics=dict(share_port=True))
 
 vu.set_sim_option("nvc.sim_flags", ["--ieee-warnings=off"])
 

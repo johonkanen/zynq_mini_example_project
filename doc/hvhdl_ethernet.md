@@ -11,10 +11,11 @@ Ethernet frames without Linux in the data path: line-rate streaming (oscilloscop
 later ADC data), fixed-latency register access, and traffic that keeps flowing while Linux is
 busy or rebooting.
 
-**Status:** phases 1–4 done (2026-10-22): the FPGA has its own IP address on the PL port and a UDP
+**Status:** phases 1–5 done (2026-10-23): the FPGA has its own IP address on the PL port and a UDP
 application - register access, the oscilloscope's capture, a stream at line rate (956 Mbit/s) -
 with no Linux in the path; the protocol logic is in the library (`network_responder`,
-`udp_sender`, `frame_mux`).
+`udp_sender`, `frame_mux`). Phase 5 (2026-10-23): one PL port shared by Linux's eth1 and the FPGA,
+both at once at the full line between them - §5c.
 
 ## 1. What the library gives: `ethernet_mac/`
 
@@ -238,6 +239,69 @@ its own testbench there); `eth_mac.vhd` keeps the board's part - I/O, clocks, re
 The FPGA path is about **twice** what Linux reached on the same port (474–553 Mbit/s, CPU-bound) and
 doesn't depend on Linux running at all.
 
+## 5c. Phase 5: one port for eth1 and the FPGA
+
+`PL_ETH=shared ./build.sh` - option B: GEM1 (Linux `eth1`) and `ethernet_mac` share the PL PHY at
+the GMII level, each with its own MAC address (eth1 `02:5a:4d:00:00:02`, the FPGA
+`02:5a:4d:00:00:10`).
+
+**In the library** (`ethernet_mac/`, VUnit 44 of 44):
+
+| change | |
+|---|---|
+| `gmii_share` (new) | GEM1's GMII transmit into a 4 KB store-and-forward FIFO (a frame kept at its end, dropped whole on TX_ER or if it doesn't fit), played out between `ethernet_mac_tx`'s frames. **The FIFO has priority**: GMII has no back-pressure, the MAC's stream has; as GEM1 sends no faster than the line, the FIFO never holds more than one MAC frame's worth and never drops. (Taking turns frame by frame was tried first: a full-size FPGA stream then throttles small GEM1 frames until the FIFO overflows.) |
+| `ethernet_mac_tx` | `hold` (no frame starts while high) and `busy` (frame start to end of the gap) |
+| `rgmii_rx` | `line_out`: the received frame as on the line (preamble, SFD, FCS) for the other MAC; with the "rising nibble a clock early" pairing the preamble is 8 bytes |
+| `ethernet_mac` | `g_shared_port`, `share_tx_in` / `share_rx_out`; counters 0x180 GEM1 frames sent, 0x184 dropped |
+
+**In the project:**
+
+- block design (`create_bd.tcl`, `shared`): no converter; GEM1's GMII and MDIO are BD ports
+  (`GMII1_*`, `MDIO1_*`); `zynq_ps_wrapper` branch `PL_ETH = 2`.
+- `eth_mac` (`SHARE_PORT`): GEM1's TX clock = our 125 MHz MMCM clock, its RX clock = the RXC BUFG;
+  its TX registered once; MDIO on the pins is GEM1's (Linux phylib). FEATURES bit1 = shared.
+- `linux/pl/zynq-mini-pl-shared.dtso`: gem1 without `gmii-to-rgmii`, PHY at 1, and
+  `zynq-mini,gigabit-only` → `linux/net/bridge` runs `ethtool -s eth1 advertise 0x020` (the PL MAC is
+  gigabit only). `make-pl-bundle.sh` picks the overlay.
+- fpgad `eth`: with FEATURES bit1 `"shared":true`, `eth1_frames_sent/dropped`, and the link from
+  eth1's sysfs (MDIO isn't the PL MAC's then).
+- Simulation 50 of 50: `tb_eth_mac` has a `share_port` config for its test "shared port: GEM1's
+  frames and a stream at the same time" (20 × 1000-byte datagrams from the FPGA while a GEM1 model
+  sends 20 frames back to back: all 40 reach the PC whole, 0x180 = 20, 0x184 = 0).
+- Timing met: WNS 0.316 ns, WHS 0.021 ns; no unconstrained endpoints.
+
+**On the board so far** (2026-10-22): apps bundle with the new fpgad installed; `bridge` copied
+onto the board by hand (it is in the rootfs - the next image has it); the shared PL bundle loaded
+and kept. eth1 came up in br0 at **1000/Full, advertising 1000BASE-T only**; `fpgactl eth`:
+`shared:true`, eth1_frames_sent 48, dropped 0, the FPGA MAC received 17 frames, 0 CRC errors.
+
+**Both at once** (2026-10-23; PC on the PL port, br0 given `192.168.20.1/24` for the test so the PC
+reaches Linux through eth1):
+
+| test | result |
+|---|---|
+| ARP from the PC | 192.168.20.1 → br0's MAC (through eth1), 192.168.20.10 → the FPGA's MAC |
+| eth1 alone, iperf3 PC→board / board→PC | 564 / 550 Mbit/s (with the Xilinx converter: 553 / 474) |
+| FPGA alone, `pl_udp.py stream 10000 1472` | 954 Mbit/s, 10000/10000 |
+| **board→PC iperf3 + FPGA stream 200 000 × 1472 together** | Linux **621 Mbit/s, 0 retransmits**; FPGA **311 Mbit/s, 200000/200000**: the line full (~930 Mbit/s payload); eth1 frames through the FIFO 673 439, **dropped 0**, 0 CRC errors |
+| PC→board iperf3 + FPGA stream 100 000 × 1472 + `read`/`write`/`scope --arm` + ping 192.168.20.10 | Linux 572 Mbit/s; FPGA 957 Mbit/s, 100000/100000; registers and capture right; ping 20/20 |
+
+GEM1's priority shows: Linux keeps its rate, the FPGA's stream takes what is left and loses
+nothing (its MAC waits, `udp_sender` paces). The PC→board retransmits (26–49 in 10 s) are the
+same without FPGA traffic: GEM1's own `rx_overruns` / `rx_resource_errors` (Linux CPU-bound on
+receive, as before).
+
+**Limits:**
+
+- the shared port is **gigabit only** (the PL MAC is); eth1 advertises 1000BASE-T alone.
+- the bridge never learns the FPGA's MAC (the FPGA's frames don't pass GEM1), so unicast for the
+  FPGA that arrives on eth1 is also flooded to eth0 - small (requests, not the stream).
+- Linux can't reach the FPGA's IP over eth1 from inside the board: GEM1's frames go only to the
+  PHY, not into the PL MAC's receive.
+
+**Not tested yet:** fpgad's relink rule with the cable in the PL port only (needs eth0 unplugged:
+the shared design keeps eth1, so it must pass).
+
 ## 6. Phases
 
 | phase | content | done when |
@@ -247,7 +311,7 @@ doesn't depend on Linux running at all.
 | 2 | on the board: the echo at 1 Gb/s from a peer; the MAC's APB registers bridged to the PS, counters in fpgad / the web page | **done** (§4) |
 | 3 | ARP + IPv4 + UDP (+ ICMP echo), FPGA IP from a register | **done** (§5) |
 | 4 | UDP register access, the oscilloscope's capture over UDP, a stream at line rate | **done** (§5b): 956 Mbit/s against Linux's 474–553 |
-| 5 | option B: GMII switch so `eth1` and the FPGA share the PL port | Linux on `eth1` and FPGA UDP traffic at the same time; fpgad's relink rule still holds |
+| 5 | option B: GMII switch so `eth1` and the FPGA share the PL port | Linux on `eth1` and FPGA UDP traffic at the same time; fpgad's relink rule still holds - **done** (§5c): 621 + 311 Mbit/s together, nothing lost |
 
 ## 7. Notes and open questions
 

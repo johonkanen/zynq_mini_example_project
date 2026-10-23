@@ -34,10 +34,12 @@ PROJECT=arm_fpga_zynq_mini
 BIT="$REPO/output/$PROJECT.bit"
 BUILD_ID_FILE="$REPO/output/$PROJECT.build_id"
 # the overlay that belongs to the build's PL Ethernet variant (scripts/config.tcl,
-# recorded by build.tcl): gem1 -> eth1 in the overlay, hvhdl -> the PL MAC, no gem1
+# recorded by build.tcl): gem1 -> eth1 in the overlay, hvhdl -> the PL MAC, no gem1,
+# shared -> both on the PL port
 PL_ETH=$(cat "$REPO/output/$PROJECT.pl_eth" 2>/dev/null || echo gem1)
 case "$PL_ETH" in
-    hvhdl) DEFAULT_DTSO="$REPO/linux/pl/zynq-mini-pl-hvhdl.dtso" ;;
+    hvhdl)  DEFAULT_DTSO="$REPO/linux/pl/zynq-mini-pl-hvhdl.dtso" ;;
+    shared) DEFAULT_DTSO="$REPO/linux/pl/zynq-mini-pl-shared.dtso" ;;
     *)     DEFAULT_DTSO="$REPO/linux/pl/zynq-mini-pl.dtso" ;;
 esac
 DTSO="${PL_DTSO:-$DEFAULT_DTSO}"   # PL_DTSO: another overlay (tests)

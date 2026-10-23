@@ -17,10 +17,13 @@ set FCLK0_MHZ       100
 #   gem1  (default) GEM1 over EMIO -> gmii_to_rgmii in the block design = Linux eth1
 #   hvhdl           hVHDL_gigabit_ethernet in the PL (src/hdl/eth_mac.vhd, echo test);
 #                   no converter in the block design - the PS configuration (and so
-#                   ps7_init / the boot loader) is the same in both
+#                   ps7_init / the boot loader) is the same in all three
+#   shared          both on one port: GEM1's GMII over EMIO into eth_mac, which puts
+#                   its frames on the line between its own (doc/hvhdl_ethernet.md
+#                   phase 5); MDIO is GEM1's
 set PL_ETH "gem1"
 if {[info exists ::env(PL_ETH)] && $::env(PL_ETH) ne ""} { set PL_ETH $::env(PL_ETH) }
-if {$PL_ETH ni {gem1 hvhdl}} { error "PL_ETH must be gem1 or hvhdl, not '$PL_ETH'" }
+if {$PL_ETH ni {gem1 hvhdl shared}} { error "PL_ETH must be gem1, hvhdl or shared, not '$PL_ETH'" }
 
 # Directory layout (all paths resolved relative to the repo root = one level
 # above this script directory)
@@ -75,7 +78,7 @@ set ETH_SOURCES [concat \
 set XDC_SOURCES [list \
     "$CONSTR_DIR/zynq_mini.xdc" \
 ]
-if {$PL_ETH eq "hvhdl"} { lappend XDC_SOURCES "$CONSTR_DIR/pl_eth_hvhdl.xdc" }
+if {$PL_ETH ne "gem1"} { lappend XDC_SOURCES "$CONSTR_DIR/pl_eth_hvhdl.xdc" }
 
 #-----------------------------------------------------------------------------
 # Parallelism

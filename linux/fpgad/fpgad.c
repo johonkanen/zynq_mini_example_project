@@ -36,7 +36,8 @@
  *   eth                           -> ok {"present":true,"frames_rx":...}  the PL Ethernet MAC
  *        (hVHDL_gigabit_ethernet, doc/hvhdl_ethernet.md): counters, settings, its IP and
  *        UDP echo port, ARP/ICMP/UDP replies, PHY link; {"present":false} when the loaded
- *        design doesn't have it. Its IP: write 0x4208 (fpgactl write 0x4208 0xC0A8140A)
+ *        design doesn't have it. With the port shared with eth1 ("shared":true) also eth1's
+ *        frames sent and dropped by the PL, and the link is eth1's (MDIO is Linux's then). Its IP: write 0x4208 (fpgactl write 0x4208 0xC0A8140A)
  *   oled <row> <text>             -> ok                (OLED row 0..7, 16 chars;
  *                                     the rest of the line, spaces kept)
  *   oled clear                    -> ok
@@ -94,7 +95,8 @@
 #define REG_HEARTBEAT   0x10
 #define REG_BUILD_ID    0x28
 #define REG_REGMAP      0x2C
-#define REG_FEATURES    0x30            /* bit0: the PL Ethernet MAC (PL_ETH=hvhdl build) */
+#define REG_FEATURES    0x30            /* bit0: the PL Ethernet MAC (PL_ETH=hvhdl build),
+                                           bit1: its port shared with GEM1 = eth1 (PL_ETH=shared) */
 #define REG_ETH         0x4000          /* ETH window: ethernet_mac's APB registers, eth_mac's */
 #define REG_SIGNATURE   0x1C
 #define SIGNATURE_VALUE 0x5A5A1234u
@@ -1235,6 +1237,8 @@ static int xadc_find(void)
 #define ETH_ARP_REPLIES     0x210
 #define ETH_ICMP_REPLIES    0x214
 #define ETH_UDP_REPLIES     0x218
+#define ETH_SHARED_SENT     0x180       /* eth1's frames put on the shared port */
+#define ETH_SHARED_DROPPED  0x184       /* and dropped (the FIFO full) */
 #define ETH_PHY_ADDR        1           /* the PL-side RTL8211E */
 
 static int eth_read(uint32_t off, uint32_t *v, char *err, size_t n)
@@ -1268,7 +1272,7 @@ static void do_eth(int fd)
 {
     char err[160], out[900];
     uint32_t f, cmd, lo, hi, tx, rx, crc, ine, oute, echoed, ignored, physr = 0;
-    uint32_t ip, port, arp, icmp, udp;
+    uint32_t ip, port, arp, icmp, udp, sh_sent = 0, sh_dropped = 0;
     if (sim) {
         sendf(fd, "ok {\"present\":false}\n");
         return;
@@ -1292,23 +1296,46 @@ static void do_eth(int fd)
         sendf(fd, "err %s\n", err);
         return;
     }
-    /* RTL8211E PHY specific status (0x11): bit10 link, 13 full duplex, 15:14 speed */
-    int phy_ok = eth_mdio_read(0x11, &physr, err, sizeof err) == 0;
+    int shared = (f & 2) != 0, phy_ok;
     static const int speeds[] = { 10, 100, 1000, 0 };
+    if (shared) {
+        if (eth_read(ETH_SHARED_SENT, &sh_sent, err, sizeof err) ||
+            eth_read(ETH_SHARED_DROPPED, &sh_dropped, err, sizeof err)) {
+            sendf(fd, "err %s\n", err);
+            return;
+        }
+        /* MDIO is GEM1's: the link as eth1 sees it, in the PHY status register's terms */
+        char v[16] = "";
+        phy_ok = read_sysfs("/sys/class/net/" NET_IF "/operstate", v, sizeof v) == 0;
+        if (phy_ok && carrier(NET_IF)) {
+            physr = 1u << 10;
+            if (read_sysfs("/sys/class/net/" NET_IF "/speed", v, sizeof v) == 0)
+                physr |= (uint32_t)(atoi(v) == 1000 ? 2 : atoi(v) == 100 ? 1 : 0) << 14;
+            if (read_sysfs("/sys/class/net/" NET_IF "/duplex", v, sizeof v) == 0 && !strcmp(v, "full"))
+                physr |= 1u << 13;
+        }
+    } else {
+        /* RTL8211E PHY specific status (0x11): bit10 link, 13 full duplex, 15:14 speed */
+        phy_ok = eth_mdio_read(0x11, &physr, err, sizeof err) == 0;
+    }
+    char extra[120] = "";
+    if (shared)
+        snprintf(extra, sizeof extra, ",\"shared\":true,\"eth1_frames_sent\":%" PRIu32 ",\"eth1_frames_dropped\":%" PRIu32,
+                 sh_sent, sh_dropped);
     snprintf(out, sizeof out,
              "ok {\"present\":true,\"mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"rx_enabled\":%s,\"tx_enabled\":%s,"
              "\"promiscuous\":%s,\"frames_rx\":%" PRIu32 ",\"frames_tx\":%" PRIu32 ",\"crc_errors\":%" PRIu32 ","
              "\"in_errors\":%" PRIu32 ",\"out_errors\":%" PRIu32 ",\"echoed\":%" PRIu32 ",\"ignored\":%" PRIu32 ","
              "\"ip\":\"%u.%u.%u.%u\",\"udp_port\":%" PRIu32 ",\"arp_replies\":%" PRIu32 ","
              "\"icmp_replies\":%" PRIu32 ",\"udp_replies\":%" PRIu32 ","
-             "\"link\":%s,\"speed\":%d,\"full_duplex\":%s}\n",
+             "\"link\":%s,\"speed\":%d,\"full_duplex\":%s%s}\n",
              lo & 0xff, (lo >> 8) & 0xff, (lo >> 16) & 0xff, lo >> 24, hi & 0xff, (hi >> 8) & 0xff,
              cmd & 2 ? "true" : "false", cmd & 1 ? "true" : "false", cmd & 16 ? "true" : "false",
              rx, tx, crc, ine, oute, echoed, ignored,
              ip >> 24, (ip >> 16) & 0xff, (ip >> 8) & 0xff, ip & 0xff, port & 0xffff, arp, icmp, udp,
              !phy_ok ? "null" : (physr & (1u << 10)) ? "true" : "false",
              phy_ok ? speeds[(physr >> 14) & 3] : 0,
-             !phy_ok ? "null" : (physr & (1u << 13)) ? "true" : "false");
+             !phy_ok ? "null" : (physr & (1u << 13)) ? "true" : "false", extra);
     sendf(fd, "%s", out);
 }
 
